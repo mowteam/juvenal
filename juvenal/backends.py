@@ -54,10 +54,8 @@ class ClaudeBackend(Backend):
             "-p",
             "--output-format",
             "stream-json",
+            "--dangerously-skip-permissions",
             "--verbose",
-            "--allowedTools",
-            "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch",
-            "--",
             prompt,
         ]
 
