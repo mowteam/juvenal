@@ -89,3 +89,24 @@ class TestErrors:
         bad_file.write_text("hello")
         with pytest.raises(ValueError, match="Unsupported file type"):
             load_workflow(bad_file)
+
+    def test_yaml_with_string_content(self, tmp_path):
+        """YAML that parses to a string instead of a dict should raise."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("just a string\n")
+        with pytest.raises(ValueError, match="expected a mapping"):
+            load_workflow(bad_yaml)
+
+    def test_yaml_with_list_content(self, tmp_path):
+        """YAML that parses to a list instead of a dict should raise."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("- item1\n- item2\n")
+        with pytest.raises(ValueError, match="expected a mapping"):
+            load_workflow(bad_yaml)
+
+    def test_yaml_empty(self, tmp_path):
+        """Empty YAML file should raise."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("")
+        with pytest.raises(ValueError, match="expected a mapping"):
+            load_workflow(bad_yaml)

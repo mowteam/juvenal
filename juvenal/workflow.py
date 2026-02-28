@@ -104,6 +104,9 @@ def _load_yaml(path: Path) -> Workflow:
     with open(path) as f:
         data = yaml.safe_load(f)
 
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid workflow YAML in {path}: expected a mapping, got {type(data).__name__}")
+
     phases = []
     for phase_data in data.get("phases", []):
         checkers = []

@@ -1,7 +1,9 @@
 """Unit tests for the execution engine with mocked backend."""
 
+import pytest
+
 from juvenal.checkers import parse_verdict
-from juvenal.engine import Engine
+from juvenal.engine import Engine, _extract_yaml
 from juvenal.workflow import Checker, Phase, Workflow
 from tests.conftest import MockBackend
 
@@ -118,3 +120,61 @@ class TestEngineWithMockedBackend:
         captured = capsys.readouterr()
         assert "test" in captured.out
         assert "setup" in captured.out
+
+
+class TestExtractYaml:
+    def test_yaml_code_fence(self):
+        text = "Here's the workflow:\n```yaml\nname: test\nphases: []\n```\nDone."
+        assert "name: test" in _extract_yaml(text)
+        assert "```" not in _extract_yaml(text)
+
+    def test_generic_code_fence(self):
+        text = "Here:\n```\nname: test\nphases: []\n```\n"
+        assert "name: test" in _extract_yaml(text)
+
+    def test_no_fence_with_prose(self):
+        text = "Sure, here is your workflow.\n\nname: test\nphases:\n  - id: a\n    prompt: do it\n"
+        result = _extract_yaml(text)
+        assert "name: test" in result
+        assert "Sure, here" not in result
+
+    def test_raw_yaml(self):
+        text = "name: test\nphases:\n  - id: a\n    prompt: do it\n"
+        assert _extract_yaml(text) == text
+
+
+class TestPlanWorkflow:
+    def test_plan_produces_valid_yaml(self, tmp_path):
+        """plan_workflow with a mock backend that returns valid YAML."""
+        from unittest.mock import patch
+
+        from juvenal.backends import AgentResult
+        from juvenal.engine import plan_workflow
+
+        yaml_output = "name: test\nphases:\n  - id: setup\n    prompt: do it\n    checkers:\n      - type: script\n        run: 'true'\n"
+        mock_result = AgentResult(exit_code=0, output=f"```yaml\n{yaml_output}```", transcript="", duration=1.0)
+
+        with patch("juvenal.engine.create_backend") as mock_cb:
+            mock_cb.return_value.run_agent.return_value = mock_result
+            out_path = str(tmp_path / "workflow.yaml")
+            plan_workflow("build something", out_path)
+
+        from juvenal.workflow import load_workflow
+
+        wf = load_workflow(out_path)
+        assert wf.name == "test"
+        assert len(wf.phases) == 1
+
+    def test_plan_rejects_non_yaml(self, tmp_path):
+        """plan_workflow should raise if LLM output isn't valid workflow YAML."""
+        from unittest.mock import patch
+
+        from juvenal.backends import AgentResult
+        from juvenal.engine import plan_workflow
+
+        mock_result = AgentResult(exit_code=0, output="Sorry, I can't do that.", transcript="", duration=1.0)
+
+        with patch("juvenal.engine.create_backend") as mock_cb:
+            mock_cb.return_value.run_agent.return_value = mock_result
+            with pytest.raises(ValueError, match="did not produce valid workflow YAML"):
+                plan_workflow("build something", str(tmp_path / "workflow.yaml"))

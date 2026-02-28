@@ -246,13 +246,37 @@ def plan_workflow(goal: str, output_path: str, backend_name: str = "claude") -> 
     display.step_pass("planning")
 
     # Extract YAML from output (strip markdown code fences if present)
-    yaml_content = result.output
-    if "```yaml" in yaml_content:
-        yaml_content = yaml_content.split("```yaml", 1)[1]
-        yaml_content = yaml_content.split("```", 1)[0]
-    elif "```" in yaml_content:
-        yaml_content = yaml_content.split("```", 1)[1]
-        yaml_content = yaml_content.split("```", 1)[0]
+    yaml_content = _extract_yaml(result.output)
+
+    # Validate it's actually a YAML mapping with phases
+    import yaml
+
+    parsed = yaml.safe_load(yaml_content)
+    if not isinstance(parsed, dict) or "phases" not in parsed:
+        raise ValueError(
+            f"Planning agent did not produce valid workflow YAML.\n"
+            f"Output (first 500 chars): {result.output[:500]}"
+        )
 
     Path(output_path).write_text(yaml_content.strip() + "\n")
     print(f"Workflow written to {output_path}")
+
+
+def _extract_yaml(text: str) -> str:
+    """Extract YAML content from LLM output, stripping markdown fences."""
+    # Try ```yaml ... ``` first
+    if "```yaml" in text:
+        return text.split("```yaml", 1)[1].split("```", 1)[0]
+    # Try ``` ... ``` (first fenced block)
+    if "```" in text:
+        after_fence = text.split("```", 1)[1]
+        if "```" in after_fence:
+            return after_fence.split("```", 1)[0]
+    # No fences — return as-is, stripping leading non-YAML prose
+    # YAML mappings start with a key like "name:" or "phases:"
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and ":" in stripped:
+            return "\n".join(lines[i:])
+    return text
