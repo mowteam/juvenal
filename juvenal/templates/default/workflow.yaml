@@ -1,0 +1,13 @@
+name: "my-workflow"
+backend: claude
+working_dir: "."
+max_retries: 999
+
+phases:
+  - id: implement
+    prompt_file: phases/01-implement/prompt.md
+    checkers:
+      - type: script
+        run: "echo 'Add your test command here'"
+      - type: agent
+        role: tester

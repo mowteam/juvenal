@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(juvenal *)",
+      "Bash(pip install*)",
+      "Bash(pytest*)",
+      "Bash(ruff*)"
+    ]
+  }
+}

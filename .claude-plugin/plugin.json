@@ -1,0 +1,11 @@
+{
+  "name": "juvenal",
+  "version": "0.1.0",
+  "description": "Orchestrate AI coding agents through verified implementation phases",
+  "skills": [
+    {
+      "name": "juvenal",
+      "path": "../skills/juvenal/SKILL.md"
+    }
+  ]
+}

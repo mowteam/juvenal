@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "juvenal"
+version = "0.1.0"
+description = "Who prompts the prompters? A framework for orchestrating AI coding agents through verified implementation phases."
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Yan Shoshitaishvili" }]
+dependencies = [
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+juvenal = "juvenal.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["juvenal*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

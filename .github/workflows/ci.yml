@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check juvenal/ tests/
+      - run: ruff format --check juvenal/ tests/
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -x --ignore=tests/test_e2e_claude.py --ignore=tests/test_e2e_codex.py --ignore=tests/test_skill.py
+
+  e2e-claude:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: [lint, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: pytest tests/test_e2e_claude.py -x -v
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  e2e-codex:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: [lint, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install -e ".[dev]"
+      - name: Login to codex
+        run: echo "$OPENAI_API_KEY" | npx @openai/codex@latest login --with-api-key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - run: pytest tests/test_e2e_codex.py -x -v
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  e2e-skill:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: [lint, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: pytest tests/test_skill.py -x -v
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
