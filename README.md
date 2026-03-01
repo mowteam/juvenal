@@ -24,6 +24,32 @@ Juvenal is conceptually similar to [ralph](https://github.com/snarktank/ralph), 
 pip install -e ".[dev]"
 ```
 
+## Claude Code Skill
+
+Juvenal ships as a Claude Code plugin, so you can use it directly from Claude Code with `/juvenal`.
+
+### Install the plugin
+
+**From the marketplace** (pending approval):
+```
+/plugin install juvenal
+```
+
+**From source** (works now):
+```bash
+claude --plugin-dir /path/to/juvenal/plugin
+```
+
+### Usage
+
+Once installed, invoke the skill in Claude Code:
+
+```
+/juvenal add authentication to the Flask app
+```
+
+Claude will create a Juvenal workflow for your goal and run it. You can also ask for help with workflow formats or run existing workflows.
+
 ## Quick Start
 
 ```bash
