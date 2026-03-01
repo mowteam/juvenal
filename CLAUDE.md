@@ -31,13 +31,14 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 
 | Module | Purpose |
 |--------|---------|
-| `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups. Global bounce counter (`max_bounces`) limits total bounces across all phases. |
+| `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
 | `workflow.py` | Workflow loading and `Phase`/`Workflow` dataclasses. Supports YAML, directory convention, and bare `.md` formats. |
 | `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. |
-| `state.py` | Atomic JSON state persistence (`PipelineState`). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume from last checkpoint. |
+| `state.py` | Atomic JSON state persistence (`PipelineState`). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume and rewind from last checkpoint. |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`) and script execution with timeouts. |
 | `display.py` | Rich TUI with rolling 15-line buffer. Falls back to plain text with `--plain`. |
-| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`. |
+| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`. |
+| `notifications.py` | Webhook notification support (`build_notification_payload`, `send_webhook`). |
 
 ### Execution Flow
 
@@ -84,12 +85,13 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 
 ```
 juvenal/
-├── __init__.py          # Version (__version__ = "0.4.0")
+├── __init__.py          # Version (__version__ = "0.6.0")
 ├── backends.py          # Backend ABC + Claude/Codex implementations
 ├── checkers.py          # Verdict parsing, script execution
 ├── cli.py               # CLI argument parsing and dispatch
 ├── display.py           # Rich TUI rendering
 ├── engine.py            # Core execution loop
+├── notifications.py     # Webhook notifications
 ├── state.py             # Atomic state persistence
 ├── workflow.py          # Workflow/Phase models and loading
 ├── prompts/             # Built-in checker role prompts (.md)
@@ -103,6 +105,8 @@ tests/
 ├── test_workflow.py     # Workflow loading tests
 ├── test_e2e_claude.py   # E2E with Claude (needs ANTHROPIC_API_KEY)
 ├── test_e2e_codex.py    # E2E with Codex (needs OPENAI_API_KEY)
-└── test_skill.py        # Claude Code skill tests
+├── test_round2.py       # Includes, cost tracking, backoff, notifications tests
+├── test_skill.py        # Claude Code skill tests
+└── test_validation.py   # Workflow validation tests
 skills/juvenal/SKILL.md  # Claude Code skill definition
 ```
