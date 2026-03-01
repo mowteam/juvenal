@@ -10,7 +10,7 @@ class TestArgumentParsing:
         assert args.command == "run"
         assert args.workflow == "workflow.yaml"
         assert args.backend == "codex"
-        assert args.max_retries == 999
+        assert args.max_bounces == 999
         assert not args.resume
         assert not args.dry_run
 
@@ -23,7 +23,7 @@ class TestArgumentParsing:
                 "--resume",
                 "--phase",
                 "implement",
-                "--max-retries",
+                "--max-bounces",
                 "5",
                 "--backend",
                 "codex",
@@ -36,7 +36,7 @@ class TestArgumentParsing:
         )
         assert args.resume
         assert args.phase == "implement"
-        assert args.max_retries == 5
+        assert args.max_bounces == 5
         assert args.backend == "codex"
         assert args.dry_run
         assert args.working_dir == "/tmp"
@@ -106,4 +106,6 @@ class TestArgumentParsing:
         except SystemExit:
             pass
         captured = capsys.readouterr()
-        assert "0.4.0" in captured.out
+        from juvenal import __version__
+
+        assert __version__ in captured.out

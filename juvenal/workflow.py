@@ -24,7 +24,8 @@ class Phase:
     prompt: str = ""  # for implement and check
     run: str | None = None  # shell command for script
     role: str | None = None  # built-in role name for check
-    bounce_target: str | None = None  # phase to bounce back to on failure
+    bounce_target: str | None = None  # fixed phase to bounce back to on failure
+    bounce_targets: list[str] = field(default_factory=list)  # agent-guided: checker picks from this list
     timeout: int | None = None  # timeout in seconds (None = no limit)
     env: dict[str, str] = field(default_factory=dict)  # environment variables for the phase
 
@@ -56,7 +57,7 @@ class Workflow:
     phases: list[Phase]
     backend: str = "codex"
     working_dir: str = "."
-    max_retries: int = 999
+    max_bounces: int = 999
     parallel_groups: list[list[str]] = field(default_factory=list)
 
 
@@ -112,6 +113,10 @@ def _load_yaml(path: Path) -> Workflow:
         if not prompt and phase_data.get("prompt_file"):
             prompt_path = path.parent / phase_data["prompt_file"]
             prompt = prompt_path.read_text()
+        bounce_target = phase_data.get("bounce_target")
+        bounce_targets = phase_data.get("bounce_targets", [])
+        if bounce_target and bounce_targets:
+            raise ValueError(f"Phase '{phase_data['id']}': bounce_target and bounce_targets are mutually exclusive")
         phases.append(
             Phase(
                 id=phase_data["id"],
@@ -119,7 +124,8 @@ def _load_yaml(path: Path) -> Workflow:
                 prompt=prompt,
                 run=phase_data.get("run"),
                 role=phase_data.get("role"),
-                bounce_target=phase_data.get("bounce_target"),
+                bounce_target=bounce_target,
+                bounce_targets=bounce_targets,
                 timeout=phase_data.get("timeout"),
                 env=phase_data.get("env", {}),
             )
@@ -134,7 +140,7 @@ def _load_yaml(path: Path) -> Workflow:
         phases=phases,
         backend=data.get("backend", "codex"),
         working_dir=data.get("working_dir", "."),
-        max_retries=data.get("max_retries", 999),
+        max_bounces=data.get("max_bounces", data.get("max_retries", 999)),
         parallel_groups=parallel_groups,
     )
 
@@ -183,7 +189,7 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
         phases=phases,
         backend=overrides.get("backend", "claude"),
         working_dir=overrides.get("working_dir", "."),
-        max_retries=overrides.get("max_retries", 999),
+        max_bounces=overrides.get("max_bounces", overrides.get("max_retries", 999)),
         parallel_groups=[pg.get("phases", []) for pg in overrides.get("parallel_groups", [])],
     )
 
@@ -260,6 +266,11 @@ def validate_workflow(workflow: Workflow) -> list[str]:
         # bounce_target references existing phase
         if phase.bounce_target and phase.bounce_target not in all_ids:
             errors.append(f"Phase {phase.id!r}: bounce_target {phase.bounce_target!r} does not match any phase ID")
+
+        # bounce_targets all reference existing phases
+        for bt in phase.bounce_targets:
+            if bt not in all_ids:
+                errors.append(f"Phase {phase.id!r}: bounce_targets entry {bt!r} does not match any phase ID")
 
         # Type-specific validation
         if phase.type == "implement" and not phase.prompt:

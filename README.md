@@ -10,7 +10,7 @@ A non-agentic Python script orchestrates AI coding agents (Claude or Codex) thro
 
 1. **Implementation** — an agent executes a prompt to build/modify code
 2. **Verification** — separate checkers (scripts, agents, or both) verify the work
-3. **Bounce** — if verification fails, the pipeline bounces back (to a configurable target phase or the most recent implement phase) with failure context injected. A global bounce limit (`max_retries`) prevents infinite loops.
+3. **Bounce** — if verification fails, the pipeline bounces back (to a configurable target phase or the most recent implement phase) with failure context injected. A global bounce limit (`max_bounces`) prevents infinite loops.
 
 The implementing agent and the checking agent are separate processes, so the implementer can't cheat by weakening tests.
 
@@ -23,6 +23,32 @@ Juvenal is conceptually similar to [ralph](https://github.com/snarktank/ralph), 
 ```bash
 pip install -e ".[dev]"
 ```
+
+## Claude Code Skill
+
+Juvenal ships as a Claude Code plugin, so you can use it directly from Claude Code with `/juvenal`.
+
+### Install the plugin
+
+**From the marketplace** (pending approval):
+```
+/plugin install juvenal
+```
+
+**From source** (works now):
+```bash
+claude --plugin-dir /path/to/juvenal/plugin
+```
+
+### Usage
+
+Once installed, invoke the skill in Claude Code:
+
+```
+/juvenal add authentication to the Flask app
+```
+
+Claude will create a Juvenal workflow for your goal and run it. You can also ask for help with workflow formats or run existing workflows.
 
 ## Quick Start
 
@@ -47,7 +73,7 @@ juvenal do "add authentication to the Flask app"
 ```yaml
 name: "my-workflow"
 backend: claude
-max_retries: 999
+max_bounces: 999
 
 phases:
   - id: implement

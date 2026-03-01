@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("workflow", help="Path to workflow YAML, directory, or bare .md file")
     run_p.add_argument("--resume", action="store_true", help="Resume from last saved state")
     run_p.add_argument("--phase", help="Start from a specific phase")
-    run_p.add_argument("--max-retries", type=int, default=999, help="Max retries per phase (default: 999)")
+    run_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
     run_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
     run_p.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
     run_p.add_argument("--working-dir", help="Working directory for the agent")
@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     do_p = sub.add_parser("do", help="Plan + immediately run a workflow")
     do_p.add_argument("goal", help="Goal description")
     do_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
-    do_p.add_argument("--max-retries", type=int, default=999, help="Max retries per phase (default: 999)")
+    do_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
 
     # status
     status_p = sub.add_parser("status", help="Show workflow progress")
@@ -56,13 +56,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_run(args: argparse.Namespace) -> int:
     from juvenal.engine import Engine
-    from juvenal.workflow import load_workflow
+    from juvenal.workflow import load_workflow, validate_workflow
 
     workflow = load_workflow(args.workflow)
+    errors = validate_workflow(workflow)
+    if errors:
+        print(f"Workflow validation failed with {len(errors)} error(s):")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
     if args.backend:
         workflow.backend = args.backend
-    if args.max_retries:
-        workflow.max_retries = args.max_retries
+    if args.max_bounces:
+        workflow.max_bounces = args.max_bounces
     if args.working_dir:
         workflow.working_dir = args.working_dir
 
@@ -97,8 +103,8 @@ def cmd_do(args: argparse.Namespace) -> int:
 
     if args.backend:
         workflow.backend = args.backend
-    if args.max_retries:
-        workflow.max_retries = args.max_retries
+    if args.max_bounces:
+        workflow.max_bounces = args.max_bounces
 
     engine = Engine(workflow, plain=args.plain)
     return engine.run()

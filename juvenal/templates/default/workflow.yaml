@@ -1,7 +1,7 @@
 name: "my-workflow"
 backend: codex
 working_dir: "."
-max_retries: 999
+max_bounces: 999
 
 phases:
   - id: implement

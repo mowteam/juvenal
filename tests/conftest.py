@@ -52,7 +52,7 @@ def sample_yaml(tmp_path):
 name: test-workflow
 backend: claude
 working_dir: "."
-max_retries: 3
+max_bounces: 3
 
 phases:
   - id: setup
@@ -122,7 +122,7 @@ def simple_workflow():
             Phase(id="setup-check", type="script", run="exit 0"),
         ],
         backend="claude",
-        max_retries=3,
+        max_bounces=3,
     )
 
 

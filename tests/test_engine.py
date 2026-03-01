@@ -12,27 +12,58 @@ from tests.conftest import MockBackend
 
 class TestVerdictParsing:
     def test_pass(self):
-        assert parse_verdict("some output\nVERDICT: PASS") == (True, "")
+        passed, reason, target = parse_verdict("some output\nVERDICT: PASS")
+        assert passed
+        assert reason == ""
+        assert target is None
 
     def test_fail_with_reason(self):
-        passed, reason = parse_verdict("output\nVERDICT: FAIL: tests broken")
+        passed, reason, target = parse_verdict("output\nVERDICT: FAIL: tests broken")
         assert not passed
         assert reason == "tests broken"
+        assert target is None
 
     def test_fail_without_reason(self):
-        passed, reason = parse_verdict("VERDICT: FAIL")
+        passed, reason, target = parse_verdict("VERDICT: FAIL")
         assert not passed
         assert reason == "unspecified"
+        assert target is None
 
     def test_no_verdict(self):
-        passed, reason = parse_verdict("no verdict here")
+        passed, reason, target = parse_verdict("no verdict here")
         assert not passed
         assert "did not emit a VERDICT" in reason
+        assert target is None
 
     def test_verdict_scan_backwards(self):
         """Should find the last VERDICT line."""
         output = "VERDICT: FAIL: old\nmore stuff\nVERDICT: PASS"
-        assert parse_verdict(output) == (True, "")
+        passed, reason, target = parse_verdict(output)
+        assert passed
+        assert reason == ""
+        assert target is None
+
+    def test_fail_with_bounce_target(self):
+        """VERDICT: FAIL(target-id): reason extracts both target and reason."""
+        passed, reason, target = parse_verdict("review\nVERDICT: FAIL(design-experiments): needs more data")
+        assert not passed
+        assert reason == "needs more data"
+        assert target == "design-experiments"
+
+    def test_fail_with_bounce_target_no_reason(self):
+        """VERDICT: FAIL(target-id): with empty reason."""
+        passed, reason, target = parse_verdict("VERDICT: FAIL(write-paper):")
+        assert not passed
+        assert reason == "unspecified"
+        assert target == "write-paper"
+
+    def test_fail_with_bounce_target_scan_backwards(self):
+        """Should find the last VERDICT line even with targeted fail."""
+        output = "VERDICT: FAIL: old reason\nmore output\nVERDICT: FAIL(phase-b): new reason"
+        passed, reason, target = parse_verdict(output)
+        assert not passed
+        assert reason == "new reason"
+        assert target == "phase-b"
 
 
 class TestEngineWithMockedBackend:
@@ -52,7 +83,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -68,7 +99,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -79,14 +110,14 @@ class TestEngineWithMockedBackend:
         backend.add_response(exit_code=0, output="done")  # implement attempt 1
         # Script fails -> bounce 1 -> back to implement
         backend.add_response(exit_code=0, output="done")  # implement attempt 2
-        # Script fails -> bounce 2 -> exhausted (max_retries=2)
+        # Script fails -> bounce 2 -> exhausted (max_bounces=2)
         workflow = Workflow(
             name="test",
             phases=[
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="false"),  # always fails
             ],
-            max_retries=2,
+            max_bounces=2,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 1  # exhausted
@@ -102,7 +133,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-review", type="check", role="tester"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -120,7 +151,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-review", type="check", role="tester"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -139,7 +170,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="phase2", type="implement", prompt="Do phase 2."),
                 Phase(id="phase2-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -155,7 +186,7 @@ class TestEngineWithMockedBackend:
         backend.add_response(exit_code=0, output="phase1 fixed")
         # Phase 1 check: pass
         backend.add_response(exit_code=0, output="VERDICT: PASS")
-        # Phase 2 implement: crash -> bounce 2 -> exhausted (max_retries=2)
+        # Phase 2 implement: crash -> bounce 2 -> exhausted (max_bounces=2)
         backend.add_response(exit_code=1, output="crash")
         workflow = Workflow(
             name="test",
@@ -164,7 +195,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="phase1-review", type="check", role="tester"),
                 Phase(id="phase2", type="implement", prompt="Do phase 2."),
             ],
-            max_retries=2,
+            max_bounces=2,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 1  # exhausted
@@ -185,7 +216,91 @@ class TestEngineWithMockedBackend:
                 Phase(id="feature", type="implement", prompt="Build feature."),
                 Phase(id="feature-review", type="check", role="tester", bounce_target="setup"),
             ],
-            max_retries=3,
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+
+    def test_agent_guided_bounce_valid_target(self, tmp_path):
+        """Check with bounce_targets: agent picks a valid target via VERDICT: FAIL(target)."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="setup done")  # setup implement
+        backend.add_response(exit_code=0, output="experiments designed")  # design-experiments implement
+        backend.add_response(exit_code=0, output="paper written")  # write-paper implement
+        # Review picks design-experiments as bounce target
+        backend.add_response(exit_code=0, output="VERDICT: FAIL(design-experiments): needs more data")
+        # Re-run from design-experiments
+        backend.add_response(exit_code=0, output="experiments redesigned")  # design-experiments again
+        backend.add_response(exit_code=0, output="paper rewritten")  # write-paper again
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # review passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Set up."),
+                Phase(id="design-experiments", type="implement", prompt="Design experiments."),
+                Phase(id="write-paper", type="implement", prompt="Write paper."),
+                Phase(
+                    id="review",
+                    type="check",
+                    role="tester",
+                    bounce_targets=["design-experiments", "write-paper"],
+                ),
+            ],
+            max_bounces=5,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+
+    def test_agent_guided_bounce_invalid_target_falls_back(self, tmp_path):
+        """Agent picks a target not in bounce_targets — falls back to first in list."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="phase-a done")  # phase-a
+        backend.add_response(exit_code=0, output="phase-b done")  # phase-b
+        # Review specifies invalid target -> falls back to phase-a (first in list)
+        backend.add_response(exit_code=0, output="VERDICT: FAIL(nonexistent): bad")
+        backend.add_response(exit_code=0, output="phase-a redone")  # phase-a again
+        backend.add_response(exit_code=0, output="phase-b redone")  # phase-b again
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # review passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="phase-a", type="implement", prompt="Do A."),
+                Phase(id="phase-b", type="implement", prompt="Do B."),
+                Phase(
+                    id="review",
+                    type="check",
+                    role="tester",
+                    bounce_targets=["phase-a", "phase-b"],
+                ),
+            ],
+            max_bounces=5,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+
+    def test_agent_guided_bounce_no_target_in_verdict(self, tmp_path):
+        """Agent emits VERDICT: FAIL without a target — falls back to first in bounce_targets."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="phase-a done")  # phase-a
+        backend.add_response(exit_code=0, output="phase-b done")  # phase-b
+        # Review fails without specifying target -> falls back to phase-a (first in list)
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: something wrong")
+        backend.add_response(exit_code=0, output="phase-a redone")  # phase-a again
+        backend.add_response(exit_code=0, output="phase-b redone")  # phase-b again
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="phase-a", type="implement", prompt="Do A."),
+                Phase(id="phase-b", type="implement", prompt="Do B."),
+                Phase(
+                    id="review",
+                    type="check",
+                    role="tester",
+                    bounce_targets=["phase-a", "phase-b"],
+                ),
+            ],
+            max_bounces=5,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -216,7 +331,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path, plain=True)
         assert engine.run() == 0
@@ -236,7 +351,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="false"),
             ],
-            max_retries=1,
+            max_bounces=1,
         )
         engine = self._make_engine(workflow, backend, tmp_path, plain=True)
         assert engine.run() == 1
