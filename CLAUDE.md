@@ -31,7 +31,7 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 
 | Module | Purpose |
 |--------|---------|
-| `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups. Global bounce counter (`max_retries`) limits total bounces across all phases. |
+| `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups. Global bounce counter (`max_bounces`) limits total bounces across all phases. |
 | `workflow.py` | Workflow loading and `Phase`/`Workflow` dataclasses. Supports YAML, directory convention, and bare `.md` formats. |
 | `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. |
 | `state.py` | Atomic JSON state persistence (`PipelineState`). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume from last checkpoint. |

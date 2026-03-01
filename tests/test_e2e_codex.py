@@ -38,7 +38,7 @@ def test_trivial_workflow_codex(tmp_path):
         ],
         backend="codex",
         working_dir=str(work_dir),
-        max_retries=3,
+        max_bounces=3,
     )
 
     engine = Engine(workflow, state_file=str(tmp_path / "state.json"))

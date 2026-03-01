@@ -83,7 +83,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -99,7 +99,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -110,14 +110,14 @@ class TestEngineWithMockedBackend:
         backend.add_response(exit_code=0, output="done")  # implement attempt 1
         # Script fails -> bounce 1 -> back to implement
         backend.add_response(exit_code=0, output="done")  # implement attempt 2
-        # Script fails -> bounce 2 -> exhausted (max_retries=2)
+        # Script fails -> bounce 2 -> exhausted (max_bounces=2)
         workflow = Workflow(
             name="test",
             phases=[
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-check", type="script", run="false"),  # always fails
             ],
-            max_retries=2,
+            max_bounces=2,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 1  # exhausted
@@ -133,7 +133,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-review", type="check", role="tester"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -151,7 +151,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="setup", type="implement", prompt="Do it."),
                 Phase(id="setup-review", type="check", role="tester"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -170,7 +170,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="phase2", type="implement", prompt="Do phase 2."),
                 Phase(id="phase2-check", type="script", run="true"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -186,7 +186,7 @@ class TestEngineWithMockedBackend:
         backend.add_response(exit_code=0, output="phase1 fixed")
         # Phase 1 check: pass
         backend.add_response(exit_code=0, output="VERDICT: PASS")
-        # Phase 2 implement: crash -> bounce 2 -> exhausted (max_retries=2)
+        # Phase 2 implement: crash -> bounce 2 -> exhausted (max_bounces=2)
         backend.add_response(exit_code=1, output="crash")
         workflow = Workflow(
             name="test",
@@ -195,7 +195,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="phase1-review", type="check", role="tester"),
                 Phase(id="phase2", type="implement", prompt="Do phase 2."),
             ],
-            max_retries=2,
+            max_bounces=2,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 1  # exhausted
@@ -216,7 +216,7 @@ class TestEngineWithMockedBackend:
                 Phase(id="feature", type="implement", prompt="Build feature."),
                 Phase(id="feature-review", type="check", role="tester", bounce_target="setup"),
             ],
-            max_retries=3,
+            max_bounces=3,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -246,7 +246,7 @@ class TestEngineWithMockedBackend:
                     bounce_targets=["design-experiments", "write-paper"],
                 ),
             ],
-            max_retries=5,
+            max_bounces=5,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -273,7 +273,7 @@ class TestEngineWithMockedBackend:
                     bounce_targets=["phase-a", "phase-b"],
                 ),
             ],
-            max_retries=5,
+            max_bounces=5,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
@@ -300,7 +300,7 @@ class TestEngineWithMockedBackend:
                     bounce_targets=["phase-a", "phase-b"],
                 ),
             ],
-            max_retries=5,
+            max_bounces=5,
         )
         engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0

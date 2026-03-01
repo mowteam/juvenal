@@ -84,7 +84,7 @@ class Engine:
                     result = self._run_parallel_group(pg)
                     if result.bounce_target:
                         bounces += 1
-                        if bounces >= self.workflow.max_retries:
+                        if bounces >= self.workflow.max_bounces:
                             raise PipelineExhausted(phase.id)
                         self.state.invalidate_from(result.bounce_target)
                         phase_idx = self._find_phase_index(result.bounce_target)
@@ -110,7 +110,7 @@ class Engine:
                     phase_idx += 1
                 elif result.bounce_target:
                     bounces += 1
-                    if bounces >= self.workflow.max_retries:
+                    if bounces >= self.workflow.max_bounces:
                         raise PipelineExhausted(phase.id)
                     self.state.invalidate_from(result.bounce_target)
                     phase_idx = self._find_phase_index(result.bounce_target)
@@ -283,7 +283,7 @@ class Engine:
         print(f"Workflow: {self.workflow.name}")
         print(f"Backend: {self.workflow.backend}")
         print(f"Working dir: {self.workflow.working_dir}")
-        print(f"Max retries (global bounces): {self.workflow.max_retries}")
+        print(f"Max bounces: {self.workflow.max_bounces}")
         print()
         for i, phase in enumerate(self.workflow.phases):
             print(f"Phase {i + 1}: {phase.id} ({phase.type})")

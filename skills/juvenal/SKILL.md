@@ -30,7 +30,7 @@ The key insight: the implementing agent and the checking agent are separate, so 
 name: "my-workflow"
 backend: claude  # or "codex"
 working_dir: "."
-max_retries: 999  # global bounce limit
+max_bounces: 999  # global bounce limit
 
 phases:
   - id: setup

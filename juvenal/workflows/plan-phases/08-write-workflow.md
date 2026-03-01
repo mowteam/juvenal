@@ -47,6 +47,6 @@ Guidelines:
       or VERDICT: FAIL(implement): reason depending on the issue.
   ```
 - `bounce_target` and `bounce_targets` are mutually exclusive on the same phase
-- Set appropriate `max_retries` (default 999 means effectively unlimited)
+- Set appropriate `max_bounces` (default 999 means effectively unlimited)
 
 Write ONLY the workflow.yaml file. Do not write any other files or output.

@@ -55,7 +55,7 @@ class Workflow:
     phases: list[Phase]
     backend: str = "codex"
     working_dir: str = "."
-    max_retries: int = 999
+    max_bounces: int = 999
     parallel_groups: list[list[str]] = field(default_factory=list)
 
 
@@ -136,7 +136,7 @@ def _load_yaml(path: Path) -> Workflow:
         phases=phases,
         backend=data.get("backend", "codex"),
         working_dir=data.get("working_dir", "."),
-        max_retries=data.get("max_retries", 999),
+        max_bounces=data.get("max_bounces", data.get("max_retries", 999)),
         parallel_groups=parallel_groups,
     )
 
@@ -185,7 +185,7 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
         phases=phases,
         backend=overrides.get("backend", "claude"),
         working_dir=overrides.get("working_dir", "."),
-        max_retries=overrides.get("max_retries", 999),
+        max_bounces=overrides.get("max_bounces", overrides.get("max_retries", 999)),
         parallel_groups=[pg.get("phases", []) for pg in overrides.get("parallel_groups", [])],
     )
 

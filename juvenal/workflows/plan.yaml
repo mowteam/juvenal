@@ -1,6 +1,6 @@
 name: plan
 backend: claude
-max_retries: 999
+max_bounces: 999
 
 phases:
   - id: plan-draft

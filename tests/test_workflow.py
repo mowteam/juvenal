@@ -10,7 +10,7 @@ class TestYAMLLoading:
         wf = load_workflow(sample_yaml)
         assert wf.name == "test-workflow"
         assert wf.backend == "claude"
-        assert wf.max_retries == 3
+        assert wf.max_bounces == 3
         assert len(wf.phases) == 5
 
     def test_yaml_phases(self, sample_yaml):
