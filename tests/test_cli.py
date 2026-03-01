@@ -30,6 +30,8 @@ class TestArgumentParsing:
                 "--dry-run",
                 "--working-dir",
                 "/tmp",
+                "--state-file",
+                "custom-state.json",
             ]
         )
         assert args.resume
@@ -38,6 +40,12 @@ class TestArgumentParsing:
         assert args.backend == "codex"
         assert args.dry_run
         assert args.working_dir == "/tmp"
+        assert args.state_file == "custom-state.json"
+
+    def test_run_state_file_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml"])
+        assert args.state_file is None
 
     def test_plan(self):
         parser = build_parser()
@@ -79,6 +87,12 @@ class TestArgumentParsing:
         args = parser.parse_args(["init", "myproject", "--template", "basic"])
         assert args.directory == "myproject"
         assert args.template == "basic"
+
+    def test_validate(self):
+        parser = build_parser()
+        args = parser.parse_args(["validate", "workflow.yaml"])
+        assert args.command == "validate"
+        assert args.workflow == "workflow.yaml"
 
     def test_no_command(self):
         parser = build_parser()

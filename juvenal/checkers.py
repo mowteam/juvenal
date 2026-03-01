@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 
@@ -14,8 +15,12 @@ class ScriptResult:
     output: str
 
 
-def run_script(command: str, working_dir: str, timeout: int = 600) -> ScriptResult:
+def run_script(command: str, working_dir: str, timeout: int = 600, env: dict[str, str] | None = None) -> ScriptResult:
     """Run a shell command. Returns exit code and combined stdout+stderr."""
+    proc_env = dict(os.environ)
+    if env:
+        proc_env.update(env)
+
     try:
         result = subprocess.run(
             command,
@@ -24,6 +29,7 @@ def run_script(command: str, working_dir: str, timeout: int = 600) -> ScriptResu
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=proc_env,
         )
         return ScriptResult(
             exit_code=result.returncode,
