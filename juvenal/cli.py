@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--resume", action="store_true", help="Resume from last saved state")
     run_p.add_argument("--phase", help="Start from a specific phase")
     run_p.add_argument("--max-retries", type=int, default=999, help="Max retries per phase (default: 999)")
-    run_p.add_argument("--backend", choices=["claude", "codex"], default="claude", help="AI backend to use")
+    run_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
     run_p.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
     run_p.add_argument("--working-dir", help="Working directory for the agent")
 
@@ -29,12 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p = sub.add_parser("plan", help="Generate a workflow from a goal description")
     plan_p.add_argument("goal", help="Goal description")
     plan_p.add_argument("-o", "--output", default="workflow.yaml", help="Output file (default: workflow.yaml)")
-    plan_p.add_argument("--backend", choices=["claude", "codex"], default="claude", help="AI backend to use")
+    plan_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
 
     # do
     do_p = sub.add_parser("do", help="Plan + immediately run a workflow")
     do_p.add_argument("goal", help="Goal description")
-    do_p.add_argument("--backend", choices=["claude", "codex"], default="claude", help="AI backend to use")
+    do_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
     do_p.add_argument("--max-retries", type=int, default=999, help="Max retries per phase (default: 999)")
 
     # status

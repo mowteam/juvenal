@@ -9,7 +9,7 @@ class TestArgumentParsing:
         args = parser.parse_args(["run", "workflow.yaml"])
         assert args.command == "run"
         assert args.workflow == "workflow.yaml"
-        assert args.backend == "claude"
+        assert args.backend == "codex"
         assert args.max_retries == 999
         assert not args.resume
         assert not args.dry_run
@@ -92,4 +92,4 @@ class TestArgumentParsing:
         except SystemExit:
             pass
         captured = capsys.readouterr()
-        assert "0.3.1" in captured.out
+        assert "0.3.2" in captured.out

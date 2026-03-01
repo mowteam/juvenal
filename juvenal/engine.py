@@ -292,7 +292,7 @@ class Engine:
         return 0
 
 
-def plan_workflow(goal: str, output_path: str, backend_name: str = "claude", plain: bool = False) -> None:
+def plan_workflow(goal: str, output_path: str, backend_name: str = "codex", plain: bool = False) -> None:
     """Generate a workflow YAML from a goal description using a multi-phase pipeline."""
     import yaml as _yaml
 

@@ -9,7 +9,7 @@ Guidelines:
 - Use composite checkers when you want an agent to review test/build output
 - Order phases from setup/scaffolding to implementation to polish
 - Keep prompts specific and actionable
-- Set `backend: claude` unless the user specifies otherwise
+- Set `backend: codex` unless the user specifies otherwise
 
 Output ONLY the workflow.yaml content, no explanation.
 

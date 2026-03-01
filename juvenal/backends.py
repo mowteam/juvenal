@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -59,6 +60,9 @@ class ClaudeBackend(Backend):
             prompt,
         ]
 
+        # Strip CLAUDECODE env var so juvenal can be invoked from inside Claude Code
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         start = time.time()
         proc = subprocess.Popen(
             cmd,
@@ -67,6 +71,7 @@ class ClaudeBackend(Backend):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
 
         transcript_lines: list[str] = []

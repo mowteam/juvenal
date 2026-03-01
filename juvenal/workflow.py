@@ -51,7 +51,7 @@ class Workflow:
 
     name: str
     phases: list[Phase]
-    backend: str = "claude"
+    backend: str = "codex"
     working_dir: str = "."
     max_retries: int = 999
     bounce_targets: dict[str, str] = field(default_factory=dict)
@@ -127,7 +127,7 @@ def _load_yaml(path: Path) -> Workflow:
     return Workflow(
         name=data.get("name", path.stem),
         phases=phases,
-        backend=data.get("backend", "claude"),
+        backend=data.get("backend", "codex"),
         working_dir=data.get("working_dir", "."),
         max_retries=data.get("max_retries", 999),
         bounce_targets=data.get("bounce_targets", {}),
