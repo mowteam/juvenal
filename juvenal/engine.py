@@ -175,10 +175,7 @@ class Engine:
             return PhaseResult(success=True)
 
         # Failure — find most recent implement phase and jump back
-        failure_context = (
-            f"Script '{phase.run}' failed (exit {result.exit_code}).\n"
-            f"Output:\n{result.output[-3000:]}"
-        )
+        failure_context = f"Script '{phase.run}' failed (exit {result.exit_code}).\nOutput:\n{result.output[-3000:]}"
         self.display.step_fail(phase.id, failure_context[:500])
 
         target_id = self._find_last_implement(phases, phase_idx)
