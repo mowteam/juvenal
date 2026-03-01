@@ -28,10 +28,21 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest tests/ -x --ignore=tests/test_e2e_claude.py --ignore=tests/test_e2e_codex.py --ignore=tests/test_skill.py
 
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      has-anthropic: ${{ steps.check.outputs.has-anthropic }}
+      has-openai: ${{ steps.check.outputs.has-openai }}
+    steps:
+      - id: check
+        run: |
+          echo "has-anthropic=${{ secrets.ANTHROPIC_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+          echo "has-openai=${{ secrets.OPENAI_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
   e2e-claude:
     runs-on: ubuntu-latest
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-    needs: [lint, unit]
+    if: needs.check-secrets.outputs.has-anthropic == 'true'
+    needs: [lint, unit, check-secrets]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,8 +56,8 @@ jobs:
 
   e2e-codex:
     runs-on: ubuntu-latest
-    if: ${{ secrets.OPENAI_API_KEY != '' }}
-    needs: [lint, unit]
+    if: needs.check-secrets.outputs.has-openai == 'true'
+    needs: [lint, unit, check-secrets]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -66,8 +77,8 @@ jobs:
 
   e2e-skill:
     runs-on: ubuntu-latest
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-    needs: [lint, unit]
+    if: needs.check-secrets.outputs.has-anthropic == 'true'
+    needs: [lint, unit, check-secrets]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
