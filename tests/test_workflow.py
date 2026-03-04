@@ -235,6 +235,210 @@ phases:
         assert wf.phases[0].max_depth is None
 
 
+class TestCheckersShorthand:
+    def test_checkers_role(self, tmp_path):
+        """role checker expands to check phase."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - role: tester
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert len(wf.phases) == 2
+        assert wf.phases[1].id == "build~check-1"
+        assert wf.phases[1].type == "check"
+        assert wf.phases[1].role == "tester"
+
+    def test_checkers_prompt(self, tmp_path):
+        """prompt checker expands to check phase."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - prompt: "Verify REST endpoints work."
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert len(wf.phases) == 2
+        assert wf.phases[1].id == "build~check-1"
+        assert wf.phases[1].type == "check"
+        assert wf.phases[1].prompt == "Verify REST endpoints work."
+
+    def test_checkers_script(self, tmp_path):
+        """run checker expands to script phase."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - run: "pytest tests/ -x"
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert len(wf.phases) == 2
+        assert wf.phases[1].id == "build~script-1"
+        assert wf.phases[1].type == "script"
+        assert wf.phases[1].run == "pytest tests/ -x"
+
+    def test_checkers_bare_string(self, tmp_path):
+        """bare string role shorthand."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - tester
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert len(wf.phases) == 2
+        assert wf.phases[1].id == "build~check-1"
+        assert wf.phases[1].type == "check"
+        assert wf.phases[1].role == "tester"
+
+    def test_checkers_mixed(self, tmp_path):
+        """all types together, verify order and IDs."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build-feature
+    prompt: "Build the thing."
+    checkers:
+      - role: tester
+      - prompt: "Verify REST endpoints."
+      - run: "pytest tests/ -x"
+      - tester
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert len(wf.phases) == 5
+        assert wf.phases[1].id == "build-feature~check-1"
+        assert wf.phases[1].role == "tester"
+        assert wf.phases[2].id == "build-feature~check-2"
+        assert wf.phases[2].prompt == "Verify REST endpoints."
+        assert wf.phases[3].id == "build-feature~script-1"
+        assert wf.phases[3].run == "pytest tests/ -x"
+        assert wf.phases[4].id == "build-feature~check-3"
+        assert wf.phases[4].role == "tester"
+
+    def test_checkers_bounce_target(self, tmp_path):
+        """all synthetic phases bounce to parent."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - role: tester
+      - run: "make test"
+      - prompt: "Check it."
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        for phase in wf.phases[1:]:
+            assert phase.bounce_target == "build"
+
+    def test_checkers_with_timeout_env(self, tmp_path):
+        """timeout/env passthrough."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - role: tester
+        timeout: 120
+        env:
+          CI: "true"
+      - run: "pytest"
+        timeout: 60
+        env:
+          FAST: "1"
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert wf.phases[1].timeout == 120
+        assert wf.phases[1].env == {"CI": "true"}
+        assert wf.phases[2].timeout == 60
+        assert wf.phases[2].env == {"FAST": "1"}
+
+    def test_checkers_invalid_role(self, tmp_path):
+        """bare string not in VALID_ROLES errors."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - nonexistent-role
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="unknown role"):
+            load_workflow(yaml_path)
+
+    def test_checkers_invalid_role_dict(self, tmp_path):
+        """dict with invalid role errors."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - role: bogus
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="unknown role"):
+            load_workflow(yaml_path)
+
+    def test_checkers_invalid_entry(self, tmp_path):
+        """dict with no recognized key errors."""
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - foo: bar
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="must have"):
+            load_workflow(yaml_path)
+
+    def test_checkers_prompt_file(self, tmp_path):
+        """prompt_file checker loads from file."""
+        (tmp_path / "check.md").write_text("Check everything works.")
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build it."
+    checkers:
+      - prompt_file: check.md
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+        wf = load_workflow(yaml_path)
+        assert wf.phases[1].prompt == "Check everything works."
+
+
 class TestErrors:
     def test_nonexistent_path(self):
         with pytest.raises(FileNotFoundError):

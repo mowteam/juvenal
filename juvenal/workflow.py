@@ -143,20 +143,22 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         bounce_targets = phase_data.get("bounce_targets", [])
         if bounce_target and bounce_targets:
             raise ValueError(f"Phase '{phase_data['id']}': bounce_target and bounce_targets are mutually exclusive")
-        phases.append(
-            Phase(
-                id=phase_data["id"],
-                type=phase_data.get("type", "implement"),
-                prompt=prompt,
-                run=phase_data.get("run"),
-                role=phase_data.get("role"),
-                bounce_target=bounce_target,
-                bounce_targets=bounce_targets,
-                timeout=phase_data.get("timeout"),
-                env=phase_data.get("env", {}),
-                max_depth=phase_data.get("max_depth"),
-            )
+        phase = Phase(
+            id=phase_data["id"],
+            type=phase_data.get("type", "implement"),
+            prompt=prompt,
+            run=phase_data.get("run"),
+            role=phase_data.get("role"),
+            bounce_target=bounce_target,
+            bounce_targets=bounce_targets,
+            timeout=phase_data.get("timeout"),
+            env=phase_data.get("env", {}),
+            max_depth=phase_data.get("max_depth"),
         )
+        phases.append(phase)
+
+        if "checkers" in phase_data:
+            phases.extend(_expand_checkers(phase.id, phase_data["checkers"], path.parent))
 
     parallel_groups = list(included_parallel_groups)
     for pg in data.get("parallel_groups", []):
@@ -251,6 +253,97 @@ def _load_bare_file(path: Path) -> Workflow:
         Phase(id=f"{path.stem}-check", type="check", role="tester"),
     ]
     return Workflow(name=path.stem, phases=phases)
+
+
+def _expand_checkers(parent_id: str, checkers: list, base_path: Path) -> list[Phase]:
+    """Expand inline checkers on an implement phase into synthetic check/script phases.
+
+    Each entry can be:
+    - bare string -> role shorthand (must be in VALID_ROLES)
+    - dict with "role" -> check phase with built-in role
+    - dict with "prompt" or "prompt_file" -> check phase with inline/file prompt
+    - dict with "run" -> script phase
+    Dicts may also carry "timeout" and "env".
+    """
+    result: list[Phase] = []
+    check_n = 0
+    script_n = 0
+
+    for i, entry in enumerate(checkers):
+        if isinstance(entry, str):
+            # Bare string = role shorthand
+            if entry not in VALID_ROLES:
+                raise ValueError(
+                    f"Phase {parent_id!r}: checkers entry {i}: unknown role {entry!r} (valid: {sorted(VALID_ROLES)})"
+                )
+            check_n += 1
+            result.append(
+                Phase(
+                    id=f"{parent_id}~check-{check_n}",
+                    type="check",
+                    role=entry,
+                    bounce_target=parent_id,
+                )
+            )
+        elif isinstance(entry, dict):
+            timeout = entry.get("timeout")
+            env = entry.get("env", {})
+
+            if "run" in entry:
+                script_n += 1
+                result.append(
+                    Phase(
+                        id=f"{parent_id}~script-{script_n}",
+                        type="script",
+                        run=entry["run"],
+                        bounce_target=parent_id,
+                        timeout=timeout,
+                        env=env,
+                    )
+                )
+            elif "role" in entry:
+                role = entry["role"]
+                if role not in VALID_ROLES:
+                    raise ValueError(
+                        f"Phase {parent_id!r}: checkers entry {i}: unknown role {role!r} "
+                        f"(valid: {sorted(VALID_ROLES)})"
+                    )
+                check_n += 1
+                result.append(
+                    Phase(
+                        id=f"{parent_id}~check-{check_n}",
+                        type="check",
+                        role=role,
+                        bounce_target=parent_id,
+                        timeout=timeout,
+                        env=env,
+                    )
+                )
+            elif "prompt" in entry or "prompt_file" in entry:
+                prompt = entry.get("prompt", "")
+                if not prompt and entry.get("prompt_file"):
+                    prompt = (base_path / entry["prompt_file"]).read_text()
+                check_n += 1
+                result.append(
+                    Phase(
+                        id=f"{parent_id}~check-{check_n}",
+                        type="check",
+                        prompt=prompt,
+                        bounce_target=parent_id,
+                        timeout=timeout,
+                        env=env,
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"Phase {parent_id!r}: checkers entry {i}: must have 'role', 'prompt', 'prompt_file', or 'run'"
+                )
+        else:
+            raise ValueError(
+                f"Phase {parent_id!r}: checkers entry {i}: expected string or dict, got {type(entry).__name__}"
+            )
+
+    return result
 
 
 def _load_role_prompt(role: str) -> str:

@@ -666,6 +666,49 @@ class TestWorkflowPhase:
         assert "Build a REST API" in captured.out
 
 
+class TestCheckersShorthandEngine:
+    def _make_engine(self, workflow, backend, tmp_path, **kwargs):
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), **kwargs)
+        engine.backend = backend
+        return engine
+
+    def test_checkers_bounce_on_fail(self, tmp_path):
+        """Implement passes, inline checker fails, bounces back to implement."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it")  # implement
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad code")  # check bounces
+        backend.add_response(exit_code=0, output="fixed it")  # implement again
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="build~check-1", type="check", role="tester", bounce_target="build"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+
+    def test_checkers_script_bounce_on_fail(self, tmp_path):
+        """Implement passes, inline script checker fails, bounces back to implement."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it")  # implement attempt 1
+        # script "false" fails -> bounce
+        backend.add_response(exit_code=0, output="fixed it")  # implement attempt 2
+        # script "true" would pass but we use "false" always -> bounce 2 -> exhausted
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="build~script-1", type="script", run="false", bounce_target="build"),
+            ],
+            max_bounces=2,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 1  # exhausted
+
+
 class TestNoVerdictResume:
     def _make_engine(self, workflow, backend, tmp_path, **kwargs):
         """Create an engine with injected mock backend."""
