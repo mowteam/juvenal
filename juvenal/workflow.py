@@ -313,8 +313,7 @@ def _expand_checkers(
                 role = entry["role"]
                 if role not in VALID_ROLES:
                     raise ValueError(
-                        f"Phase {parent_id!r}: checkers entry {i}: unknown role {role!r} "
-                        f"(valid: {sorted(VALID_ROLES)})"
+                        f"Phase {parent_id!r}: checkers entry {i}: unknown role {role!r} (valid: {sorted(VALID_ROLES)})"
                     )
                 check_n += 1
                 result.append(
@@ -452,9 +451,7 @@ def inject_checkers(workflow: Workflow, checker_specs: list[str]) -> Workflow:
             i += 1
 
         # Expand CLI checkers with proper offsets
-        expanded = _expand_checkers(
-            parent_id, parsed, check_offset=existing_checks, script_offset=existing_scripts
-        )
+        expanded = _expand_checkers(parent_id, parsed, check_offset=existing_checks, script_offset=existing_scripts)
         new_phases.extend(expanded)
 
     return Workflow(
