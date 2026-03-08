@@ -70,7 +70,7 @@ class ClaudeBackend(Backend):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
     ) -> AgentResult:
-        session_id = uuid.uuid4().hex
+        session_id = str(uuid.uuid4())
         cmd = [
             "claude",
             "-p",
