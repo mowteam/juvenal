@@ -73,7 +73,7 @@ def load_workflow(path: str | Path) -> Workflow:
     - .yaml/.yml file -> YAML workflow
     - directory with phases/ subdir -> directory convention
     - directory with .md files -> bare .md convention
-    - single .md file -> single-phase workflow with default checker
+    - single .md file -> single-phase workflow (no checker unless --checker is used)
     """
     p = Path(path)
     if not p.exists():
@@ -201,7 +201,6 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
             phase_id = entry.stem
             prompt = entry.read_text()
             phases.append(Phase(id=phase_id, type="implement", prompt=prompt))
-            phases.append(Phase(id=f"{phase_id}-check", type="check", role="tester"))
         elif entry.is_dir():
             loaded = _load_phase_dir(entry)
             if loaded:
@@ -246,11 +245,10 @@ def _load_phase_dir(phase_dir: Path) -> list[Phase] | None:
 
 
 def _load_bare_file(path: Path) -> Workflow:
-    """Load a single .md file as a two-phase workflow: implement + check."""
+    """Load a single .md file as a single implement phase workflow."""
     prompt = path.read_text()
     phases = [
         Phase(id=path.stem, type="implement", prompt=prompt),
-        Phase(id=f"{path.stem}-check", type="check", role="tester"),
     ]
     return Workflow(name=path.stem, phases=phases)
 

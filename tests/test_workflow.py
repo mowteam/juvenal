@@ -75,13 +75,10 @@ class TestDirectoryLoading:
 class TestBareFileLoading:
     def test_load_bare_md(self, bare_md):
         wf = load_workflow(bare_md)
-        assert len(wf.phases) == 2
+        assert len(wf.phases) == 1
         assert wf.phases[0].id == "task"
         assert wf.phases[0].type == "implement"
         assert wf.phases[0].prompt == "Implement a hello world program."
-        assert wf.phases[1].id == "task-check"
-        assert wf.phases[1].type == "check"
-        assert wf.phases[1].role == "tester"
 
 
 class TestPhaseRendering:
