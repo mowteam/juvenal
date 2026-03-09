@@ -85,6 +85,18 @@ class TestInvalidation:
         assert state.phases["b"].status == "pending"
         assert state.phases["c"].status == "pending"
 
+    def test_invalidate_preserves_attempt_count(self, tmp_path):
+        """invalidate_from should not reset the attempt counter."""
+        state = PipelineState(state_file=tmp_path / "state.json")
+        state.set_attempt("a", 1)
+        state.mark_completed("a")
+        state.set_attempt("b", 2)
+        state.mark_completed("b")
+        state.invalidate_from("b")
+
+        assert state.phases["a"].attempt == 1  # untouched
+        assert state.phases["b"].attempt == 2  # preserved through invalidation
+
 
 class TestLoadEmpty:
     def test_load_nonexistent(self, tmp_path):

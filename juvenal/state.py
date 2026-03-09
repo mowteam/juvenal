@@ -91,14 +91,17 @@ class PipelineState:
         return inp, out
 
     def invalidate_from(self, phase_id: str) -> None:
-        """Invalidate this phase and all subsequent phases (for bounce targets)."""
+        """Invalidate this phase and all subsequent phases (for bounce targets).
+
+        Preserves attempt count (cumulative across bounces) and failure_context
+        (set separately after invalidation by the engine loop).
+        """
         found = False
         for pid, ps in self.phases.items():
             if pid == phase_id:
                 found = True
             if found:
                 ps.status = "pending"
-                ps.attempt = 0
                 ps.failure_context = ""
                 ps.started_at = None
                 ps.completed_at = None

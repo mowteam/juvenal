@@ -759,6 +759,23 @@ class TestCheckersShorthandEngine:
         retry_prompt = backend.calls[2]
         assert "missing error handling" in retry_prompt
 
+    def test_injected_checker_attempt_increments_on_bounce(self, tmp_path):
+        """Attempt counter should increment when a checker bounces back to the implement phase."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it")  # implement attempt 1
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad")  # check fails -> bounce
+        backend.add_response(exit_code=0, output="fixed it")  # implement attempt 2
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.")],
+            max_bounces=3,
+        )
+        workflow = inject_checkers(workflow, ["tester"])
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+        assert engine.state.phases["build"].attempt == 2
+
     def test_checker_failure_context_delivered_multi_phase(self, tmp_path):
         """With --checkers on multiple phases, bounced phase gets failure context."""
         backend = MockBackend()
