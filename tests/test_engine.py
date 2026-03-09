@@ -6,7 +6,7 @@ import pytest
 
 from juvenal.checkers import parse_verdict
 from juvenal.engine import Engine, _extract_yaml
-from juvenal.workflow import Phase, Workflow, inject_checkers
+from juvenal.workflow import Phase, Workflow, inject_checkers, inject_implementer
 from tests.conftest import MockBackend
 
 
@@ -802,6 +802,46 @@ class TestCheckersShorthandEngine:
         # calls[4] = phase-b retry implement — should contain failure context
         retry_prompt = backend.calls[4]
         assert "tests not passing" in retry_prompt
+
+
+class TestImplementerEngine:
+    def _make_engine(self, workflow, backend, tmp_path, **kwargs):
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), **kwargs)
+        engine.backend = backend
+        return engine
+
+    def test_implementer_prompt_reaches_backend(self, tmp_path):
+        """inject_implementer preamble is included in the prompt sent to the backend."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build a REST API.")],
+        )
+        workflow = inject_implementer(workflow, "software-engineer")
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+        assert len(backend.calls) == 1
+        prompt = backend.calls[0]
+        assert "expert software engineer" in prompt
+        assert "Build a REST API." in prompt
+
+    def test_implementer_with_checker(self, tmp_path):
+        """--implementer and --checker work together."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it")  # implement
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.")],
+        )
+        workflow = inject_implementer(workflow, "software-engineer")
+        workflow = inject_checkers(workflow, ["tester"])
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+        # Implement prompt has the preamble
+        assert "expert software engineer" in backend.calls[0]
+        assert "Build it." in backend.calls[0]
 
 
 class TestNoVerdictResume:

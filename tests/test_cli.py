@@ -147,6 +147,26 @@ class TestArgumentParsing:
         args = parser.parse_args(["do", "build a thing"])
         assert args.checker == []
 
+    def test_run_implementer(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml", "--implementer", "software-engineer"])
+        assert args.implementer == "software-engineer"
+
+    def test_run_implementer_default_none(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml"])
+        assert args.implementer is None
+
+    def test_plan_implementer(self):
+        parser = build_parser()
+        args = parser.parse_args(["plan", "build an API", "--implementer", "software-engineer"])
+        assert args.implementer == "software-engineer"
+
+    def test_do_implementer(self):
+        parser = build_parser()
+        args = parser.parse_args(["do", "build a thing", "--implementer", "software-engineer"])
+        assert args.implementer == "software-engineer"
+
     def test_no_command(self):
         parser = build_parser()
         args = parser.parse_args([])

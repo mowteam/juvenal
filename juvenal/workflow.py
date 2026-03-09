@@ -363,6 +363,7 @@ def _load_role_prompt(role: str) -> str:
 
 VALID_PHASE_TYPES = {"implement", "check", "script", "workflow"}
 VALID_ROLES = {"tester", "architect", "pm", "senior-tester", "senior-engineer"}
+VALID_IMPLEMENTER_ROLES = {"software-engineer"}
 
 
 def parse_checker_string(spec: str) -> dict | str:
@@ -451,6 +452,57 @@ def inject_checkers(workflow: Workflow, checker_specs: list[str]) -> Workflow:
         # Expand CLI checkers with proper offsets
         expanded = _expand_checkers(parent_id, parsed, check_offset=existing_checks, script_offset=existing_scripts)
         new_phases.extend(expanded)
+
+    return Workflow(
+        name=workflow.name,
+        phases=new_phases,
+        backend=workflow.backend,
+        working_dir=workflow.working_dir,
+        max_bounces=workflow.max_bounces,
+        parallel_groups=workflow.parallel_groups,
+        backoff=workflow.backoff,
+        max_backoff=workflow.max_backoff,
+        notify=list(workflow.notify),
+    )
+
+
+def _load_implementer_prompt(role: str) -> str:
+    """Load a built-in implementer role prompt from the prompts directory."""
+    role_file = f"implementer-{role}.md"
+    prompts_dir = Path(__file__).parent / "prompts"
+    role_path = prompts_dir / role_file
+    if role_path.exists():
+        return role_path.read_text()
+    raise FileNotFoundError(f"Built-in implementer prompt not found: {role_file}")
+
+
+def inject_implementer(workflow: Workflow, role: str) -> Workflow:
+    """Prepend an implementer role prompt to every implement phase in the workflow.
+
+    Returns a new Workflow with modified prompts.
+    """
+    if role not in VALID_IMPLEMENTER_ROLES:
+        raise ValueError(
+            f"Invalid --implementer role {role!r}: must be one of {sorted(VALID_IMPLEMENTER_ROLES)}"
+        )
+
+    preamble = _load_implementer_prompt(role)
+    new_phases = []
+    for phase in workflow.phases:
+        if phase.type == "implement":
+            phase = Phase(
+                id=phase.id,
+                type=phase.type,
+                prompt=preamble + phase.prompt,
+                run=phase.run,
+                role=phase.role,
+                bounce_target=phase.bounce_target,
+                bounce_targets=list(phase.bounce_targets),
+                timeout=phase.timeout,
+                env=dict(phase.env),
+                max_depth=phase.max_depth,
+            )
+        new_phases.append(phase)
 
     return Workflow(
         name=workflow.name,

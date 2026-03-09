@@ -2,7 +2,7 @@
 
 import pytest
 
-from juvenal.workflow import Phase, Workflow, inject_checkers, load_workflow, parse_checker_string
+from juvenal.workflow import Phase, Workflow, inject_checkers, inject_implementer, load_workflow, parse_checker_string
 
 
 class TestYAMLLoading:
@@ -434,6 +434,78 @@ phases:
         yaml_path.write_text(yaml_content)
         wf = load_workflow(yaml_path)
         assert wf.phases[1].prompt == "Check everything works."
+
+
+class TestInjectImplementer:
+    def test_prepends_role_prompt(self):
+        """inject_implementer prepends the role prompt to implement phases."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build the feature.")],
+        )
+        result = inject_implementer(wf, "software-engineer")
+        assert result.phases[0].prompt.endswith("Build the feature.")
+        assert "expert software engineer" in result.phases[0].prompt
+
+    def test_only_affects_implement_phases(self):
+        """Non-implement phases are left untouched."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="verify", type="check", role="tester"),
+                Phase(id="lint", type="script", run="ruff check"),
+            ],
+        )
+        result = inject_implementer(wf, "software-engineer")
+        assert "expert software engineer" in result.phases[0].prompt
+        assert result.phases[1].role == "tester"
+        assert result.phases[1].prompt == ""
+        assert result.phases[2].run == "ruff check"
+
+    def test_multiple_implement_phases(self):
+        """All implement phases get the preamble."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Set up."),
+                Phase(id="build", type="implement", prompt="Build it."),
+            ],
+        )
+        result = inject_implementer(wf, "software-engineer")
+        assert "expert software engineer" in result.phases[0].prompt
+        assert result.phases[0].prompt.endswith("Set up.")
+        assert "expert software engineer" in result.phases[1].prompt
+        assert result.phases[1].prompt.endswith("Build it.")
+
+    def test_invalid_role_raises(self):
+        """Invalid role name raises ValueError."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.")],
+        )
+        with pytest.raises(ValueError, match="Invalid --implementer role"):
+            inject_implementer(wf, "nonexistent-role")
+
+    def test_preserves_workflow_fields(self):
+        """inject_implementer preserves all other workflow fields."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.", bounce_target="setup", timeout=120)],
+            backend="claude",
+            max_bounces=5,
+            backoff=2.0,
+            max_backoff=30.0,
+            notify=["https://example.com/hook"],
+        )
+        result = inject_implementer(wf, "software-engineer")
+        assert result.backend == "claude"
+        assert result.max_bounces == 5
+        assert result.backoff == 2.0
+        assert result.max_backoff == 30.0
+        assert result.notify == ["https://example.com/hook"]
+        assert result.phases[0].bounce_target == "setup"
+        assert result.phases[0].timeout == 120
 
 
 class TestErrors:

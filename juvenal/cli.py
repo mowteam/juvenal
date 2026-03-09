@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--notify", action="append", default=[], help="Webhook URL for completion/failure notifications")
     run_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
+    run_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
 
     # plan
     plan_p = sub.add_parser("plan", help="Generate a workflow from a goal description")
@@ -39,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument("-o", "--output", default="workflow.yaml", help="Output file (default: workflow.yaml)")
     plan_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
     plan_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
+    plan_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
 
     # do
     do_p = sub.add_parser("do", help="Plan + immediately run a workflow")
@@ -46,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     do_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
     do_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
     do_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
+    do_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
 
     # status
     status_p = sub.add_parser("status", help="Show workflow progress")
@@ -65,9 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_run(args: argparse.Namespace) -> int:
     from juvenal.engine import Engine
-    from juvenal.workflow import inject_checkers, load_workflow, validate_workflow
+    from juvenal.workflow import inject_checkers, inject_implementer, load_workflow, validate_workflow
 
     workflow = load_workflow(args.workflow)
+    if args.implementer:
+        workflow = inject_implementer(workflow, args.implementer)
     if args.checker:
         workflow = inject_checkers(workflow, args.checker)
     errors = validate_workflow(workflow)
@@ -105,6 +110,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     from juvenal.engine import plan_workflow
 
     plan_workflow(args.goal, args.output, args.backend, plain=args.plain)
+    if args.implementer:
+        _inject_implementer_into_yaml(args.output, args.implementer)
     if args.checker:
         _inject_checkers_into_yaml(args.output, args.checker)
     return 0
@@ -130,16 +137,37 @@ def _inject_checkers_into_yaml(yaml_path: str, checker_specs: list[str]) -> None
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+def _inject_implementer_into_yaml(yaml_path: str, role: str) -> None:
+    """Post-process a generated YAML file to prepend an implementer role prompt to each implement phase."""
+    import yaml
+
+    from juvenal.workflow import _load_implementer_prompt
+
+    preamble = _load_implementer_prompt(role)
+
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f)
+
+    for phase in data.get("phases", []):
+        if phase.get("type", "implement") == "implement":
+            phase["prompt"] = preamble + phase.get("prompt", "")
+
+    with open(yaml_path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
 def cmd_do(args: argparse.Namespace) -> int:
     import tempfile
 
     from juvenal.engine import Engine, plan_workflow
-    from juvenal.workflow import inject_checkers, load_workflow
+    from juvenal.workflow import inject_checkers, inject_implementer, load_workflow
 
     with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
         plan_workflow(args.goal, f.name, args.backend, plain=args.plain)
         workflow = load_workflow(f.name)
 
+    if args.implementer:
+        workflow = inject_implementer(workflow, args.implementer)
     if args.checker:
         workflow = inject_checkers(workflow, args.checker)
     if args.backend:
