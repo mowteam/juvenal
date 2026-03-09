@@ -218,9 +218,9 @@ class CodexBackend(Backend):
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
-            prompt,
+            "-",
         ]
-        return self._run_codex_process(cmd, working_dir, display_callback, timeout, env)
+        return self._run_codex_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
 
     def resume_agent(
         self,
@@ -240,9 +240,9 @@ class CodexBackend(Backend):
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
-            prompt,
+            "-",
         ]
-        result = self._run_codex_process(cmd, working_dir, display_callback, timeout, env)
+        result = self._run_codex_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
         result.session_id = session_id
         return result
 
@@ -253,6 +253,7 @@ class CodexBackend(Backend):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        stdin_input: str | None = None,
     ) -> AgentResult:
         proc_env = dict(os.environ)
         if env:
@@ -262,12 +263,17 @@ class CodexBackend(Backend):
         proc = subprocess.Popen(
             cmd,
             cwd=working_dir,
+            stdin=subprocess.PIPE if stdin_input else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             env=proc_env,
         )
+
+        if stdin_input:
+            proc.stdin.write(stdin_input)
+            proc.stdin.close()
 
         transcript_lines: list[str] = []
         assistant_messages: list[str] = []
