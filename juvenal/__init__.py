@@ -1,3 +1,5 @@
 """Juvenal — Who guards the agents?"""
 
-__version__ = "0.9.1"
+from importlib.metadata import version
+
+__version__ = version("juvenal")
