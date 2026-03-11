@@ -1,6 +1,7 @@
 """Unit tests for the execution engine with mocked backend."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1217,3 +1218,189 @@ class TestPlanWorkflow:
         ):
             with pytest.raises(SystemExit):
                 plan_workflow("goal", str(tmp_path / "out.yaml"))
+
+
+class TestBaselineSha:
+    def _make_engine(self, workflow, backend, tmp_path, **kwargs):
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), **kwargs)
+        engine.backend = backend
+        return engine
+
+    def test_baseline_sha_captured_on_first_implement(self, tmp_path):
+        """Engine captures git HEAD as baseline_sha before the first implement run."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Do it."),
+                Phase(id="check", type="script", run="true"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+
+        with patch.object(engine, "_get_git_head", return_value="abc123"):
+            engine.run()
+
+        assert engine.state.phases["setup"].baseline_sha == "abc123"
+
+    def test_baseline_sha_not_overwritten_on_bounce(self, tmp_path):
+        """baseline_sha is set once and not overwritten when the phase re-runs after bounce."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")  # implement attempt 1
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad")  # check fails
+        backend.add_response(exit_code=0, output="fixed")  # implement attempt 2
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="review", type="check", role="tester"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+
+        call_count = 0
+
+        def mock_git_head():
+            nonlocal call_count
+            call_count += 1
+            return f"sha-{call_count}"
+
+        with patch.object(engine, "_get_git_head", side_effect=mock_git_head):
+            engine.run()
+
+        # Should keep the first SHA, not overwrite on the second implement run
+        assert engine.state.phases["build"].baseline_sha == "sha-1"
+
+    def test_baseline_sha_injected_into_check_prompt(self, tmp_path):
+        """Check phase receives the baseline SHA in its prompt."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="implemented")  # implement
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Do it."),
+                Phase(id="review", type="check", prompt="Check the work."),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+
+        with patch.object(engine, "_get_git_head", return_value="deadbeef"):
+            engine.run()
+
+        # The check prompt should contain the baseline SHA
+        check_prompt = backend.calls[1]  # second call is the check
+        assert "deadbeef" in check_prompt
+        assert "git diff deadbeef..HEAD" in check_prompt
+
+    def test_baseline_sha_injected_on_bounce_recheck(self, tmp_path):
+        """After a bounce, the re-run checker still gets the original baseline SHA."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")  # implement attempt 1
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad")  # check fails
+        backend.add_response(exit_code=0, output="fixed")  # implement attempt 2
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="review", type="check", prompt="Review."),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+
+        with patch.object(engine, "_get_git_head", return_value="baseline-sha"):
+            engine.run()
+
+        # Both check calls should have the same baseline SHA
+        first_check = backend.calls[1]  # implement, check, implement, check
+        second_check = backend.calls[3]
+        assert "baseline-sha" in first_check
+        assert "baseline-sha" in second_check
+
+    def test_no_baseline_when_not_git_repo(self, tmp_path):
+        """When not in a git repo, baseline_sha is None and no SHA is injected."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")  # implement
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Do it."),
+                Phase(id="review", type="check", prompt="Check."),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+
+        with patch.object(engine, "_get_git_head", return_value=None):
+            engine.run()
+
+        assert engine.state.phases["setup"].baseline_sha is None
+        # Check prompt should not have git diff instruction
+        check_prompt = backend.calls[1]
+        assert "git diff" not in check_prompt
+
+    def test_baseline_sha_with_explicit_bounce_target(self, tmp_path):
+        """Check phase with explicit bounce_target uses the target's baseline SHA."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="setup done")  # setup implement
+        backend.add_response(exit_code=0, output="feature done")  # feature implement
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # review passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Set up."),
+                Phase(id="feature", type="implement", prompt="Build feature."),
+                Phase(id="review", type="check", prompt="Review.", bounce_target="setup"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+
+        call_count = 0
+
+        def mock_git_head():
+            nonlocal call_count
+            call_count += 1
+            # setup gets sha-1, feature gets sha-2
+            return f"sha-{call_count}"
+
+        with patch.object(engine, "_get_git_head", side_effect=mock_git_head):
+            engine.run()
+
+        # Review's bounce_target is "setup", so it should use setup's baseline SHA
+        check_prompt = backend.calls[2]
+        assert "sha-1" in check_prompt
+
+    def test_baseline_sha_persists_through_state_save_load(self, tmp_path):
+        """baseline_sha survives state save and load (for --resume)."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")
+        backend.add_response(exit_code=1, output="crash")  # next phase crashes -> exhausted
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="phase1", type="implement", prompt="Do phase 1."),
+                Phase(id="phase2", type="implement", prompt="Do phase 2."),
+            ],
+            max_bounces=1,
+        )
+        state_file = str(tmp_path / "state.json")
+        engine = Engine(workflow, state_file=state_file)
+        engine.backend = backend
+
+        with patch.object(engine, "_get_git_head", return_value="persist-sha"):
+            engine.run()
+
+        # Load state from disk and verify baseline_sha survived
+        from juvenal.state import PipelineState
+
+        loaded = PipelineState.load(state_file)
+        assert loaded.phases["phase1"].baseline_sha == "persist-sha"

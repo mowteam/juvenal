@@ -25,6 +25,7 @@ class PhaseState:
     completed_at: float | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    baseline_sha: str | None = None  # git HEAD before first implement run
 
 
 @dataclass
@@ -93,8 +94,8 @@ class PipelineState:
     def invalidate_from(self, phase_id: str) -> None:
         """Invalidate this phase and all subsequent phases (for bounce targets).
 
-        Preserves attempt count (cumulative across bounces) and failure_context
-        (set separately after invalidation by the engine loop).
+        Preserves attempt count, baseline_sha (cumulative across bounces), and
+        failure_context (set separately after invalidation by the engine loop).
         """
         found = False
         for pid, ps in self.phases.items():
@@ -149,6 +150,7 @@ class PipelineState:
                     completed_at=pdata.get("completed_at"),
                     input_tokens=pdata.get("input_tokens", 0),
                     output_tokens=pdata.get("output_tokens", 0),
+                    baseline_sha=pdata.get("baseline_sha"),
                 )
         return state
 
@@ -195,6 +197,7 @@ class PipelineState:
                     "completed_at": ps.completed_at,
                     "input_tokens": ps.input_tokens,
                     "output_tokens": ps.output_tokens,
+                    "baseline_sha": ps.baseline_sha,
                 }
                 for pid, ps in self.phases.items()
             },

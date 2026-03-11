@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -179,8 +180,12 @@ class Engine:
         """Run an implement phase once. On crash, return a bounce target."""
         failure_context = self.state.get_failure_context(phase.id)
 
-        ps = self.state.phases.get(phase.id)
-        attempt = (ps.attempt if ps and ps.attempt > 0 else 0) + 1
+        ps = self.state._ensure_phase(phase.id)
+        if ps.baseline_sha is None:
+            ps.baseline_sha = self._get_git_head()
+            self.state.save()
+
+        attempt = (ps.attempt if ps.attempt > 0 else 0) + 1
         self.state.set_attempt(phase.id, attempt)
         self.display.phase_start(phase.id, attempt)
 
@@ -275,6 +280,16 @@ class Engine:
         self.display.step_start(f"check: {phase.id}")
 
         prompt = phase.render_check_prompt()
+
+        # Inject baseline SHA so the checker can see ALL changes, not just the latest commit
+        baseline_sha = self._get_baseline_sha(phase, phases, phase_idx)
+        if baseline_sha:
+            prompt += (
+                f"\n\nIMPORTANT: The implementation started from commit {baseline_sha}. "
+                f"Use `git diff {baseline_sha}..HEAD` to see ALL changes made by the implementor, "
+                "not just the latest commit. This ensures you review the complete scope of work."
+            )
+
         result = self.backend.run_agent(
             prompt,
             working_dir=self.workflow.working_dir,
@@ -473,6 +488,31 @@ class Engine:
         delay = min(base * (2 ** (bounces - 1)), self.workflow.max_backoff)
         self.display.backoff_wait(delay)
         time.sleep(delay)
+
+    def _get_git_head(self) -> str | None:
+        """Get the current git HEAD SHA, or None if not in a git repo."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.workflow.working_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return None
+
+    def _get_baseline_sha(self, phase: Phase, phases: list[Phase], phase_idx: int) -> str | None:
+        """Get the baseline SHA for a check/script phase's bounce target."""
+        target_id = self._resolve_bounce_target(phase, phases, phase_idx)
+        if target_id:
+            target_ps = self.state.phases.get(target_id)
+            if target_ps and target_ps.baseline_sha:
+                return target_ps.baseline_sha
+        return None
 
     def _send_notifications(self, success: bool, bounces: int) -> None:
         """Send webhook notifications if configured."""

@@ -98,6 +98,38 @@ class TestInvalidation:
         assert state.phases["b"].attempt == 2  # preserved through invalidation
 
 
+class TestBaselineSha:
+    def test_baseline_sha_default_none(self, tmp_path):
+        state = PipelineState(state_file=tmp_path / "state.json")
+        ps = state._ensure_phase("setup")
+        assert ps.baseline_sha is None
+
+    def test_baseline_sha_persisted(self, tmp_path):
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        ps = state._ensure_phase("setup")
+        ps.baseline_sha = "abc123"
+        state.save()
+
+        loaded = PipelineState.load(state_file)
+        assert loaded.phases["setup"].baseline_sha == "abc123"
+
+    def test_invalidate_preserves_baseline_sha(self, tmp_path):
+        """invalidate_from should not reset baseline_sha."""
+        state = PipelineState(state_file=tmp_path / "state.json")
+        ps_a = state._ensure_phase("a")
+        ps_a.baseline_sha = "sha-a"
+        state.mark_completed("a")
+        ps_b = state._ensure_phase("b")
+        ps_b.baseline_sha = "sha-b"
+        state.mark_completed("b")
+        state.invalidate_from("b")
+
+        assert state.phases["a"].baseline_sha == "sha-a"  # untouched
+        assert state.phases["b"].baseline_sha == "sha-b"  # preserved through invalidation
+        assert state.phases["b"].status == "pending"
+
+
 class TestLoadEmpty:
     def test_load_nonexistent(self, tmp_path):
         state = PipelineState.load(tmp_path / "nonexistent.json")
