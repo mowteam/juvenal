@@ -65,6 +65,7 @@ class Engine:
         plain: bool = False,
         _depth: int = 0,
         _max_depth: int = 3,
+        preserve_context_on_bounce: bool = False,
     ):
         self.workflow = workflow
         self.backend = create_backend(workflow.backend)
@@ -72,6 +73,9 @@ class Engine:
         self._depth = _depth
         self._max_depth = _max_depth
         self.dry_run = dry_run
+        self.preserve_context_on_bounce = preserve_context_on_bounce
+        self._session_ids: dict[str, str] = {}  # phase_id -> last session_id
+        self._bounce_targets: set[str] = set()  # phases that should resume on next run
 
         sf = state_file or ".juvenal-state.json"
         needs_state = resume or rewind is not None or rewind_to is not None
@@ -118,6 +122,7 @@ class Engine:
                         self.state.invalidate_from(result.bounce_target)
                         if result.failure_context:
                             self.state.set_failure_context(result.bounce_target, result.failure_context)
+                        self._bounce_targets.add(result.bounce_target)
                         phase_idx = self._find_phase_index(result.bounce_target)
                         continue
                     if not result.success:
@@ -149,6 +154,7 @@ class Engine:
                     self.state.invalidate_from(result.bounce_target)
                     if result.failure_context:
                         self.state.set_failure_context(result.bounce_target, result.failure_context)
+                    self._bounce_targets.add(result.bounce_target)
                     phase_idx = self._find_phase_index(result.bounce_target)
                 else:
                     raise PipelineExhausted(phase.id)
@@ -178,17 +184,44 @@ class Engine:
         self.state.set_attempt(phase.id, attempt)
         self.display.phase_start(phase.id, attempt)
 
-        prompt = phase.render_prompt(failure_context=failure_context)
-        self.display.step_start("implement")
-        result = self.backend.run_agent(
-            prompt,
-            working_dir=self.workflow.working_dir,
-            display_callback=self.display.live_update,
-            timeout=phase.timeout,
-            env=phase.env or None,
+        # When preserve_context_on_bounce is enabled and we're bouncing back to this
+        # phase, resume the previous session instead of starting fresh. The failure
+        # context is sent as the resume message (not the full prompt).
+        should_resume = (
+            self.preserve_context_on_bounce and phase.id in self._bounce_targets and phase.id in self._session_ids
         )
+        self._bounce_targets.discard(phase.id)
+
+        self.display.step_start("implement")
+        if should_resume:
+            resume_prompt = (
+                "A previous attempt failed verification.\n"
+                f"Failure details:\n\n{failure_context}\n\n"
+                "Fix these issues in your implementation.\n"
+            )
+            result = self.backend.resume_agent(
+                self._session_ids[phase.id],
+                resume_prompt,
+                working_dir=self.workflow.working_dir,
+                display_callback=self.display.live_update,
+                timeout=phase.timeout,
+                env=phase.env or None,
+            )
+        else:
+            prompt = phase.render_prompt(failure_context=failure_context)
+            result = self.backend.run_agent(
+                prompt,
+                working_dir=self.workflow.working_dir,
+                display_callback=self.display.live_update,
+                timeout=phase.timeout,
+                env=phase.env or None,
+            )
         self.state.log_step(phase.id, attempt, "implement", result.output)
         self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
+
+        # Track session ID for potential future resume
+        if result.session_id:
+            self._session_ids[phase.id] = result.session_id
 
         if result.exit_code != 0:
             failure_context = f"Implementation agent crashed (exit {result.exit_code}).\n{result.output[-3000:]}"

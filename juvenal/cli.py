@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--notify", action="append", default=[], help="Webhook URL for completion/failure notifications")
     run_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
     run_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
+    run_p.add_argument(
+        "--preserve-context-on-bounce",
+        action="store_true",
+        help="Resume agent session when bouncing back (preserves conversation context)",
+    )
 
     # plan
     plan_p = sub.add_parser("plan", help="Generate a workflow from a goal description")
@@ -49,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     do_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
     do_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
     do_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
+    do_p.add_argument(
+        "--preserve-context-on-bounce",
+        action="store_true",
+        help="Resume agent session when bouncing back (preserves conversation context)",
+    )
 
     # status
     status_p = sub.add_parser("status", help="Show workflow progress")
@@ -102,6 +112,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         state_file=state_file,
         plain=args.plain,
+        preserve_context_on_bounce=args.preserve_context_on_bounce,
     )
     return engine.run()
 
@@ -175,7 +186,7 @@ def cmd_do(args: argparse.Namespace) -> int:
     if args.max_bounces:
         workflow.max_bounces = args.max_bounces
 
-    engine = Engine(workflow, plain=args.plain)
+    engine = Engine(workflow, plain=args.plain, preserve_context_on_bounce=args.preserve_context_on_bounce)
     return engine.run()
 
 

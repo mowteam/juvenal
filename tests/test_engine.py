@@ -480,6 +480,150 @@ class TestEngineWithMockedBackend:
         assert workflow.phases[0].timeout == 60
 
 
+class TestPreserveContextOnBounce:
+    def _make_engine(self, workflow, backend, tmp_path, **kwargs):
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), **kwargs)
+        engine.backend = backend
+        return engine
+
+    def test_bounce_uses_resume_agent(self, tmp_path):
+        """With preserve_context_on_bounce, bouncing back resumes the session."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it", session_id="sess-1")  # implement attempt 1
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad code")  # check fails -> bounce
+        backend.add_response(exit_code=0, output="fixed it", session_id="sess-1")  # implement attempt 2 (resumed)
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="review", type="check", role="tester"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        assert engine.run() == 0
+
+        # First call is run_agent (fresh), second implement call should be resume_agent
+        assert len(backend.calls) == 3  # implement + check + check (2nd)
+        assert len(backend.resume_calls) == 1
+        session_id, prompt = backend.resume_calls[0]
+        assert session_id == "sess-1"
+        assert "failed verification" in prompt
+
+    def test_bounce_without_flag_uses_run_agent(self, tmp_path):
+        """Without preserve_context_on_bounce, bouncing back starts fresh."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it", session_id="sess-1")  # implement attempt 1
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad code")  # check fails -> bounce
+        backend.add_response(exit_code=0, output="fixed it")  # implement attempt 2 (fresh)
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="review", type="check", role="tester"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path)
+        assert engine.run() == 0
+
+        # All calls should be run_agent, no resume
+        assert len(backend.calls) == 4
+        assert len(backend.resume_calls) == 0
+
+    def test_forward_after_bounce_starts_fresh(self, tmp_path):
+        """After a bounce+resume, proceeding forward starts fresh sessions."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="phase1 done", session_id="sess-a")  # phase1 implement
+        backend.add_response(exit_code=0, output="phase2 done", session_id="sess-b")  # phase2 implement
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: nope")  # check fails -> bounce to phase1
+        backend.add_response(exit_code=0, output="phase1 fixed", session_id="sess-a2")  # phase1 resumed
+        backend.add_response(exit_code=0, output="phase2 redone", session_id="sess-b2")  # phase2 fresh (not resumed)
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # check passes
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="phase1", type="implement", prompt="Do phase 1."),
+                Phase(id="phase2", type="implement", prompt="Do phase 2."),
+                Phase(id="review", type="check", role="tester", bounce_target="phase1"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        assert engine.run() == 0
+
+        # phase1 resumed (bounce target), phase2 fresh (forward progression)
+        assert len(backend.resume_calls) == 1
+        assert backend.resume_calls[0][0] == "sess-a"
+        # run_agent calls: phase1(1) + phase2(1) + check(1) + phase2(2) + check(2) = 5
+        assert len(backend.calls) == 5
+
+    def test_bounce_without_session_id_falls_back_to_fresh(self, tmp_path):
+        """If no session_id was captured, fall back to run_agent even with the flag."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it")  # no session_id
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: bad")  # check fails -> bounce
+        backend.add_response(exit_code=0, output="fixed it")  # implement attempt 2 (fresh, no session to resume)
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="review", type="check", role="tester"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        assert engine.run() == 0
+
+        # No session_id means no resume, all run_agent
+        assert len(backend.calls) == 4
+        assert len(backend.resume_calls) == 0
+
+    def test_script_bounce_uses_resume(self, tmp_path):
+        """Script failure bounces back and resumes the implement session."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it", session_id="sess-1")  # implement attempt 1
+        # script "false" fails -> bounce
+        backend.add_response(exit_code=0, output="fixed it", session_id="sess-2")  # implement attempt 2 (resumed)
+        # script "true" would pass — use a workflow where it passes on second try
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="build-check", type="script", run="false", bounce_target="build"),
+            ],
+            max_bounces=2,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        # Will exhaust bounces since "false" always fails, but we check resume was used
+        engine.run()
+
+        assert len(backend.resume_calls) == 1
+        assert backend.resume_calls[0][0] == "sess-1"
+
+    def test_crash_bounce_to_self_uses_resume(self, tmp_path):
+        """Implement crash bouncing to self resumes the session."""
+        backend = MockBackend()
+        backend.add_response(exit_code=1, output="crash", session_id="sess-1")  # attempt 1 crashes
+        backend.add_response(exit_code=0, output="done")  # attempt 2 (resumed)
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Do it."),
+                Phase(id="check", type="script", run="true"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        assert engine.run() == 0
+
+        assert len(backend.resume_calls) == 1
+        assert backend.resume_calls[0][0] == "sess-1"
+
+
 class TestWorkflowPhase:
     def _make_engine(self, workflow, backend, tmp_path, **kwargs):
         """Create an engine with injected mock backend."""

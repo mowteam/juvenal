@@ -167,6 +167,21 @@ class TestArgumentParsing:
         args = parser.parse_args(["do", "build a thing", "--implementer", "software-engineer"])
         assert args.implementer == "software-engineer"
 
+    def test_run_preserve_context_on_bounce(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml", "--preserve-context-on-bounce"])
+        assert args.preserve_context_on_bounce is True
+
+    def test_run_preserve_context_on_bounce_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml"])
+        assert args.preserve_context_on_bounce is False
+
+    def test_do_preserve_context_on_bounce(self):
+        parser = build_parser()
+        args = parser.parse_args(["do", "build a thing", "--preserve-context-on-bounce"])
+        assert args.preserve_context_on_bounce is True
+
     def test_no_command(self):
         parser = build_parser()
         args = parser.parse_args([])
