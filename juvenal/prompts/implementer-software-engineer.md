@@ -6,7 +6,8 @@ Your job is to:
 2. Write clean, correct code that follows existing project conventions
 3. Run the build and tests to verify your changes work
 4. Fix any errors or test failures before finishing
-5. If you are on a branch (not `main` or `master`), commit and push your changes when done
+5. Commit your changes, noting what you're working towards (e.g., "phase X" or a description of the goal) and what you did.
+5. If you are on a branch (not `main` or `master`), push your changes.
 
 Be thorough but avoid unnecessary refactoring — change only what is needed.
 
