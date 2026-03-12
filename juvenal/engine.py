@@ -122,7 +122,10 @@ class Engine:
                         self._apply_backoff(bounces)
                         self.state.invalidate_from(result.bounce_target)
                         if result.failure_context:
-                            self.state.set_failure_context(result.bounce_target, result.failure_context)
+                            target_attempt = self.state._ensure_phase(result.bounce_target).attempt
+                            self.state.set_failure_context(
+                                result.bounce_target, result.failure_context, attempt=target_attempt
+                            )
                         self._bounce_targets.add(result.bounce_target)
                         phase_idx = self._find_phase_index(result.bounce_target)
                         continue
@@ -154,7 +157,10 @@ class Engine:
                     self._apply_backoff(bounces)
                     self.state.invalidate_from(result.bounce_target)
                     if result.failure_context:
-                        self.state.set_failure_context(result.bounce_target, result.failure_context)
+                        target_attempt = self.state._ensure_phase(result.bounce_target).attempt
+                        self.state.set_failure_context(
+                            result.bounce_target, result.failure_context, attempt=target_attempt
+                        )
                     self._bounce_targets.add(result.bounce_target)
                     phase_idx = self._find_phase_index(result.bounce_target)
                 else:

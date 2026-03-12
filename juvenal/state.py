@@ -19,7 +19,7 @@ class PhaseState:
     phase_id: str
     status: str = "pending"  # pending, running, completed, failed
     attempt: int = 0
-    failure_context: str = ""
+    failure_contexts: list[dict] = field(default_factory=list)
     logs: list[dict] = field(default_factory=list)
     started_at: float | None = None
     completed_at: float | None = None
@@ -57,14 +57,23 @@ class PipelineState:
         ps.completed_at = time.time()
         self.save()
 
-    def set_failure_context(self, phase_id: str, context: str) -> None:
+    def set_failure_context(self, phase_id: str, context: str, attempt: int | None = None) -> None:
         ps = self._ensure_phase(phase_id)
-        ps.failure_context = context
+        entry: dict = {
+            "context": context,
+            "timestamp": time.time(),
+        }
+        if attempt is not None:
+            entry["attempt"] = attempt
+        ps.failure_contexts.append(entry)
         self.save()
 
     def get_failure_context(self, phase_id: str) -> str:
+        """Return the most recent failure context, or empty string."""
         ps = self.phases.get(phase_id)
-        return ps.failure_context if ps else ""
+        if ps and ps.failure_contexts:
+            return ps.failure_contexts[-1]["context"]
+        return ""
 
     def log_step(self, phase_id: str, attempt: int, step: str, output: str) -> None:
         ps = self._ensure_phase(phase_id)
@@ -94,8 +103,9 @@ class PipelineState:
     def invalidate_from(self, phase_id: str) -> None:
         """Invalidate this phase and all subsequent phases (for bounce targets).
 
-        Preserves attempt count, baseline_sha (cumulative across bounces), and
-        failure_context (set separately after invalidation by the engine loop).
+        Preserves attempt count, baseline_sha (cumulative across bounces),
+        failure_contexts (append-only history, new context set separately after
+        invalidation by the engine loop).
         """
         found = False
         for pid, ps in self.phases.items():
@@ -103,7 +113,6 @@ class PipelineState:
                 found = True
             if found:
                 ps.status = "pending"
-                ps.failure_context = ""
                 ps.started_at = None
                 ps.completed_at = None
         self.save()
@@ -140,11 +149,15 @@ class PipelineState:
             state.started_at = data.get("started_at")
             state.completed_at = data.get("completed_at")
             for pid, pdata in data.get("phases", {}).items():
+                # Backwards compat: migrate scalar failure_context to list
+                fc_raw = pdata.get("failure_contexts", [])
+                if not fc_raw and pdata.get("failure_context"):
+                    fc_raw = [{"context": pdata["failure_context"], "timestamp": 0}]
                 state.phases[pid] = PhaseState(
                     phase_id=pid,
                     status=pdata.get("status", "pending"),
                     attempt=pdata.get("attempt", 0),
-                    failure_context=pdata.get("failure_context", ""),
+                    failure_contexts=fc_raw,
                     logs=pdata.get("logs", []),
                     started_at=pdata.get("started_at"),
                     completed_at=pdata.get("completed_at"),
@@ -191,7 +204,7 @@ class PipelineState:
                 pid: {
                     "status": ps.status,
                     "attempt": ps.attempt,
-                    "failure_context": ps.failure_context,
+                    "failure_contexts": ps.failure_contexts,
                     "logs": ps.logs,
                     "started_at": ps.started_at,
                     "completed_at": ps.completed_at,

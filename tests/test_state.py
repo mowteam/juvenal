@@ -65,12 +65,60 @@ class TestResumeLogic:
 class TestFailureContext:
     def test_set_and_get_failure_context(self, tmp_path):
         state = PipelineState(state_file=tmp_path / "state.json")
-        state.set_failure_context("phase1", "tests failed")
+        state.set_failure_context("phase1", "tests failed", attempt=1)
         assert state.get_failure_context("phase1") == "tests failed"
+
+    def test_failure_contexts_are_per_attempt(self, tmp_path):
+        state = PipelineState(state_file=tmp_path / "state.json")
+        state.set_failure_context("phase1", "first failure", attempt=1)
+        state.set_failure_context("phase1", "second failure", attempt=2)
+        ps = state.phases["phase1"]
+        assert len(ps.failure_contexts) == 2
+        assert ps.failure_contexts[0]["context"] == "first failure"
+        assert ps.failure_contexts[0]["attempt"] == 1
+        assert ps.failure_contexts[1]["context"] == "second failure"
+        assert ps.failure_contexts[1]["attempt"] == 2
+        # get_failure_context returns latest
+        assert state.get_failure_context("phase1") == "second failure"
+
+    def test_failure_contexts_persist_across_save_load(self, tmp_path):
+        state = PipelineState(state_file=tmp_path / "state.json")
+        state.set_failure_context("phase1", "fail one", attempt=1)
+        state.set_failure_context("phase1", "fail two", attempt=2)
+        loaded = PipelineState.load(tmp_path / "state.json")
+        ps = loaded.phases["phase1"]
+        assert len(ps.failure_contexts) == 2
+        assert ps.failure_contexts[0]["context"] == "fail one"
+        assert ps.failure_contexts[1]["context"] == "fail two"
 
     def test_get_nonexistent_phase(self, tmp_path):
         state = PipelineState(state_file=tmp_path / "state.json")
         assert state.get_failure_context("nonexistent") == ""
+
+    def test_backwards_compat_scalar_failure_context(self, tmp_path):
+        """Old state files with scalar failure_context are migrated on load."""
+        import json
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "started_at": None,
+                    "completed_at": None,
+                    "phases": {
+                        "build": {
+                            "status": "pending",
+                            "attempt": 1,
+                            "failure_context": "old failure",
+                            "logs": [],
+                        }
+                    },
+                }
+            )
+        )
+        loaded = PipelineState.load(state_file)
+        assert loaded.get_failure_context("build") == "old failure"
+        assert len(loaded.phases["build"].failure_contexts) == 1
 
 
 class TestInvalidation:
