@@ -75,6 +75,10 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 - `test_skill.py` tests the Claude Code skill integration
 - CI runs: lint → unit → e2e (on push only)
 
+## Versioning
+
+When bumping the version, update it in both `pyproject.toml` and `.claude-plugin/plugin.json`.
+
 ## Dependencies
 
 **Runtime**: `pyyaml>=6.0` (workflow parsing), `rich>=13.0` (terminal UI)
