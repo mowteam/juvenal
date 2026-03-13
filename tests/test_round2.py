@@ -13,7 +13,7 @@ from juvenal.backends import AgentResult, _extract_claude_tokens, _extract_codex
 from juvenal.engine import Engine
 from juvenal.notifications import build_notification_payload, send_webhook
 from juvenal.state import PipelineState
-from juvenal.workflow import Phase, Workflow, load_workflow, validate_workflow
+from juvenal.workflow import ParallelGroup, Phase, Workflow, load_workflow, validate_workflow
 from tests.conftest import MockBackend
 
 # ─── Feature 1: Workflow Includes ───────────────────────────────────────────
@@ -111,7 +111,7 @@ parallel_groups:
         )
         (tmp_path / "main.yaml").write_text("name: main\ninclude:\n  - base.yaml\nphases:\n  - id: c\n    prompt: C.\n")
         wf = load_workflow(tmp_path / "main.yaml")
-        assert ["a", "b"] in wf.parallel_groups
+        assert any(pg.phases == ["a", "b"] for pg in wf.parallel_groups)
 
     def test_no_includes(self, tmp_path):
         """Workflow without include key works normally."""
@@ -714,10 +714,114 @@ class TestEnhancedDryRun:
                 Phase(id="a", type="implement", prompt="A."),
                 Phase(id="b", type="implement", prompt="B."),
             ],
-            parallel_groups=[["a", "b"]],
+            parallel_groups=[ParallelGroup(phases=["a", "b"])],
         )
         engine = Engine(workflow, state_file=str(tmp_path / "state.json"), dry_run=True, plain=True)
         engine.run()
         captured = capsys.readouterr()
         assert "Parallel groups:" in captured.out
         assert "['a', 'b']" in captured.out
+
+    def test_dry_run_shows_lane_groups(self, tmp_path, capsys):
+        """Dry-run shows lane groups with 'lanes:' prefix."""
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), dry_run=True, plain=True)
+        engine.run()
+        captured = capsys.readouterr()
+        assert "Parallel groups:" in captured.out
+        assert "lanes:" in captured.out
+
+
+class TestLaneGroupYAML:
+    def test_include_inherits_lane_groups(self, tmp_path):
+        """Lane groups from included workflows are merged."""
+        (tmp_path / "base.yaml").write_text(
+            """\
+name: base
+phases:
+  - id: a
+    prompt: "A."
+  - id: check_a
+    type: check
+    role: tester
+    bounce_target: a
+  - id: b
+    prompt: "B."
+  - id: check_b
+    type: check
+    role: tester
+    bounce_target: b
+parallel_groups:
+  - lanes:
+      - [a, check_a]
+      - [b, check_b]
+"""
+        )
+        (tmp_path / "main.yaml").write_text("name: main\ninclude:\n  - base.yaml\nphases:\n  - id: c\n    prompt: C.\n")
+        wf = load_workflow(tmp_path / "main.yaml")
+        assert len(wf.parallel_groups) == 1
+        pg = wf.parallel_groups[0]
+        assert pg.is_lane_group()
+        assert pg.lanes == [["a", "check_a"], ["b", "check_b"]]
+
+    def test_legacy_flat_parallel_group_still_works(self, tmp_path):
+        """Legacy flat format parallel groups still load and work."""
+        (tmp_path / "wf.yaml").write_text(
+            """\
+name: test
+phases:
+  - id: a
+    prompt: "A."
+  - id: b
+    prompt: "B."
+parallel_groups:
+  - phases: [a, b]
+"""
+        )
+        wf = load_workflow(tmp_path / "wf.yaml")
+        assert len(wf.parallel_groups) == 1
+        pg = wf.parallel_groups[0]
+        assert not pg.is_lane_group()
+        assert pg.phases == ["a", "b"]
+
+    def test_lane_yaml_loading(self, tmp_path):
+        """Lane groups load correctly from YAML."""
+        (tmp_path / "wf.yaml").write_text(
+            """\
+name: test
+phases:
+  - id: a
+    prompt: "A."
+  - id: check_a
+    type: check
+    role: tester
+    bounce_target: a
+  - id: b
+    prompt: "B."
+  - id: check_b
+    type: check
+    role: tester
+    bounce_target: b
+parallel_groups:
+  - lanes:
+      - [a, check_a]
+      - [b, check_b]
+"""
+        )
+        wf = load_workflow(tmp_path / "wf.yaml")
+        assert len(wf.parallel_groups) == 1
+        pg = wf.parallel_groups[0]
+        assert pg.is_lane_group()
+        assert pg.lanes == [["a", "check_a"], ["b", "check_b"]]
+        assert set(pg.all_phase_ids()) == {"a", "check_a", "b", "check_b"}
+        assert pg.first_phase_id() == "a"
+        assert pg.last_phase_id() == "check_b"

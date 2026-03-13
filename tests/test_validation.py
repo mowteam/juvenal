@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from juvenal.cli import build_parser, cmd_validate
-from juvenal.workflow import Phase, Workflow, validate_workflow
+from juvenal.workflow import ParallelGroup, Phase, Workflow, validate_workflow
 
 
 class TestValidateWorkflow:
@@ -113,7 +113,7 @@ class TestValidateWorkflow:
             phases=[
                 Phase(id="setup", type="implement", prompt="Set up."),
             ],
-            parallel_groups=[["setup", "nonexistent"]],
+            parallel_groups=[ParallelGroup(phases=["setup", "nonexistent"])],
         )
         errors = validate_workflow(wf)
         assert any("nonexistent" in e for e in errors)
@@ -125,7 +125,7 @@ class TestValidateWorkflow:
                 Phase(id="a", type="implement", prompt="A."),
                 Phase(id="b", type="implement", prompt="B."),
             ],
-            parallel_groups=[["a", "b"]],
+            parallel_groups=[ParallelGroup(phases=["a", "b"])],
         )
         assert validate_workflow(wf) == []
 
@@ -288,6 +288,87 @@ class TestWorkflowPhaseValidation:
         )
         errors = validate_workflow(wf)
         assert any("max_depth must be >= 1" in e for e in errors)
+
+
+class TestLaneValidation:
+    def test_lane_phase_existence(self):
+        """Lane phase IDs must exist in the workflow."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "nonexistent"]])],
+        )
+        errors = validate_workflow(wf)
+        assert any("nonexistent" in e for e in errors)
+
+    def test_lane_bounce_target_containment(self):
+        """Bounce targets in a lane must stay within that lane."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="b"),
+                Phase(id="b", type="implement", prompt="B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+        )
+        errors = validate_workflow(wf)
+        assert any("outside its lane" in e for e in errors)
+
+    def test_lane_empty(self):
+        """Empty lanes are invalid."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a"], []])],
+        )
+        errors = validate_workflow(wf)
+        assert any("empty" in e for e in errors)
+
+    def test_lane_duplicate_phase(self):
+        """A phase cannot appear in multiple lanes."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="b", type="implement", prompt="B."),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "b"], ["b"]])],
+        )
+        errors = validate_workflow(wf)
+        assert any("multiple lanes" in e for e in errors)
+
+    def test_lane_no_workflow_type(self):
+        """Workflow-type phases are not allowed in lanes."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="dyn", type="workflow", prompt="Dynamic."),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "dyn"]])],
+        )
+        errors = validate_workflow(wf)
+        assert any("workflow-type" in e for e in errors)
+
+    def test_valid_lane_group(self):
+        """A valid lane group passes validation."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+        )
+        assert validate_workflow(wf) == []
 
 
 class TestValidateCLI:

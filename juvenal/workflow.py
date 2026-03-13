@@ -52,6 +52,41 @@ class Phase:
 
 
 @dataclass
+class ParallelGroup:
+    """A group of phases to run in parallel.
+
+    Two formats:
+    - Legacy flat: phases = ["a", "b"] — run implement phases concurrently, no per-phase checking
+    - Lane: lanes = [["a", "check_a"], ["b", "check_b"]] — each lane is a mini-pipeline with internal bounce
+    """
+
+    phases: list[str] = field(default_factory=list)
+    lanes: list[list[str]] = field(default_factory=list)
+
+    def is_lane_group(self) -> bool:
+        """True if this group uses lanes (not legacy flat format)."""
+        return len(self.lanes) > 0
+
+    def all_phase_ids(self) -> list[str]:
+        """All phase IDs referenced by this group."""
+        if self.is_lane_group():
+            return [pid for lane in self.lanes for pid in lane]
+        return list(self.phases)
+
+    def first_phase_id(self) -> str:
+        """First phase ID in this group (for main loop skip logic)."""
+        if self.is_lane_group():
+            return self.lanes[0][0]
+        return self.phases[0]
+
+    def last_phase_id(self) -> str:
+        """Last phase ID in this group (for main loop skip logic)."""
+        if self.is_lane_group():
+            return self.lanes[-1][-1]
+        return self.phases[-1]
+
+
+@dataclass
 class Workflow:
     """Complete workflow definition."""
 
@@ -60,7 +95,7 @@ class Workflow:
     backend: str = "codex"
     working_dir: str = "."
     max_bounces: int = 999
-    parallel_groups: list[list[str]] = field(default_factory=list)
+    parallel_groups: list[ParallelGroup] = field(default_factory=list)
     backoff: float = 0.0  # base backoff delay in seconds between bounces (0 = no backoff)
     max_backoff: float = 60.0  # maximum backoff delay cap in seconds
     notify: list[str] = field(default_factory=list)  # webhook URLs for completion/failure notifications
@@ -124,7 +159,7 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
 
     # Resolve includes first — insert included phases before this workflow's phases
     included_phases: list[Phase] = []
-    included_parallel_groups: list[list[str]] = []
+    included_parallel_groups: list[ParallelGroup] = []
     for include_path_str in data.get("include", []):
         include_path = path.parent / include_path_str
         if not include_path.exists():
@@ -162,7 +197,10 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
 
     parallel_groups = list(included_parallel_groups)
     for pg in data.get("parallel_groups", []):
-        parallel_groups.append(pg.get("phases", []))
+        if "lanes" in pg:
+            parallel_groups.append(ParallelGroup(lanes=pg["lanes"]))
+        else:
+            parallel_groups.append(ParallelGroup(phases=pg.get("phases", [])))
 
     return Workflow(
         name=data.get("name", path.stem),
@@ -221,7 +259,10 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
         backend=overrides.get("backend", "claude"),
         working_dir=overrides.get("working_dir", "."),
         max_bounces=overrides.get("max_bounces", overrides.get("max_retries", 999)),
-        parallel_groups=[pg.get("phases", []) for pg in overrides.get("parallel_groups", [])],
+        parallel_groups=[
+            ParallelGroup(lanes=pg["lanes"]) if "lanes" in pg else ParallelGroup(phases=pg.get("phases", []))
+            for pg in overrides.get("parallel_groups", [])
+        ],
     )
 
 
@@ -573,9 +614,43 @@ def validate_workflow(workflow: Workflow) -> list[str]:
 
     # Parallel group validation
     for i, group in enumerate(workflow.parallel_groups):
-        for pid in group:
+        for pid in group.all_phase_ids():
             if pid not in all_ids:
                 errors.append(f"Parallel group {i}: phase ID {pid!r} does not match any phase")
+
+        if group.is_lane_group():
+            # Lane-specific validation
+            for li, lane in enumerate(group.lanes):
+                if not lane:
+                    errors.append(f"Parallel group {i}, lane {li}: lane is empty")
+                for pid in lane:
+                    if pid in all_ids:
+                        phase = next(p for p in workflow.phases if p.id == pid)
+                        if phase.type == "workflow":
+                            errors.append(
+                                f"Parallel group {i}, lane {li}: workflow-type phase {pid!r} not allowed in lanes"
+                            )
+
+            # Check for phases appearing in multiple lanes
+            seen_ids: set[str] = set()
+            for li, lane in enumerate(group.lanes):
+                for pid in lane:
+                    if pid in seen_ids:
+                        errors.append(f"Parallel group {i}: phase {pid!r} appears in multiple lanes")
+                    seen_ids.add(pid)
+
+            # Check bounce targets stay within their lane
+            for li, lane in enumerate(group.lanes):
+                lane_set = set(lane)
+                for pid in lane:
+                    if pid not in all_ids:
+                        continue
+                    phase = next(p for p in workflow.phases if p.id == pid)
+                    if phase.bounce_target and phase.bounce_target not in lane_set:
+                        errors.append(
+                            f"Parallel group {i}, lane {li}: phase {pid!r} bounce_target "
+                            f"{phase.bounce_target!r} is outside its lane"
+                        )
 
     # Backoff validation
     if workflow.backoff < 0:

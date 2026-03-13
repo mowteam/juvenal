@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from collections import deque
+from threading import Lock
 
 try:
     from rich.console import Console, Group
@@ -39,48 +40,58 @@ class Display:
         self._plain = plain
         self._console = Console() if (RICH_AVAILABLE and not plain) else None
         self._use_live = RICH_AVAILABLE and not plain and sys.stdout.isatty()
+        self._display_lock = Lock()
+        self._parallel_mode = False
+
+    def set_parallel_mode(self, enabled: bool) -> None:
+        """Enable/disable parallel mode. In parallel mode, Live display is skipped."""
+        self._parallel_mode = enabled
 
     def phase_start(self, phase_id: str, attempt: int) -> None:
         """Announce phase start."""
-        if self._console:
-            self._console.rule(f"Phase \\[{phase_id}] attempt {attempt}", style="bold blue")
-        else:
-            print(f"=== Phase [{phase_id}] attempt {attempt} ===", flush=True)
+        with self._display_lock:
+            if self._console:
+                self._console.rule(f"Phase \\[{phase_id}] attempt {attempt}", style="bold blue")
+            else:
+                print(f"=== Phase [{phase_id}] attempt {attempt} ===", flush=True)
 
     def step_start(self, step_name: str) -> None:
         """Start a new step (implement or checker)."""
-        self._worker_name = step_name
-        self._worker_start = time.time()
-        self._live_lines.clear()
-        if self._use_live:
-            self._live_obj = Live(
-                self._build_renderable(),
-                console=self._console,
-                refresh_per_second=8,
-                transient=True,
-            )
-            self._live_obj.start()
-        else:
-            print(f"  > {step_name}...", flush=True)
+        with self._display_lock:
+            self._worker_name = step_name
+            self._worker_start = time.time()
+            self._live_lines.clear()
+            if self._use_live and not self._parallel_mode:
+                self._live_obj = Live(
+                    self._build_renderable(),
+                    console=self._console,
+                    refresh_per_second=8,
+                    transient=True,
+                )
+                self._live_obj.start()
+            else:
+                print(f"  > {step_name}...", flush=True)
 
     def step_pass(self, step_name: str) -> None:
         """Mark step as passed."""
-        self._stop_live()
-        elapsed = _elapsed(self._worker_start)
-        if self._console:
-            self._console.print(f"  [green]PASS[/green] {step_name} ({elapsed})")
-        else:
-            print(f"  PASS {step_name} ({elapsed})", flush=True)
+        with self._display_lock:
+            self._stop_live()
+            elapsed = _elapsed(self._worker_start)
+            if self._console:
+                self._console.print(f"  [green]PASS[/green] {step_name} ({elapsed})")
+            else:
+                print(f"  PASS {step_name} ({elapsed})", flush=True)
 
     def step_fail(self, step_name: str, reason: str) -> None:
         """Mark step as failed."""
-        self._stop_live()
-        elapsed = _elapsed(self._worker_start)
-        safe_reason = reason.replace("[", "\\[") if self._console else reason
-        if self._console:
-            self._console.print(f"  [red]FAIL[/red] {step_name} ({elapsed}): {safe_reason}")
-        else:
-            print(f"  FAIL {step_name} ({elapsed}): {reason}", flush=True)
+        with self._display_lock:
+            self._stop_live()
+            elapsed = _elapsed(self._worker_start)
+            safe_reason = reason.replace("[", "\\[") if self._console else reason
+            if self._console:
+                self._console.print(f"  [red]FAIL[/red] {step_name} ({elapsed}): {safe_reason}")
+            else:
+                print(f"  FAIL {step_name} ({elapsed}): {reason}", flush=True)
 
     def pipeline_done(self, success: bool) -> None:
         """Announce pipeline completion."""
@@ -173,11 +184,12 @@ class Display:
 
     def live_update(self, line: str) -> None:
         """Feed a line of output to the live display."""
-        self._live_lines.append(line)
-        if self._live_obj:
-            self._live_obj.update(self._build_renderable())
-        elif self._plain:
-            print(f"    {line}", flush=True)
+        with self._display_lock:
+            self._live_lines.append(line)
+            if self._live_obj:
+                self._live_obj.update(self._build_renderable())
+            elif self._plain or self._parallel_mode:
+                print(f"    {line}", flush=True)
 
     def _build_renderable(self):
         """Build Rich renderable for the live display."""

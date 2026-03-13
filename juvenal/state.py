@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 
 from rich.console import Console
 from rich.table import Table
@@ -36,37 +37,42 @@ class PipelineState:
     phases: dict[str, PhaseState] = field(default_factory=dict)
     started_at: float | None = None
     completed_at: float | None = None
+    _lock: RLock = field(init=False, repr=False, default_factory=RLock)
 
     def set_attempt(self, phase_id: str, attempt: int) -> None:
-        ps = self._ensure_phase(phase_id)
-        ps.attempt = attempt
-        ps.status = "running"
-        if ps.started_at is None:
-            ps.started_at = time.time()
-        self.save()
+        with self._lock:
+            ps = self._ensure_phase(phase_id)
+            ps.attempt = attempt
+            ps.status = "running"
+            if ps.started_at is None:
+                ps.started_at = time.time()
+            self.save()
 
     def mark_completed(self, phase_id: str) -> None:
-        ps = self._ensure_phase(phase_id)
-        ps.status = "completed"
-        ps.completed_at = time.time()
-        self.save()
+        with self._lock:
+            ps = self._ensure_phase(phase_id)
+            ps.status = "completed"
+            ps.completed_at = time.time()
+            self.save()
 
     def mark_failed(self, phase_id: str) -> None:
-        ps = self._ensure_phase(phase_id)
-        ps.status = "failed"
-        ps.completed_at = time.time()
-        self.save()
+        with self._lock:
+            ps = self._ensure_phase(phase_id)
+            ps.status = "failed"
+            ps.completed_at = time.time()
+            self.save()
 
     def set_failure_context(self, phase_id: str, context: str, attempt: int | None = None) -> None:
-        ps = self._ensure_phase(phase_id)
-        entry: dict = {
-            "context": context,
-            "timestamp": time.time(),
-        }
-        if attempt is not None:
-            entry["attempt"] = attempt
-        ps.failure_contexts.append(entry)
-        self.save()
+        with self._lock:
+            ps = self._ensure_phase(phase_id)
+            entry: dict = {
+                "context": context,
+                "timestamp": time.time(),
+            }
+            if attempt is not None:
+                entry["attempt"] = attempt
+            ps.failure_contexts.append(entry)
+            self.save()
 
     def get_failure_context(self, phase_id: str) -> str:
         """Return the most recent failure context, or empty string."""
@@ -78,26 +84,28 @@ class PipelineState:
     def log_step(
         self, phase_id: str, attempt: int, step: str, output: str, input: str = "", transcript: str = ""
     ) -> None:
-        ps = self._ensure_phase(phase_id)
-        entry: dict = {
-            "attempt": attempt,
-            "step": step,
-            "output": output,
-            "timestamp": time.time(),
-        }
-        if input:
-            entry["input"] = input
-        if transcript:
-            entry["transcript"] = transcript
-        ps.logs.append(entry)
-        self.save()
+        with self._lock:
+            ps = self._ensure_phase(phase_id)
+            entry: dict = {
+                "attempt": attempt,
+                "step": step,
+                "output": output,
+                "timestamp": time.time(),
+            }
+            if input:
+                entry["input"] = input
+            if transcript:
+                entry["transcript"] = transcript
+            ps.logs.append(entry)
+            self.save()
 
     def add_tokens(self, phase_id: str, input_tokens: int, output_tokens: int) -> None:
         """Accumulate token usage for a phase."""
-        ps = self._ensure_phase(phase_id)
-        ps.input_tokens += input_tokens
-        ps.output_tokens += output_tokens
-        self.save()
+        with self._lock:
+            ps = self._ensure_phase(phase_id)
+            ps.input_tokens += input_tokens
+            ps.output_tokens += output_tokens
+            self.save()
 
     def total_tokens(self) -> tuple[int, int]:
         """Return (total_input_tokens, total_output_tokens) across all phases."""
@@ -105,22 +113,28 @@ class PipelineState:
         out = sum(ps.output_tokens for ps in self.phases.values())
         return inp, out
 
-    def invalidate_from(self, phase_id: str) -> None:
+    def invalidate_from(self, phase_id: str, scope: set[str] | None = None) -> None:
         """Invalidate this phase and all subsequent phases (for bounce targets).
 
         Preserves attempt count, baseline_sha (cumulative across bounces),
         failure_contexts (append-only history, new context set separately after
         invalidation by the engine loop).
+
+        If scope is provided, only invalidate phases whose ID is in the scope set.
+        This prevents lane A's bounce from clobbering lane B's state.
         """
-        found = False
-        for pid, ps in self.phases.items():
-            if pid == phase_id:
-                found = True
-            if found:
-                ps.status = "pending"
-                ps.started_at = None
-                ps.completed_at = None
-        self.save()
+        with self._lock:
+            found = False
+            for pid, ps in self.phases.items():
+                if pid == phase_id:
+                    found = True
+                if found:
+                    if scope is not None and pid not in scope:
+                        continue
+                    ps.status = "pending"
+                    ps.started_at = None
+                    ps.completed_at = None
+            self.save()
 
     def get_resume_phase_index(self, phases: list) -> int:
         """Find the first non-completed phase index for resuming."""
@@ -131,16 +145,21 @@ class PipelineState:
         return len(phases)
 
     def save(self) -> None:
-        """Atomic save: write to tmp, fsync, rename."""
-        data = self._to_dict()
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.state_file.with_name(f"{self.state_file.name}.tmp")
-        payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, self.state_file)
+        """Atomic save: write to tmp, fsync, rename.
+
+        Thread-safe: acquires _lock if not already held (RLock is reentrant,
+        so callers that already hold the lock can call save() safely).
+        """
+        with self._lock:
+            data = self._to_dict()
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.state_file.with_name(f"{self.state_file.name}.tmp")
+            payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.state_file)
 
     @classmethod
     def load(cls, state_file: str | Path | None) -> PipelineState:

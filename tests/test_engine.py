@@ -6,8 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from juvenal.checkers import parse_verdict
-from juvenal.engine import Engine, _extract_yaml
-from juvenal.workflow import Phase, Workflow, inject_checkers, inject_implementer
+from juvenal.engine import BounceCounter, Engine, _extract_yaml
+from juvenal.workflow import ParallelGroup, Phase, Workflow, inject_checkers, inject_implementer
 from tests.conftest import MockBackend
 
 
@@ -1404,3 +1404,165 @@ class TestBaselineSha:
 
         loaded = PipelineState.load(state_file)
         assert loaded.phases["phase1"].baseline_sha == "persist-sha"
+
+
+class TestLaneGroups:
+    def test_lane_group_both_pass(self, tmp_path):
+        """Two lanes, both pass on first try."""
+        backend = MockBackend()
+        # Lane A: implement a -> check_a passes
+        backend.add_response(exit_code=0, output="done a")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        # Lane B: implement b -> check_b passes
+        backend.add_response(exit_code=0, output="done b")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="Build A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="Build B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+            max_bounces=5,
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            exit_code = engine.run()
+        assert exit_code == 0
+
+    def test_lane_group_one_bounces_then_passes(self, tmp_path):
+        """Lane A passes immediately, lane B bounces once then passes."""
+        backend = MockBackend()
+        # Lane A: implement a -> check_a passes (calls 0, 1)
+        backend.add_response(exit_code=0, output="done a")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        # Lane B attempt 1: implement b -> check_b fails (calls 2, 3)
+        backend.add_response(exit_code=0, output="done b")
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: tests broken")
+        # Lane B attempt 2: implement b retry -> check_b passes (calls 4, 5)
+        backend.add_response(exit_code=0, output="done b fixed")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="Build A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="Build B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+            max_bounces=5,
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            exit_code = engine.run()
+        assert exit_code == 0
+
+    def test_lane_group_exhausts_budget(self, tmp_path):
+        """Lanes exhaust global bounce budget, pipeline fails."""
+        backend = MockBackend()
+        # Each lane bounces: implement -> check fails -> implement -> check fails ...
+        for _ in range(10):
+            backend.add_response(exit_code=0, output="done")
+            backend.add_response(exit_code=0, output="VERDICT: FAIL: bad")
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="Build A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="Build B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+            max_bounces=2,  # Only 2 bounces total across all lanes
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            exit_code = engine.run()
+        assert exit_code == 1
+
+    def test_lane_group_preserve_context_on_bounce(self, tmp_path):
+        """Session resumption works within lanes."""
+        backend = MockBackend()
+        # Lane: implement -> check fails -> implement (resumed) -> check passes
+        backend.add_response(exit_code=0, output="first attempt", session_id="sess-1")
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: tests fail")
+        backend.add_response(exit_code=0, output="fixed", session_id="sess-1")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="impl", type="implement", prompt="Build it."),
+                Phase(id="chk", type="check", role="tester", bounce_target="impl"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["impl", "chk"]])],
+            max_bounces=5,
+        )
+        engine = Engine(
+            workflow,
+            state_file=str(tmp_path / "state.json"),
+            plain=True,
+            preserve_context_on_bounce=True,
+        )
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            exit_code = engine.run()
+        assert exit_code == 0
+        # The second implement call should have been a resume
+        assert len(backend.resume_calls) == 1
+        assert backend.resume_calls[0][0] == "sess-1"
+
+    def test_lane_group_shared_bounce_budget(self, tmp_path):
+        """Two lanes each bounce once, total = 2, within budget of 3."""
+        backend = MockBackend()
+        # Lane A: implement a -> check fails -> implement a -> check passes
+        backend.add_response(exit_code=0, output="a1")
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: a bad")
+        backend.add_response(exit_code=0, output="a2")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        # Lane B: implement b -> check fails -> implement b -> check passes
+        backend.add_response(exit_code=0, output="b1")
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: b bad")
+        backend.add_response(exit_code=0, output="b2")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="Build A."),
+                Phase(id="check_a", type="check", role="tester", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="Build B."),
+                Phase(id="check_b", type="check", role="tester", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check_a"], ["b", "check_b"]])],
+            max_bounces=3,  # Budget of 3 > 2 bounces consumed
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            exit_code = engine.run()
+        assert exit_code == 0
+
+
+class TestBounceCounter:
+    def test_try_increment_within_budget(self):
+        bc = BounceCounter(max_bounces=3)
+        assert bc.try_increment()
+        assert bc.try_increment()
+        assert bc.try_increment()
+        assert not bc.try_increment()  # exhausted
+        assert bc.count == 3
+
+    def test_try_increment_zero_budget(self):
+        bc = BounceCounter(max_bounces=0)
+        assert not bc.try_increment()
+        assert bc.count == 0

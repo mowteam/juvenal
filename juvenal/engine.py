@@ -9,13 +9,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 from juvenal.backends import create_backend
 from juvenal.checkers import NO_VERDICT_REASON, parse_verdict, run_script
 from juvenal.display import Display
 from juvenal.notifications import build_notification_payload, send_webhook
 from juvenal.state import PipelineState
-from juvenal.workflow import Phase, Workflow
+from juvenal.workflow import ParallelGroup, Phase, Workflow
 
 
 @dataclass
@@ -37,6 +38,28 @@ class PlanResult:
     error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+
+
+class BounceCounter:
+    """Thread-safe global bounce counter for lane execution."""
+
+    def __init__(self, max_bounces: int):
+        self._max = max_bounces
+        self._count = 0
+        self._lock = Lock()
+
+    def try_increment(self) -> bool:
+        """Try to increment. Returns False if budget exhausted."""
+        with self._lock:
+            if self._count >= self._max:
+                return False
+            self._count += 1
+            return True
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
 
 
 class PipelineExhausted(Exception):
@@ -77,6 +100,7 @@ class Engine:
         self.preserve_context_on_bounce = preserve_context_on_bounce
         self._session_ids: dict[str, str] = {}  # phase_id -> last session_id
         self._bounce_targets: set[str] = set()  # phases that should resume on next run
+        self._engine_lock = Lock()  # protects _session_ids and _bounce_targets in parallel
 
         sf = state_file or ".juvenal-state.json"
         needs_state = resume or rewind is not None or rewind_to is not None
@@ -113,26 +137,33 @@ class Engine:
 
                 # Check for parallel group
                 pg = self._get_parallel_group(phase.id)
-                if pg and phase.id == pg[0]:
-                    result = self._run_parallel_group(pg)
-                    if result.bounce_target:
-                        bounces += 1
-                        if bounces >= self.workflow.max_bounces:
+                if pg and phase.id == pg.first_phase_id():
+                    if pg.is_lane_group():
+                        # Lane groups handle bouncing internally
+                        result, lane_bounces = self._run_lane_group(pg, bounces)
+                        bounces += lane_bounces
+                        if not result.success:
                             raise PipelineExhausted(phase.id)
-                        self._apply_backoff(bounces)
-                        self.state.invalidate_from(result.bounce_target)
-                        if result.failure_context:
-                            target_attempt = self.state._ensure_phase(result.bounce_target).attempt
-                            self.state.set_failure_context(
-                                result.bounce_target, result.failure_context, attempt=target_attempt
-                            )
-                        self._bounce_targets.add(result.bounce_target)
-                        phase_idx = self._find_phase_index(result.bounce_target)
-                        continue
-                    if not result.success:
-                        raise PipelineExhausted(phase.id)
+                    else:
+                        result = self._run_parallel_group(pg)
+                        if result.bounce_target:
+                            bounces += 1
+                            if bounces >= self.workflow.max_bounces:
+                                raise PipelineExhausted(phase.id)
+                            self._apply_backoff(bounces)
+                            self.state.invalidate_from(result.bounce_target)
+                            if result.failure_context:
+                                target_attempt = self.state._ensure_phase(result.bounce_target).attempt
+                                self.state.set_failure_context(
+                                    result.bounce_target, result.failure_context, attempt=target_attempt
+                                )
+                            self._bounce_targets.add(result.bounce_target)
+                            phase_idx = self._find_phase_index(result.bounce_target)
+                            continue
+                        if not result.success:
+                            raise PipelineExhausted(phase.id)
                     # Skip past all phases in the group
-                    last_pg_phase = pg[-1]
+                    last_pg_phase = pg.last_phase_id()
                     phase_idx = self._find_phase_index(last_pg_phase) + 1
                     continue
 
@@ -470,8 +501,9 @@ class Engine:
                 return phases[i].id
         return None
 
-    def _run_parallel_group(self, phase_ids: list[str]) -> PhaseResult:
-        """Run a group of phases in parallel."""
+    def _run_parallel_group(self, pg: ParallelGroup) -> PhaseResult:
+        """Run a legacy flat group of implement phases in parallel."""
+        phase_ids = pg.phases
         phases_map = {p.id: p for p in self.workflow.phases}
         results: dict[str, PhaseResult] = {}
 
@@ -493,10 +525,76 @@ class Engine:
             return PhaseResult(success=True)
         return PhaseResult(success=False)
 
-    def _get_parallel_group(self, phase_id: str) -> list[str] | None:
+    def _run_lane_group(self, pg: ParallelGroup, bounces_so_far: int) -> tuple[PhaseResult, int]:
+        """Run a lane group: each lane is a mini-pipeline running concurrently.
+
+        Returns (result, bounces_consumed). Lanes share a global bounce budget.
+        """
+        bounce_counter = BounceCounter(self.workflow.max_bounces - bounces_so_far)
+        self.display.set_parallel_mode(True)
+        results: dict[int, PhaseResult] = {}
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(pg.lanes)) as pool:
+                futures = {pool.submit(self._run_lane, lane, bounce_counter): i for i, lane in enumerate(pg.lanes)}
+                for future in as_completed(futures):
+                    lane_idx = futures[future]
+                    results[lane_idx] = future.result()
+        finally:
+            self.display.set_parallel_mode(False)
+
+        consumed = bounce_counter.count
+        if all(r.success for r in results.values()):
+            return PhaseResult(success=True), consumed
+        return PhaseResult(success=False), consumed
+
+    def _run_lane(self, lane_phase_ids: list[str], bounce_counter: BounceCounter) -> PhaseResult:
+        """Run a single lane: sequential implement/check/script loop with internal bounce."""
+        phases_map = {p.id: p for p in self.workflow.phases}
+        lane_phases = [phases_map[pid] for pid in lane_phase_ids]
+        lane_scope = set(lane_phase_ids)
+        phase_idx = 0
+
+        while phase_idx < len(lane_phases):
+            phase = lane_phases[phase_idx]
+
+            if phase.type == "implement":
+                result = self._run_implement(phase)
+            elif phase.type == "script":
+                result = self._run_script(phase, lane_phases, phase_idx)
+            elif phase.type == "check":
+                result = self._run_check(phase, lane_phases, phase_idx)
+            else:
+                raise ValueError(f"Unsupported phase type in lane: {phase.type!r}")
+
+            if result.success:
+                self.state.mark_completed(phase.id)
+                phase_idx += 1
+            elif result.bounce_target:
+                if not bounce_counter.try_increment():
+                    return PhaseResult(success=False)
+                self._apply_backoff(bounce_counter.count)
+                self.state.invalidate_from(result.bounce_target, scope=lane_scope)
+                if result.failure_context:
+                    target_attempt = self.state._ensure_phase(result.bounce_target).attempt
+                    self.state.set_failure_context(result.bounce_target, result.failure_context, attempt=target_attempt)
+                with self._engine_lock:
+                    self._bounce_targets.add(result.bounce_target)
+                # Track session ID is already done in _run_implement
+                # Find bounce target index within the lane
+                try:
+                    phase_idx = lane_phase_ids.index(result.bounce_target)
+                except ValueError:
+                    return PhaseResult(success=False)
+            else:
+                return PhaseResult(success=False)
+
+        return PhaseResult(success=True)
+
+    def _get_parallel_group(self, phase_id: str) -> ParallelGroup | None:
         """Check if a phase is the start of a parallel group."""
         for group in self.workflow.parallel_groups:
-            if phase_id in group:
+            if phase_id in group.all_phase_ids():
                 return group
         return None
 
@@ -650,7 +748,10 @@ class Engine:
         if self.workflow.parallel_groups:
             print("Parallel groups:")
             for group in self.workflow.parallel_groups:
-                print(f"  {group}")
+                if group.is_lane_group():
+                    print(f"  lanes: {group.lanes}")
+                else:
+                    print(f"  {group.phases}")
         return 0
 
 

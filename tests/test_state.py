@@ -178,6 +178,75 @@ class TestBaselineSha:
         assert state.phases["b"].status == "pending"
 
 
+class TestScopedInvalidation:
+    def test_invalidate_from_with_scope(self, tmp_path):
+        """Scoped invalidation only affects target phases."""
+        state = PipelineState(state_file=tmp_path / "state.json")
+        state.mark_completed("a")
+        state.mark_completed("b")
+        state.mark_completed("c")
+        state.mark_completed("d")
+
+        # Invalidate from "b" but only in scope {b, c}
+        state.invalidate_from("b", scope={"b", "c"})
+
+        assert state.phases["a"].status == "completed"
+        assert state.phases["b"].status == "pending"
+        assert state.phases["c"].status == "pending"
+        assert state.phases["d"].status == "completed"  # outside scope, preserved
+
+    def test_invalidate_from_none_scope_affects_all(self, tmp_path):
+        """Without scope, invalidation works as before (affects all from target)."""
+        state = PipelineState(state_file=tmp_path / "state.json")
+        state.mark_completed("a")
+        state.mark_completed("b")
+        state.mark_completed("c")
+
+        state.invalidate_from("b", scope=None)
+
+        assert state.phases["a"].status == "completed"
+        assert state.phases["b"].status == "pending"
+        assert state.phases["c"].status == "pending"
+
+
+class TestConcurrentStateWrites:
+    def test_concurrent_state_writes(self, tmp_path):
+        """Multiple threads writing state concurrently without corruption."""
+        import threading
+
+        state = PipelineState(state_file=tmp_path / "state.json")
+        errors = []
+
+        def writer(phase_prefix, count):
+            try:
+                for i in range(count):
+                    pid = f"{phase_prefix}-{i}"
+                    state.set_attempt(pid, 1)
+                    state.mark_completed(pid)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=writer, args=("lane-a", 10)),
+            threading.Thread(target=writer, args=("lane-b", 10)),
+            threading.Thread(target=writer, args=("lane-c", 10)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        # All 30 phases should be completed
+        assert len(state.phases) == 30
+        for ps in state.phases.values():
+            assert ps.status == "completed"
+
+        # File should be valid JSON
+        loaded = PipelineState.load(tmp_path / "state.json")
+        assert len(loaded.phases) == 30
+
+
 class TestLoadEmpty:
     def test_load_nonexistent(self, tmp_path):
         state = PipelineState.load(tmp_path / "nonexistent.json")
