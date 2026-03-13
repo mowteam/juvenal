@@ -507,19 +507,23 @@ class Engine:
         phases_map = {p.id: p for p in self.workflow.phases}
         results: dict[str, PhaseResult] = {}
 
-        with ThreadPoolExecutor(max_workers=len(phase_ids)) as pool:
-            futures = {pool.submit(self._run_implement, phases_map[pid]): pid for pid in phase_ids}
-            for future in as_completed(futures):
-                pid = futures[future]
-                result = future.result()
-                results[pid] = result
-                if result.success:
-                    self.state.mark_completed(pid)
-                if result.bounce_target:
-                    # Any bounce aborts the group
-                    return PhaseResult(
-                        success=False, bounce_target=result.bounce_target, failure_context=result.failure_context
-                    )
+        self.display.set_parallel_mode(True)
+        try:
+            with ThreadPoolExecutor(max_workers=len(phase_ids)) as pool:
+                futures = {pool.submit(self._run_implement, phases_map[pid]): pid for pid in phase_ids}
+                for future in as_completed(futures):
+                    pid = futures[future]
+                    result = future.result()
+                    results[pid] = result
+                    if result.success:
+                        self.state.mark_completed(pid)
+                    if result.bounce_target:
+                        # Any bounce aborts the group
+                        return PhaseResult(
+                            success=False, bounce_target=result.bounce_target, failure_context=result.failure_context
+                        )
+        finally:
+            self.display.set_parallel_mode(False)
 
         if all(r.success for r in results.values()):
             return PhaseResult(success=True)
