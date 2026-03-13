@@ -75,9 +75,18 @@ my-workflow/
   phases/
     01-setup/
       prompt.md
-    02-implement/
+    02-parallel/           # "parallel" in name → parallel lane group
+      feature-a/           #   each subdir is a lane
+        prompt.md          #     implement phase
+        check.md           #     check phase (auto-bounces to implement)
+      feature-b/
+        prompt.md
+        check.md
+    03-finish/
       prompt.md
 ```
+
+Lanes can also use subdirectories: `02-parallel/a/01-implement/prompt.md`, `02-parallel/a/02-check-review/prompt.md`.
 
 ### 3. Bare .md files
 

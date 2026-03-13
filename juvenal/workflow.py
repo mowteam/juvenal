@@ -221,10 +221,12 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
     Detection:
     - Subdirectory with prompt.md and NO check- prefix -> implement
     - Subdirectory with prompt.md and check- prefix -> check
+    - Subdirectory with "parallel" in name -> parallel lane group
     - .sh file at top level -> script
     - Bare .md file at top level -> implement + auto check phase
     """
     phases = []
+    parallel_groups: list[ParallelGroup] = []
     entries = sorted(phases_dir.iterdir())
 
     for entry in entries:
@@ -240,9 +242,14 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
             prompt = entry.read_text()
             phases.append(Phase(id=phase_id, type="implement", prompt=prompt))
         elif entry.is_dir():
-            loaded = _load_phase_dir(entry)
-            if loaded:
-                phases.extend(loaded)
+            if "parallel" in entry.name:
+                par_phases, par_group = _load_parallel_dir(entry)
+                phases.extend(par_phases)
+                parallel_groups.append(par_group)
+            else:
+                loaded = _load_phase_dir(entry)
+                if loaded:
+                    phases.extend(loaded)
 
     # Merge overrides from workflow.yaml if present
     overrides = {}
@@ -253,16 +260,18 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
                 overrides = yaml.safe_load(f) or {}
             break
 
+    override_groups = [
+        ParallelGroup(lanes=pg["lanes"]) if "lanes" in pg else ParallelGroup(phases=pg.get("phases", []))
+        for pg in overrides.get("parallel_groups", [])
+    ]
+
     return Workflow(
         name=overrides.get("name", root.name),
         phases=phases,
         backend=overrides.get("backend", "claude"),
         working_dir=overrides.get("working_dir", "."),
         max_bounces=overrides.get("max_bounces", overrides.get("max_retries", 999)),
-        parallel_groups=[
-            ParallelGroup(lanes=pg["lanes"]) if "lanes" in pg else ParallelGroup(phases=pg.get("phases", []))
-            for pg in overrides.get("parallel_groups", [])
-        ],
+        parallel_groups=parallel_groups + override_groups,
     )
 
 
@@ -283,6 +292,93 @@ def _load_phase_dir(phase_dir: Path) -> list[Phase] | None:
     else:
         # Implement phase
         return [Phase(id=phase_dir.name, type="implement", prompt=prompt)]
+
+
+def _load_parallel_dir(parallel_dir: Path) -> tuple[list[Phase], ParallelGroup]:
+    """Load a parallel lane group from a directory.
+
+    Each subdirectory is a lane. Within each lane, phases are loaded
+    using standard conventions. Check/script phases auto-get bounce_target
+    set to the lane's first implement phase.
+    """
+    lanes: list[list[str]] = []
+    all_phases: list[Phase] = []
+
+    for lane_dir in sorted(parallel_dir.iterdir()):
+        if not lane_dir.is_dir():
+            continue
+        if lane_dir.name.startswith(".") or lane_dir.name.startswith("_"):
+            continue
+
+        lane_phases = _load_lane_dir(lane_dir)
+        if not lane_phases:
+            continue
+
+        # Auto-set bounce targets for check/script phases
+        first_implement = next((p.id for p in lane_phases if p.type == "implement"), None)
+        for p in lane_phases:
+            if p.type in ("check", "script") and not p.bounce_target and first_implement:
+                p.bounce_target = first_implement
+
+        lanes.append([p.id for p in lane_phases])
+        all_phases.extend(lane_phases)
+
+    return all_phases, ParallelGroup(lanes=lanes)
+
+
+def _load_lane_dir(lane_dir: Path) -> list[Phase]:
+    """Load phases from a lane directory.
+
+    Simple mode (prompt.md at root):
+        prompt.md       -> implement phase (id = lane dir name)
+        check*.md       -> check phases (id = {lane}~check-N)
+        *.sh            -> script phases (id = {lane}~script-N)
+
+    Complex mode (subdirectories):
+        Each entry is loaded using standard directory conventions,
+        with phase IDs prefixed by the lane name.
+    """
+    lane_name = lane_dir.name
+    phases: list[Phase] = []
+
+    # Simple mode: prompt.md at root of the lane dir
+    root_prompt = lane_dir / "prompt.md"
+    if root_prompt.exists():
+        phases.append(Phase(id=lane_name, type="implement", prompt=root_prompt.read_text()))
+
+        check_n = 0
+        script_n = 0
+        for entry in sorted(lane_dir.iterdir()):
+            if entry.name == "prompt.md" or entry.name.startswith(".") or entry.name.startswith("_"):
+                continue
+            if entry.is_file() and entry.suffix == ".sh":
+                script_n += 1
+                phases.append(Phase(id=f"{lane_name}~script-{script_n}", type="script", run=str(entry)))
+            elif entry.is_file() and entry.suffix == ".md":
+                check_n += 1
+                phases.append(Phase(id=f"{lane_name}~check-{check_n}", type="check", prompt=entry.read_text()))
+        return phases
+
+    # Complex mode: subdirectories as phases
+    for entry in sorted(lane_dir.iterdir()):
+        if entry.name.startswith(".") or entry.name.startswith("_"):
+            continue
+        if entry.is_file() and entry.suffix == ".sh":
+            phases.append(Phase(id=f"{lane_name}~{entry.stem}", type="script", run=str(entry)))
+        elif entry.is_file() and entry.suffix == ".md":
+            phases.append(Phase(id=f"{lane_name}~{entry.stem}", type="implement", prompt=entry.read_text()))
+        elif entry.is_dir():
+            prompt_path = entry / "prompt.md"
+            if not prompt_path.exists():
+                continue
+            prompt = prompt_path.read_text()
+            phase_id = f"{lane_name}~{entry.name}"
+            if entry.name.startswith("check-") or "-check-" in entry.name:
+                phases.append(Phase(id=phase_id, type="check", prompt=prompt))
+            else:
+                phases.append(Phase(id=phase_id, type="implement", prompt=prompt))
+
+    return phases
 
 
 def _load_bare_file(path: Path) -> Workflow:

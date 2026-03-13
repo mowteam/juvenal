@@ -31,12 +31,12 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 
 | Module | Purpose |
 |--------|---------|
-| `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
-| `workflow.py` | Workflow loading and `Phase`/`Workflow` dataclasses. Supports YAML, directory convention, and bare `.md` formats. |
+| `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups (flat or lane-based). `BounceCounter` for thread-safe global bounce tracking in lanes. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
+| `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. |
 | `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. |
-| `state.py` | Atomic JSON state persistence (`PipelineState`). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume and rewind from last checkpoint. |
+| `state.py` | Atomic JSON state persistence (`PipelineState`). Thread-safe (RLock). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume, rewind, and scoped invalidation (for lane bounces). |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`) and script execution with timeouts. |
-| `display.py` | Rich TUI with rolling 15-line buffer. Falls back to plain text with `--plain`. |
+| `display.py` | Rich TUI with rolling 15-line buffer. Thread-safe (Lock). Falls back to plain text with `--plain` or parallel mode. |
 | `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`. |
 | `notifications.py` | Webhook notification support (`build_notification_payload`, `send_webhook`). |
 

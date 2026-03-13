@@ -677,3 +677,170 @@ class TestInjectCheckers:
         assert result.phases[2].run == "pytest -x"
         assert result.phases[3].id == "build~check-2"
         assert result.phases[3].prompt == "Check it"
+
+
+class TestDirectoryParallelLanes:
+    def test_simple_parallel_lanes(self, tmp_path):
+        """Parallel dir with simple lanes: prompt.md + check.md per lane."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        par_dir = phases_dir / "02-parallel"
+        par_dir.mkdir()
+
+        # Lane a: implement + check
+        lane_a = par_dir / "a"
+        lane_a.mkdir()
+        (lane_a / "prompt.md").write_text("Build feature A.")
+        (lane_a / "check.md").write_text("Review A.\nVERDICT: PASS or FAIL")
+
+        # Lane b: implement + check
+        lane_b = par_dir / "b"
+        lane_b.mkdir()
+        (lane_b / "prompt.md").write_text("Build feature B.")
+        (lane_b / "check.md").write_text("Review B.\nVERDICT: PASS or FAIL")
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.parallel_groups) == 1
+        pg = wf.parallel_groups[0]
+        assert pg.is_lane_group()
+        assert len(pg.lanes) == 2
+        assert pg.lanes[0] == ["a", "a~check-1"]
+        assert pg.lanes[1] == ["b", "b~check-1"]
+
+        # Check phases exist with correct types
+        phase_map = {p.id: p for p in wf.phases}
+        assert phase_map["a"].type == "implement"
+        assert phase_map["a~check-1"].type == "check"
+        assert phase_map["b"].type == "implement"
+        assert phase_map["b~check-1"].type == "check"
+
+    def test_auto_bounce_target(self, tmp_path):
+        """Check/script phases in a lane auto-get bounce_target to the lane's implement phase."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        par_dir = phases_dir / "01-parallel"
+        par_dir.mkdir()
+
+        lane = par_dir / "feat"
+        lane.mkdir()
+        (lane / "prompt.md").write_text("Build it.")
+        (lane / "check.md").write_text("Verify it.")
+
+        wf = load_workflow(tmp_path)
+        phase_map = {p.id: p for p in wf.phases}
+        assert phase_map["feat~check-1"].bounce_target == "feat"
+
+    def test_lane_with_script_checker(self, tmp_path):
+        """Lane with a .sh script checker."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        par_dir = phases_dir / "01-parallel"
+        par_dir.mkdir()
+
+        lane = par_dir / "x"
+        lane.mkdir()
+        (lane / "prompt.md").write_text("Build X.")
+        script = lane / "tests.sh"
+        script.write_text("#!/bin/bash\nexit 0\n")
+        script.chmod(0o755)
+
+        wf = load_workflow(tmp_path)
+        pg = wf.parallel_groups[0]
+        assert pg.lanes == [["x", "x~script-1"]]
+
+        phase_map = {p.id: p for p in wf.phases}
+        assert phase_map["x~script-1"].type == "script"
+        assert phase_map["x~script-1"].bounce_target == "x"
+
+    def test_complex_lane_subdirectories(self, tmp_path):
+        """Lane with subdirectories instead of root prompt.md."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        par_dir = phases_dir / "01-parallel"
+        par_dir.mkdir()
+
+        lane = par_dir / "a"
+        lane.mkdir()
+
+        impl = lane / "01-implement"
+        impl.mkdir()
+        (impl / "prompt.md").write_text("Build A.")
+
+        check = lane / "02-check-review"
+        check.mkdir()
+        (check / "prompt.md").write_text("Review A.")
+
+        wf = load_workflow(tmp_path)
+        pg = wf.parallel_groups[0]
+        assert pg.lanes == [["a~01-implement", "a~02-check-review"]]
+
+        phase_map = {p.id: p for p in wf.phases}
+        assert phase_map["a~01-implement"].type == "implement"
+        assert phase_map["a~02-check-review"].type == "check"
+        # Auto bounce target to first implement
+        assert phase_map["a~02-check-review"].bounce_target == "a~01-implement"
+
+    def test_parallel_mixed_with_sequential(self, tmp_path):
+        """Parallel dir coexists with regular sequential phases."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        # Sequential phase before
+        setup = phases_dir / "01-setup"
+        setup.mkdir()
+        (setup / "prompt.md").write_text("Set up.")
+
+        # Parallel group
+        par_dir = phases_dir / "02-parallel"
+        par_dir.mkdir()
+        lane_a = par_dir / "a"
+        lane_a.mkdir()
+        (lane_a / "prompt.md").write_text("Feature A.")
+        lane_b = par_dir / "b"
+        lane_b.mkdir()
+        (lane_b / "prompt.md").write_text("Feature B.")
+
+        # Sequential phase after
+        finish = phases_dir / "03-finish"
+        finish.mkdir()
+        (finish / "prompt.md").write_text("Finish up.")
+
+        wf = load_workflow(tmp_path)
+        phase_ids = [p.id for p in wf.phases]
+        assert phase_ids == ["01-setup", "a", "b", "03-finish"]
+        assert len(wf.parallel_groups) == 1
+        assert wf.parallel_groups[0].lanes == [["a"], ["b"]]
+
+    def test_empty_parallel_dir(self, tmp_path):
+        """Parallel dir with no lane subdirectories produces empty group."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+        par_dir = phases_dir / "01-parallel"
+        par_dir.mkdir()
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.parallel_groups) == 1
+        assert wf.parallel_groups[0].lanes == []
+
+    def test_multiple_checks_in_lane(self, tmp_path):
+        """Lane with multiple check files gets numbered check IDs."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        par_dir = phases_dir / "01-parallel"
+        par_dir.mkdir()
+
+        lane = par_dir / "a"
+        lane.mkdir()
+        (lane / "prompt.md").write_text("Build A.")
+        (lane / "check-quality.md").write_text("Quality check.")
+        (lane / "check-tests.md").write_text("Test check.")
+
+        wf = load_workflow(tmp_path)
+        pg = wf.parallel_groups[0]
+        # Two check files sorted alphabetically
+        assert pg.lanes == [["a", "a~check-1", "a~check-2"]]

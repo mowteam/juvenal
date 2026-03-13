@@ -116,9 +116,30 @@ my-workflow/
   phases/
     01-setup/
       prompt.md            # implementation prompt
-    02-implement/
+    02-parallel/           # "parallel" in name → parallel lane group
+      feature-a/           #   each subdir is a lane
+        prompt.md          #     implement phase
+        check.md           #     check phase (auto-bounces to implement)
+        tests.sh           #     script phase (auto-bounces to implement)
+      feature-b/
+        prompt.md
+        check.md
+    03-finish/
       prompt.md
 ```
+
+Lanes can also use subdirectories for more complex pipelines:
+
+```
+02-parallel/
+  a/
+    01-implement/
+      prompt.md
+    02-check-review/
+      prompt.md
+```
+
+Phase IDs are derived from directory names. In simple mode (lane has `prompt.md` at root): `a`, `a~check-1`, `a~script-1`. In complex mode (subdirectories): `a~01-implement`, `a~02-check-review`.
 
 ### Bare Markdown
 
