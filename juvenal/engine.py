@@ -227,7 +227,10 @@ class Engine:
                 timeout=phase.timeout,
                 env=phase.env or None,
             )
-        self.state.log_step(phase.id, attempt, "implement", result.output)
+        logged_input = resume_prompt if should_resume else prompt
+        self.state.log_step(
+            phase.id, attempt, "implement", result.output, input=logged_input, transcript=result.transcript
+        )
         self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
 
         # Track session ID for potential future resume
@@ -254,7 +257,7 @@ class Engine:
 
         timeout = phase.timeout or 600
         result = run_script(phase.run, self.workflow.working_dir, timeout=timeout, env=phase.env or None)
-        self.state.log_step(phase.id, attempt, "script", result.output)
+        self.state.log_step(phase.id, attempt, "script", result.output, input=phase.run)
 
         if result.exit_code == 0:
             self.display.step_pass(phase.id)
@@ -314,7 +317,7 @@ class Engine:
             timeout=phase.timeout,
             env=phase.env or None,
         )
-        self.state.log_step(phase.id, attempt, "check", result.output)
+        self.state.log_step(phase.id, attempt, "check", result.output, input=prompt, transcript=result.transcript)
         self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
 
         if result.exit_code != 0:
@@ -338,7 +341,14 @@ class Engine:
                     timeout=phase.timeout,
                     env=phase.env or None,
                 )
-                self.state.log_step(phase.id, attempt, "check-resume", resume_result.output)
+                self.state.log_step(
+                    phase.id,
+                    attempt,
+                    "check-resume",
+                    resume_result.output,
+                    input=self._RESUME_PROMPT,
+                    transcript=resume_result.transcript,
+                )
                 self.state.add_tokens(phase.id, resume_result.input_tokens, resume_result.output_tokens)
 
                 if resume_result.exit_code != 0:

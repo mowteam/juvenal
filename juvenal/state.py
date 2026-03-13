@@ -75,16 +75,21 @@ class PipelineState:
             return ps.failure_contexts[-1]["context"]
         return ""
 
-    def log_step(self, phase_id: str, attempt: int, step: str, output: str) -> None:
+    def log_step(
+        self, phase_id: str, attempt: int, step: str, output: str, input: str = "", transcript: str = ""
+    ) -> None:
         ps = self._ensure_phase(phase_id)
-        ps.logs.append(
-            {
-                "attempt": attempt,
-                "step": step,
-                "output": output[-5000:],  # truncate to prevent state bloat
-                "timestamp": time.time(),
-            }
-        )
+        entry: dict = {
+            "attempt": attempt,
+            "step": step,
+            "output": output,
+            "timestamp": time.time(),
+        }
+        if input:
+            entry["input"] = input
+        if transcript:
+            entry["transcript"] = transcript
+        ps.logs.append(entry)
         self.save()
 
     def add_tokens(self, phase_id: str, input_tokens: int, output_tokens: int) -> None:
