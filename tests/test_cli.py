@@ -1,5 +1,7 @@
 """Unit tests for CLI argument parsing and commands."""
 
+import subprocess
+import sys
 import time
 
 from juvenal.cli import build_parser, cmd_status
@@ -251,3 +253,48 @@ class TestStatusExitCode:
         """No state file (never run) returns exit code 1."""
         state_file = tmp_path / "state.json"
         assert cmd_status(self._make_args(state_file)) == 1
+
+
+class TestStatusExitCodeSubprocess:
+    """Test that exit codes actually propagate through the real entry point."""
+
+    def test_status_subprocess_exit_0_on_success(self, tmp_path):
+        """Successful pipeline exits 0 as a real process."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        state.started_at = time.time() - 10
+        state.set_attempt("build", 1)
+        state.mark_completed("build")
+        state.completed_at = time.time()
+        state.save()
+
+        result = subprocess.run(
+            [sys.executable, "-m", "juvenal.cli", "status", "--state-file", str(state_file)],
+            capture_output=True,
+        )
+        assert result.returncode == 0
+
+    def test_status_subprocess_exit_1_on_no_state(self, tmp_path):
+        """No state file exits 1 as a real process."""
+        state_file = tmp_path / "nonexistent.json"
+        result = subprocess.run(
+            [sys.executable, "-m", "juvenal.cli", "status", "--state-file", str(state_file)],
+            capture_output=True,
+        )
+        assert result.returncode == 1
+
+    def test_status_subprocess_exit_1_on_failure(self, tmp_path):
+        """Failed pipeline exits 1 as a real process."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        state.started_at = time.time() - 10
+        state.set_attempt("build", 1)
+        state.mark_failed("build")
+        state.completed_at = time.time()
+        state.save()
+
+        result = subprocess.run(
+            [sys.executable, "-m", "juvenal.cli", "status", "--state-file", str(state_file)],
+            capture_output=True,
+        )
+        assert result.returncode == 1
