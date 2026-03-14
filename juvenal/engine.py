@@ -90,6 +90,7 @@ class Engine:
         _depth: int = 0,
         _max_depth: int = 3,
         clear_context_on_bounce: bool = False,
+        serialize: bool = False,
     ):
         self.workflow = workflow
         self.backend = create_backend(workflow.backend)
@@ -98,6 +99,7 @@ class Engine:
         self._max_depth = _max_depth
         self.dry_run = dry_run
         self.preserve_context_on_bounce = not clear_context_on_bounce
+        self.serialize = serialize
         self._session_ids: dict[str, str] = {}  # phase_id -> last session_id
         self._bounce_targets: set[str] = set()  # phases that should resume on next run
         self._engine_lock = Lock()  # protects _session_ids and _bounce_targets in parallel
@@ -526,23 +528,35 @@ class Engine:
 
         results: dict[str, PhaseResult] = {}
 
-        self.display.set_parallel_mode(True)
-        try:
-            with ThreadPoolExecutor(max_workers=len(incomplete_ids)) as pool:
-                futures = {pool.submit(self._run_implement, phases_map[pid]): pid for pid in incomplete_ids}
-                for future in as_completed(futures):
-                    pid = futures[future]
-                    result = future.result()
-                    results[pid] = result
-                    if result.success:
-                        self.state.mark_completed(pid)
-                    if result.bounce_target:
-                        # Any bounce aborts the group
-                        return PhaseResult(
-                            success=False, bounce_target=result.bounce_target, failure_context=result.failure_context
-                        )
-        finally:
-            self.display.set_parallel_mode(False)
+        if self.serialize:
+            for pid in incomplete_ids:
+                result = self._run_implement(phases_map[pid])
+                results[pid] = result
+                if result.success:
+                    self.state.mark_completed(pid)
+                if result.bounce_target:
+                    return PhaseResult(
+                        success=False, bounce_target=result.bounce_target, failure_context=result.failure_context
+                    )
+        else:
+            self.display.set_parallel_mode(True)
+            try:
+                with ThreadPoolExecutor(max_workers=len(incomplete_ids)) as pool:
+                    futures = {pool.submit(self._run_implement, phases_map[pid]): pid for pid in incomplete_ids}
+                    for future in as_completed(futures):
+                        pid = futures[future]
+                        result = future.result()
+                        results[pid] = result
+                        if result.success:
+                            self.state.mark_completed(pid)
+                        if result.bounce_target:
+                            return PhaseResult(
+                                success=False,
+                                bounce_target=result.bounce_target,
+                                failure_context=result.failure_context,
+                            )
+            finally:
+                self.display.set_parallel_mode(False)
 
         if all(r.success for r in results.values()):
             return PhaseResult(success=True)
@@ -560,19 +574,23 @@ class Engine:
         if not incomplete_lanes:
             return PhaseResult(success=True), 0
 
-        self.display.set_parallel_mode(True)
         results: dict[int, PhaseResult] = {}
 
-        try:
-            with ThreadPoolExecutor(max_workers=len(incomplete_lanes)) as pool:
-                futures = {
-                    pool.submit(self._run_lane, lane, bounce_counter): i for i, lane in enumerate(incomplete_lanes)
-                }
-                for future in as_completed(futures):
-                    lane_idx = futures[future]
-                    results[lane_idx] = future.result()
-        finally:
-            self.display.set_parallel_mode(False)
+        if self.serialize:
+            for i, lane in enumerate(incomplete_lanes):
+                results[i] = self._run_lane(lane, bounce_counter)
+        else:
+            self.display.set_parallel_mode(True)
+            try:
+                with ThreadPoolExecutor(max_workers=len(incomplete_lanes)) as pool:
+                    futures = {
+                        pool.submit(self._run_lane, lane, bounce_counter): i for i, lane in enumerate(incomplete_lanes)
+                    }
+                    for future in as_completed(futures):
+                        lane_idx = futures[future]
+                        results[lane_idx] = future.result()
+            finally:
+                self.display.set_parallel_mode(False)
 
         consumed = bounce_counter.count
         if all(r.success for r in results.values()):

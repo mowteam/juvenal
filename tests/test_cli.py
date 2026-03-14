@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-from juvenal.cli import build_parser, cmd_status
+from juvenal.cli import _parse_defines, build_parser, cmd_status
 from juvenal.state import PipelineState
 
 
@@ -212,6 +212,26 @@ class TestArgumentParsing:
         args = parser.parse_args(["do", "build a thing", "-D", "ENV=prod"])
         assert args.defines == ["ENV=prod"]
 
+    def test_run_defines_multi_value(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml", "-D", "TARGET=linux", "-D", "TARGET=windows"])
+        assert args.defines == ["TARGET=linux", "TARGET=windows"]
+
+    def test_run_serialize(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml", "--serialize"])
+        assert args.serialize is True
+
+    def test_run_serialize_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "workflow.yaml"])
+        assert args.serialize is False
+
+    def test_do_serialize(self):
+        parser = build_parser()
+        args = parser.parse_args(["do", "build a thing", "--serialize"])
+        assert args.serialize is True
+
     def test_no_command(self):
         parser = build_parser()
         args = parser.parse_args([])
@@ -227,6 +247,23 @@ class TestArgumentParsing:
         from juvenal import __version__
 
         assert __version__ in captured.out
+
+
+class TestParseDefines:
+    def test_single_value(self):
+        assert _parse_defines(["FOO=bar"]) == {"FOO": ["bar"]}
+
+    def test_multi_value_same_key(self):
+        result = _parse_defines(["T=linux", "T=windows"])
+        assert result == {"T": ["linux", "windows"]}
+
+    def test_mixed_single_and_multi(self):
+        result = _parse_defines(["ENV=prod", "T=a", "T=b"])
+        assert result == {"ENV": ["prod"], "T": ["a", "b"]}
+
+    def test_equals_in_value(self):
+        result = _parse_defines(["CMD=a=b=c"])
+        assert result == {"CMD": ["a=b=c"]}
 
 
 class TestStatusExitCode:

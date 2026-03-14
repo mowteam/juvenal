@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -696,6 +697,112 @@ def inject_implementer(workflow: Workflow, role: str) -> Workflow:
         working_dir=workflow.working_dir,
         max_bounces=workflow.max_bounces,
         parallel_groups=workflow.parallel_groups,
+        backoff=workflow.backoff,
+        max_backoff=workflow.max_backoff,
+        notify=list(workflow.notify),
+        vars=dict(workflow.vars),
+    )
+
+
+def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> Workflow:
+    """Expand phases that reference multi-value vars into parallel duplicates.
+
+    For each phase whose prompt or run command references a multi-value var,
+    create N copies (one per value, or cartesian product for multiple vars).
+    If the phase has child phases (checkers/scripts with IDs like parent~check-1),
+    duplicate the entire group as a lane group. Otherwise, create a flat parallel group.
+    """
+    if not multi_vars:
+        return workflow
+
+    # Build set of phase IDs already in parallel groups (skip these)
+    parallel_phase_ids: set[str] = set()
+    for pg in workflow.parallel_groups:
+        parallel_phase_ids.update(pg.all_phase_ids())
+
+    # Group phases: parent + children (IDs starting with parent~)
+    groups: list[list[Phase]] = []
+    i = 0
+    phases = workflow.phases
+    while i < len(phases):
+        phase = phases[i]
+        group = [phase]
+        prefix = f"{phase.id}~"
+        j = i + 1
+        while j < len(phases) and phases[j].id.startswith(prefix):
+            group.append(phases[j])
+            j += 1
+        groups.append(group)
+        i = j
+
+    new_phases: list[Phase] = []
+    new_parallel_groups = list(workflow.parallel_groups)
+
+    for group in groups:
+        parent = group[0]
+
+        # Skip if already in a parallel group
+        if parent.id in parallel_phase_ids:
+            new_phases.extend(group)
+            continue
+
+        # Find which multi-value vars this group references
+        all_text = parent.prompt + (parent.run or "")
+        for child in group[1:]:
+            all_text += child.prompt + (child.run or "")
+        used_vars = set(_VAR_RE.findall(all_text))
+        referenced = [k for k in multi_vars if k in used_vars]
+
+        if not referenced:
+            new_phases.extend(group)
+            continue
+
+        # Generate all value combinations (cartesian product)
+        value_lists = [[(k, v) for v in multi_vars[k]] for k in referenced]
+        combinations = list(itertools.product(*value_lists))
+
+        lanes: list[list[str]] = []
+        for combo in combinations:
+            combo_vars = dict(combo)
+            suffix = "~".join(f"{k}={v}" for k, v in combo)
+            group_old_ids = {p.id for p in group}
+            lane_ids: list[str] = []
+
+            for phase in group:
+                new_id = f"{phase.id}~{suffix}"
+
+                # Update bounce_target if it points within the same group
+                new_bounce = phase.bounce_target
+                if new_bounce in group_old_ids:
+                    new_bounce = f"{new_bounce}~{suffix}"
+                new_bounce_targets = [f"{bt}~{suffix}" if bt in group_old_ids else bt for bt in phase.bounce_targets]
+
+                new_phase = Phase(
+                    id=new_id,
+                    type=phase.type,
+                    prompt=apply_vars(phase.prompt, combo_vars) if phase.prompt else "",
+                    run=apply_vars(phase.run, combo_vars) if phase.run else phase.run,
+                    role=phase.role,
+                    bounce_target=new_bounce,
+                    bounce_targets=new_bounce_targets,
+                    timeout=phase.timeout,
+                    env=dict(phase.env),
+                    max_depth=phase.max_depth,
+                )
+                new_phases.append(new_phase)
+                lane_ids.append(new_id)
+
+            lanes.append(lane_ids)
+
+        new_parallel_groups.append(ParallelGroup(lanes=lanes))
+
+    return Workflow(
+        name=workflow.name,
+        phases=new_phases,
+        backend=workflow.backend,
+        working_dir=workflow.working_dir,
+        max_bounces=workflow.max_bounces,
+        parallel_groups=new_parallel_groups,
         backoff=workflow.backoff,
         max_backoff=workflow.max_backoff,
         notify=list(workflow.notify),

@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "-D", action="append", default=[], metavar="VAR=VAL", dest="defines", help="Set template variable"
     )
+    run_p.add_argument("--serialize", action="store_true", help="Disable all parallelization")
 
     # plan
     plan_p = sub.add_parser("plan", help="Generate a workflow from a goal description")
@@ -75,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     do_p.add_argument(
         "-D", action="append", default=[], metavar="VAR=VAL", dest="defines", help="Set template variable"
     )
+    do_p.add_argument("--serialize", action="store_true", help="Disable all parallelization")
 
     # status
     status_p = sub.add_parser("status", help="Show workflow progress")
@@ -92,16 +94,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_defines(defines: list[str]) -> dict[str, str]:
-    """Parse -D VAR=VAL arguments into a dict."""
-    result: dict[str, str] = {}
+def _parse_defines(defines: list[str]) -> dict[str, list[str]]:
+    """Parse -D VAR=VAL arguments, accumulating multiple values per key."""
+    result: dict[str, list[str]] = {}
     for d in defines:
         if "=" not in d:
             print(f"Error: invalid -D value {d!r}: must be VAR=VAL")
             sys.exit(1)
         key, val = d.split("=", 1)
-        result[key] = val
+        result.setdefault(key, []).append(val)
     return result
+
+
+def _apply_defines(workflow, all_vars: dict[str, list[str]]):
+    """Apply parsed -D vars: single-value go into workflow.vars, multi-value expand phases."""
+    from juvenal.workflow import expand_multi_vars
+
+    single = {k: v[0] for k, v in all_vars.items() if len(v) == 1}
+    multi = {k: v for k, v in all_vars.items() if len(v) > 1}
+    workflow.vars.update(single)
+    if multi:
+        workflow = expand_multi_vars(workflow, multi)
+    return workflow
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -110,7 +124,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     workflow = load_workflow(args.workflow)
     if args.defines:
-        workflow.vars.update(_parse_defines(args.defines))
+        workflow = _apply_defines(workflow, _parse_defines(args.defines))
     if args.implementer:
         workflow = inject_implementer(workflow, args.implementer)
     if args.checker:
@@ -143,6 +157,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         state_file=state_file,
         plain=args.plain,
         clear_context_on_bounce=args.clear_context_on_bounce,
+        serialize=args.serialize,
     )
     return engine.run()
 
@@ -208,7 +223,7 @@ def cmd_do(args: argparse.Namespace) -> int:
         workflow = load_workflow(f.name)
 
     if args.defines:
-        workflow.vars.update(_parse_defines(args.defines))
+        workflow = _apply_defines(workflow, _parse_defines(args.defines))
     if args.implementer:
         workflow = inject_implementer(workflow, args.implementer)
     if args.checker:
@@ -218,7 +233,9 @@ def cmd_do(args: argparse.Namespace) -> int:
     if args.max_bounces:
         workflow.max_bounces = args.max_bounces
 
-    engine = Engine(workflow, plain=args.plain, clear_context_on_bounce=args.clear_context_on_bounce)
+    engine = Engine(
+        workflow, plain=args.plain, clear_context_on_bounce=args.clear_context_on_bounce, serialize=args.serialize
+    )
     return engine.run()
 
 

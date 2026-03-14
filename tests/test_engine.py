@@ -1896,3 +1896,98 @@ class TestTemplateVarsEngine:
         captured = capsys.readouterr()
         assert "APP" in captured.out
         assert "myservice" in captured.out
+
+
+class TestSerialize:
+    def test_serialize_runs_flat_parallel_sequentially(self, tmp_path):
+        """With serialize=True, flat parallel groups run sequentially."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done a")
+        backend.add_response(exit_code=0, output="done b")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="b", type="implement", prompt="B."),
+            ],
+            parallel_groups=[ParallelGroup(phases=["a", "b"])],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True, serialize=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            assert engine.run() == 0
+        assert len(backend.calls) == 2
+
+    def test_serialize_runs_lane_group_sequentially(self, tmp_path):
+        """With serialize=True, lane groups run sequentially."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done a")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        backend.add_response(exit_code=0, output="done b")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="A."),
+                Phase(id="check-a", type="check", prompt="Check A.", bounce_target="a"),
+                Phase(id="b", type="implement", prompt="B."),
+                Phase(id="check-b", type="check", prompt="Check B.", bounce_target="b"),
+            ],
+            parallel_groups=[ParallelGroup(lanes=[["a", "check-a"], ["b", "check-b"]])],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True, serialize=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            assert engine.run() == 0
+        assert len(backend.calls) == 4
+
+
+class TestMultiVarExpansionEngine:
+    def test_expanded_phases_run_in_parallel(self, tmp_path):
+        """Multi-value var expansion creates parallel lanes that execute."""
+        from juvenal.workflow import expand_multi_vars
+
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built linux")
+        backend.add_response(exit_code=0, output="built windows")
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build for {{TARGET}}.")],
+        )
+        wf = expand_multi_vars(wf, {"TARGET": ["linux", "windows"]})
+        engine = Engine(workflow=wf, state_file=str(tmp_path / "state.json"), plain=True, serialize=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            assert engine.run() == 0
+        assert len(backend.calls) == 2
+        # Verify both prompts were sent with substituted values
+        prompts = set(backend.calls)
+        assert any("linux" in p for p in prompts)
+        assert any("windows" in p for p in prompts)
+
+    def test_expanded_group_with_checker(self, tmp_path):
+        """Multi-value expansion with checker creates lane groups that bounce correctly."""
+        from juvenal.workflow import expand_multi_vars
+
+        backend = MockBackend()
+        # Lane 1 (staging): implement pass, check pass
+        backend.add_response(exit_code=0, output="deployed to staging")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        # Lane 2 (prod): implement pass, check fail, implement retry, check pass
+        backend.add_response(exit_code=0, output="deployed to prod", session_id="s1")
+        backend.add_response(exit_code=0, output="VERDICT: FAIL: broken")
+        backend.add_response(exit_code=0, output="fixed prod")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="deploy", type="implement", prompt="Deploy to {{ENV}}."),
+                Phase(id="deploy~check-1", type="check", prompt="Verify {{ENV}}.", bounce_target="deploy"),
+            ],
+            max_bounces=5,
+        )
+        wf = expand_multi_vars(wf, {"ENV": ["staging", "prod"]})
+        engine = Engine(workflow=wf, state_file=str(tmp_path / "state.json"), plain=True, serialize=True)
+        engine.backend = backend
+        with patch.object(engine, "_get_git_head", return_value=None):
+            assert engine.run() == 0

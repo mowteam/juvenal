@@ -3,9 +3,11 @@
 import pytest
 
 from juvenal.workflow import (
+    ParallelGroup,
     Phase,
     Workflow,
     apply_vars,
+    expand_multi_vars,
     inject_checkers,
     inject_implementer,
     load_workflow,
@@ -1075,3 +1077,123 @@ vars:
 """)
         wf = load_workflow(tmp_path)
         assert wf.vars == {"PROJECT": "myapp"}
+
+
+class TestExpandMultiVars:
+    def test_single_var_two_values(self):
+        """Phase with {{TARGET}} and TARGET=[linux, windows] creates two parallel lanes."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build for {{TARGET}}.")],
+        )
+        result = expand_multi_vars(wf, {"TARGET": ["linux", "windows"]})
+        assert len(result.phases) == 2
+        assert result.phases[0].id == "build~TARGET=linux"
+        assert result.phases[0].prompt == "Build for linux."
+        assert result.phases[1].id == "build~TARGET=windows"
+        assert result.phases[1].prompt == "Build for windows."
+        assert len(result.parallel_groups) == 1
+        assert result.parallel_groups[0].lanes == [["build~TARGET=linux"], ["build~TARGET=windows"]]
+
+    def test_phase_with_children_duplicates_group(self):
+        """Phase + checker group is duplicated together as a lane group."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="deploy", type="implement", prompt="Deploy to {{ENV}}."),
+                Phase(id="deploy~check-1", type="check", prompt="Verify {{ENV}} deploy.", bounce_target="deploy"),
+            ],
+        )
+        result = expand_multi_vars(wf, {"ENV": ["staging", "prod"]})
+        assert len(result.phases) == 4
+        assert result.phases[0].id == "deploy~ENV=staging"
+        assert result.phases[1].id == "deploy~check-1~ENV=staging"
+        assert result.phases[1].bounce_target == "deploy~ENV=staging"
+        assert result.phases[2].id == "deploy~ENV=prod"
+        assert result.phases[3].id == "deploy~check-1~ENV=prod"
+        assert result.phases[3].bounce_target == "deploy~ENV=prod"
+        pg = result.parallel_groups[0]
+        assert pg.lanes == [
+            ["deploy~ENV=staging", "deploy~check-1~ENV=staging"],
+            ["deploy~ENV=prod", "deploy~check-1~ENV=prod"],
+        ]
+
+    def test_unaffected_phases_preserved(self):
+        """Phases that don't reference multi-value vars are unchanged."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Set up."),
+                Phase(id="build", type="implement", prompt="Build for {{TARGET}}."),
+                Phase(id="finish", type="implement", prompt="Done."),
+            ],
+        )
+        result = expand_multi_vars(wf, {"TARGET": ["a", "b"]})
+        ids = [p.id for p in result.phases]
+        assert ids == ["setup", "build~TARGET=a", "build~TARGET=b", "finish"]
+
+    def test_script_run_templated(self):
+        """Script run commands are also expanded."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="test", type="implement", prompt="Build."),
+                Phase(id="test~script-1", type="script", run="pytest {{DIR}} -x", bounce_target="test"),
+            ],
+        )
+        result = expand_multi_vars(wf, {"DIR": ["tests/a", "tests/b"]})
+        scripts = [p for p in result.phases if p.type == "script"]
+        assert scripts[0].run == "pytest tests/a -x"
+        assert scripts[1].run == "pytest tests/b -x"
+
+    def test_cartesian_product(self):
+        """Multiple multi-value vars produce cartesian product."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build {{A}} on {{B}}.")],
+        )
+        result = expand_multi_vars(wf, {"A": ["x", "y"], "B": ["1", "2"]})
+        assert len(result.phases) == 4
+        prompts = {p.prompt for p in result.phases}
+        assert prompts == {"Build x on 1.", "Build x on 2.", "Build y on 1.", "Build y on 2."}
+
+    def test_empty_multi_vars_is_noop(self):
+        """Empty multi_vars returns workflow unchanged."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.")],
+        )
+        result = expand_multi_vars(wf, {})
+        assert len(result.phases) == 1
+        assert result.phases[0].id == "build"
+
+    def test_phases_in_existing_parallel_group_skipped(self):
+        """Phases already in a parallel group are not expanded."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="a", type="implement", prompt="Build {{TARGET}}."),
+                Phase(id="b", type="implement", prompt="Build {{TARGET}}."),
+            ],
+            parallel_groups=[ParallelGroup(phases=["a", "b"])],
+        )
+        result = expand_multi_vars(wf, {"TARGET": ["x", "y"]})
+        # Original phases unchanged, no new parallel groups
+        assert [p.id for p in result.phases] == ["a", "b"]
+        assert len(result.parallel_groups) == 1
+
+    def test_preserves_workflow_fields(self):
+        """expand_multi_vars preserves all workflow fields."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build {{X}}.")],
+            backend="claude",
+            max_bounces=5,
+            backoff=2.0,
+            vars={"EXISTING": "val"},
+        )
+        result = expand_multi_vars(wf, {"X": ["a", "b"]})
+        assert result.backend == "claude"
+        assert result.max_bounces == 5
+        assert result.backoff == 2.0
+        assert result.vars == {"EXISTING": "val"}
