@@ -488,7 +488,7 @@ class TestPreserveContextOnBounce:
         return engine
 
     def test_bounce_uses_resume_agent(self, tmp_path):
-        """With preserve_context_on_bounce, bouncing back resumes the session."""
+        """By default, bouncing back resumes the session."""
         backend = MockBackend()
         backend.add_response(exit_code=0, output="built it", session_id="sess-1")  # implement attempt 1
         backend.add_response(exit_code=0, output="VERDICT: FAIL: bad code")  # check fails -> bounce
@@ -502,7 +502,7 @@ class TestPreserveContextOnBounce:
             ],
             max_bounces=3,
         )
-        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
 
         # First call is run_agent (fresh), second implement call should be resume_agent
@@ -512,8 +512,8 @@ class TestPreserveContextOnBounce:
         assert session_id == "sess-1"
         assert "failed verification" in prompt
 
-    def test_bounce_without_flag_uses_run_agent(self, tmp_path):
-        """Without preserve_context_on_bounce, bouncing back starts fresh."""
+    def test_bounce_with_clear_context_uses_run_agent(self, tmp_path):
+        """With clear_context_on_bounce, bouncing back starts fresh."""
         backend = MockBackend()
         backend.add_response(exit_code=0, output="built it", session_id="sess-1")  # implement attempt 1
         backend.add_response(exit_code=0, output="VERDICT: FAIL: bad code")  # check fails -> bounce
@@ -527,7 +527,7 @@ class TestPreserveContextOnBounce:
             ],
             max_bounces=3,
         )
-        engine = self._make_engine(workflow, backend, tmp_path)
+        engine = self._make_engine(workflow, backend, tmp_path, clear_context_on_bounce=True)
         assert engine.run() == 0
 
         # All calls should be run_agent, no resume
@@ -561,7 +561,7 @@ class TestPreserveContextOnBounce:
             ],
             max_bounces=3,
         )
-        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
 
         # Point 1: (a) was resumed exactly once with the right session
@@ -588,7 +588,7 @@ class TestPreserveContextOnBounce:
             ],
             max_bounces=3,
         )
-        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
 
         # No session_id means no resume, all run_agent
@@ -610,7 +610,7 @@ class TestPreserveContextOnBounce:
             ],
             max_bounces=2,
         )
-        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        engine = self._make_engine(workflow, backend, tmp_path)
         # Will exhaust bounces since "false" always fails, but we check resume was used
         engine.run()
 
@@ -630,7 +630,7 @@ class TestPreserveContextOnBounce:
             ],
             max_bounces=3,
         )
-        engine = self._make_engine(workflow, backend, tmp_path, preserve_context_on_bounce=True)
+        engine = self._make_engine(workflow, backend, tmp_path)
         assert engine.run() == 0
 
         assert len(backend.resume_calls) == 1
@@ -1511,7 +1511,6 @@ class TestLaneGroups:
             workflow,
             state_file=str(tmp_path / "state.json"),
             plain=True,
-            preserve_context_on_bounce=True,
         )
         engine.backend = backend
         with patch.object(engine, "_get_git_head", return_value=None):

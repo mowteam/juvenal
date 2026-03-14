@@ -89,7 +89,7 @@ class Engine:
         plain: bool = False,
         _depth: int = 0,
         _max_depth: int = 3,
-        preserve_context_on_bounce: bool = False,
+        clear_context_on_bounce: bool = False,
     ):
         self.workflow = workflow
         self.backend = create_backend(workflow.backend)
@@ -97,7 +97,7 @@ class Engine:
         self._depth = _depth
         self._max_depth = _max_depth
         self.dry_run = dry_run
-        self.preserve_context_on_bounce = preserve_context_on_bounce
+        self.preserve_context_on_bounce = not clear_context_on_bounce
         self._session_ids: dict[str, str] = {}  # phase_id -> last session_id
         self._bounce_targets: set[str] = set()  # phases that should resume on next run
         self._engine_lock = Lock()  # protects _session_ids and _bounce_targets in parallel

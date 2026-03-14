@@ -34,9 +34,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
     run_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
     run_p.add_argument(
+        "--clear-context-on-bounce",
+        action="store_true",
+        help="Start a fresh agent session when bouncing back (default: resume session)",
+    )
+    run_p.add_argument(
         "--preserve-context-on-bounce",
         action="store_true",
-        help="Resume agent session when bouncing back (preserves conversation context)",
+        help=argparse.SUPPRESS,  # deprecated no-op, kept for compatibility
     )
     run_p.add_argument(
         "-D", action="append", default=[], metavar="VAR=VAL", dest="defines", help="Set template variable"
@@ -58,9 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
     do_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
     do_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
     do_p.add_argument(
+        "--clear-context-on-bounce",
+        action="store_true",
+        help="Start a fresh agent session when bouncing back (default: resume session)",
+    )
+    do_p.add_argument(
         "--preserve-context-on-bounce",
         action="store_true",
-        help="Resume agent session when bouncing back (preserves conversation context)",
+        help=argparse.SUPPRESS,  # deprecated no-op, kept for compatibility
     )
     do_p.add_argument(
         "-D", action="append", default=[], metavar="VAR=VAL", dest="defines", help="Set template variable"
@@ -132,7 +142,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         state_file=state_file,
         plain=args.plain,
-        preserve_context_on_bounce=args.preserve_context_on_bounce,
+        clear_context_on_bounce=args.clear_context_on_bounce,
     )
     return engine.run()
 
@@ -208,7 +218,7 @@ def cmd_do(args: argparse.Namespace) -> int:
     if args.max_bounces:
         workflow.max_bounces = args.max_bounces
 
-    engine = Engine(workflow, plain=args.plain, preserve_context_on_bounce=args.preserve_context_on_bounce)
+    engine = Engine(workflow, plain=args.plain, clear_context_on_bounce=args.clear_context_on_bounce)
     return engine.run()
 
 

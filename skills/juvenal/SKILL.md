@@ -220,7 +220,7 @@ juvenal run <workflow> [--resume] [--rewind N] [--rewind-to PHASE_ID] [--phase X
                        [--max-bounces N] [--backend claude|codex] [--dry-run]
                        [--backoff SECONDS] [--notify URL] [--working-dir DIR]
                        [--state-file PATH] [--checker SPEC] [--implementer ROLE]
-                       [--preserve-context-on-bounce] [-D VAR=VAL]
+                       [--clear-context-on-bounce] [-D VAR=VAL]
 juvenal plan "goal" [-o output.yaml] [--backend claude|codex]
 juvenal do "goal" [--backend claude|codex] [--max-bounces N] [-D VAR=VAL]
 juvenal status [--state-file path]
@@ -232,7 +232,7 @@ juvenal validate <workflow>
 
 - **`--checker SPEC`**: Inject a checker on every implement phase. SPEC is a role name (`tester`), `run:CMD`, or `prompt:TEXT`. Repeatable.
 - **`--implementer ROLE`**: Prepend an implementer role prompt to every implement phase (e.g., `software-engineer`).
-- **`--preserve-context-on-bounce`**: Resume the agent's session on bounce instead of starting fresh — preserves conversation context.
+- **`--clear-context-on-bounce`**: Start a fresh agent session on bounce instead of resuming (default: resume session, preserving conversation context).
 - **`-D VAR=VAL`**: Set a template variable. Use `{{VAR}}` in prompts/scripts. Repeatable. Overrides `vars:` defaults in YAML.
 - **`--backoff SECONDS`**: Exponential backoff between bounces (base delay, doubles each bounce, capped at `--max-backoff` or workflow's `max_backoff`).
 - **`--notify URL`**: Webhook URL for JSON notifications on completion/failure. Repeatable.

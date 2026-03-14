@@ -292,7 +292,7 @@ Or via CLI: `--notify URL` (repeatable). The webhook receives a JSON payload wit
 
 ## Context Preservation
 
-By default, each bounce starts a fresh agent session. With `--preserve-context-on-bounce`, the agent's session is resumed instead, so it retains the full conversation context from the previous attempt. The failure details are sent as a follow-up message rather than re-rendering the full prompt.
+By default, bounces resume the agent's session so it retains the full conversation context from the previous attempt. The failure details are sent as a follow-up message rather than re-rendering the full prompt. Use `--clear-context-on-bounce` to start a fresh session on each bounce instead.
 
 ## Token Tracking
 
@@ -305,7 +305,7 @@ juvenal run <workflow> [--resume] [--rewind N] [--rewind-to PHASE_ID] [--phase X
                        [--max-bounces N] [--backend claude|codex] [--dry-run]
                        [--backoff SECONDS] [--notify URL] [--working-dir DIR]
                        [--state-file PATH] [--checker SPEC] [--implementer ROLE]
-                       [--preserve-context-on-bounce]
+                       [--clear-context-on-bounce] [-D VAR=VAL]
 juvenal plan "goal" [-o output.yaml] [--backend claude|codex]
 juvenal do "goal" [--backend claude|codex] [--max-bounces N]
 juvenal status [--state-file path]
@@ -324,7 +324,8 @@ juvenal validate <workflow>
 | `--dry-run` | Print execution plan without running |
 | `--checker SPEC` | Inject checker on every implement phase (role, `run:CMD`, `prompt:TEXT`). Repeatable. |
 | `--implementer ROLE` | Prepend implementer role prompt to every implement phase |
-| `--preserve-context-on-bounce` | Resume agent session on bounce (preserves conversation context) |
+| `--clear-context-on-bounce` | Start fresh agent session on bounce (default: resume session) |
+| `-D VAR=VAL` | Set template variable for `{{VAR}}` substitution. Repeatable. |
 | `--backoff SECONDS` | Exponential backoff base delay between bounces |
 | `--notify URL` | Webhook URL for completion/failure notifications. Repeatable. |
 
