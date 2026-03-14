@@ -222,6 +222,12 @@ class Engine:
             self._send_notifications(False, bounces)
             return 1
 
+        except KeyboardInterrupt:
+            self.backend.kill_active()
+            self.state.save()
+            print("\nInterrupted. State saved. Resume with --resume.")
+            return 130
+
     def _run_implement(self, phase: Phase) -> PhaseResult:
         """Run an implement phase once. On crash, return a bounce target."""
         failure_context = self.state.get_failure_context(phase.id)

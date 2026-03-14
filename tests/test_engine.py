@@ -1993,6 +1993,93 @@ class TestMultiVarExpansionEngine:
             assert engine.run() == 0
 
 
+class TestKeyboardInterrupt:
+    def test_interrupt_saves_state_and_returns_130(self, tmp_path):
+        """KeyboardInterrupt saves state and returns exit code 130."""
+        backend = MockBackend()
+
+        # Make run_agent raise KeyboardInterrupt
+        def interrupted_run(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        backend.run_agent = interrupted_run
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build.")],
+        )
+        state_file = str(tmp_path / "state.json")
+        engine = Engine(workflow, state_file=state_file, plain=True)
+        engine.backend = backend
+        assert engine.run() == 130
+
+        # State file should exist (was saved)
+        from juvenal.state import PipelineState
+
+        state = PipelineState.load(state_file)
+        assert "build" in state.phases
+
+    def test_interrupt_kills_active_processes(self, tmp_path):
+        """KeyboardInterrupt calls kill_active on the backend."""
+        backend = MockBackend()
+        kill_called = []
+
+        original_kill = backend.kill_active
+
+        def tracking_kill():
+            kill_called.append(True)
+            original_kill()
+
+        backend.kill_active = tracking_kill
+
+        def interrupted_run(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        backend.run_agent = interrupted_run
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build.")],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        engine.run()
+        assert len(kill_called) == 1
+
+    def test_interrupt_mid_pipeline_preserves_completed(self, tmp_path):
+        """Interrupt after first phase completes preserves that phase's completed status."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="phase 1 done")
+
+        call_count = [0]
+        original_run = backend.run_agent
+
+        def interrupt_on_second(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise KeyboardInterrupt
+            return original_run(*args, **kwargs)
+
+        backend.run_agent = interrupt_on_second
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Setup."),
+                Phase(id="build", type="implement", prompt="Build."),
+            ],
+        )
+        state_file = str(tmp_path / "state.json")
+        engine = Engine(workflow, state_file=state_file, plain=True)
+        engine.backend = backend
+        assert engine.run() == 130
+
+        from juvenal.state import PipelineState
+
+        state = PipelineState.load(state_file)
+        assert state.phases["setup"].status == "completed"
+
+
 class TestStaticWorkflowPhase:
     def test_workflow_file_success(self, tmp_path):
         """Static workflow_file phase loads and executes the sub-workflow."""

@@ -87,6 +87,7 @@ class MockBackend(Backend):
     """Mock backend for testing."""
 
     def __init__(self, responses: list[AgentResult] | None = None):
+        super().__init__()
         self._responses = list(responses or [])
         self._call_count = 0
         self.calls: list[str] = []

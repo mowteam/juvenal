@@ -28,6 +28,19 @@ class AgentResult:
 class Backend(ABC):
     """Abstract base for AI agent backends."""
 
+    def __init__(self):
+        self._active_procs: list[subprocess.Popen] = []
+
+    def kill_active(self) -> None:
+        """Kill all active agent subprocesses."""
+        for proc in self._active_procs:
+            try:
+                proc.kill()
+                proc.wait()
+            except (ProcessLookupError, OSError):
+                pass
+        self._active_procs.clear()
+
     @abstractmethod
     def name(self) -> str: ...
 
@@ -133,6 +146,7 @@ class ClaudeBackend(Backend):
             bufsize=1,
             env=proc_env,
         )
+        self._active_procs.append(proc)
 
         transcript_lines: list[str] = []
         assistant_messages: list[str] = []
@@ -179,6 +193,8 @@ class ClaudeBackend(Backend):
         stderr_output = proc.stderr.read()
         returncode = proc.wait()
         duration = time.time() - start
+        if proc in self._active_procs:
+            self._active_procs.remove(proc)
 
         if stderr_output:
             transcript_lines.append(f"[stderr] {stderr_output}")
@@ -270,6 +286,7 @@ class CodexBackend(Backend):
             bufsize=1,
             env=proc_env,
         )
+        self._active_procs.append(proc)
 
         if stdin_input:
             proc.stdin.write(stdin_input)
@@ -323,6 +340,8 @@ class CodexBackend(Backend):
 
         returncode = proc.wait()
         duration = time.time() - start
+        if proc in self._active_procs:
+            self._active_procs.remove(proc)
 
         output = "\n".join(assistant_messages)
         if returncode != 0 and not output:
