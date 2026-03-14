@@ -335,7 +335,10 @@ class Engine:
             if self.workflow.vars:
                 parent_prompt = apply_vars(parent_prompt, self.workflow.vars)
             prompt = (
-                f"## Implementation Task Given to the Implementer\n\n"
+                f"You are a CHECKER. You must NOT write any code or implement anything. "
+                f"Another agent has already attempted the task below. "
+                f"Your ONLY job is to VERIFY their work.\n\n"
+                f"## Implementation Task Given to the Implementer — THIS IS NOT YOUR TASK, YOU WILL VERIFY IT\n\n"
                 f"{parent_prompt}\n\n"
                 f"---\n\n"
                 f"## Your Checker Instructions\n\n"
