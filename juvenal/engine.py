@@ -418,7 +418,7 @@ class Engine:
         return PhaseResult(success=False)
 
     def _run_workflow(self, phase: Phase) -> PhaseResult:
-        """Run a workflow phase: plan a sub-workflow from the prompt, then execute it."""
+        """Run a workflow phase: static (workflow_file/workflow_dir) or dynamic (prompt-planned)."""
         effective_max_depth = phase.max_depth if phase.max_depth is not None else self._max_depth
 
         # Check recursion depth
@@ -430,6 +430,58 @@ class Engine:
             bounce_target = phase.bounce_target or phase.id
             return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
 
+        if phase.workflow_file or phase.workflow_dir:
+            return self._run_static_workflow(phase, effective_max_depth)
+        return self._run_dynamic_workflow(phase, effective_max_depth)
+
+    def _run_static_workflow(self, phase: Phase, effective_max_depth: int) -> PhaseResult:
+        """Run a static sub-workflow from workflow_file or workflow_dir."""
+        from juvenal.workflow import load_workflow
+
+        ps = self.state.phases.get(phase.id)
+        attempt = (ps.attempt if ps and ps.attempt > 0 else 0) + 1
+        self.state.set_attempt(phase.id, attempt)
+        self.display.phase_start(phase.id, attempt)
+        self.display.step_start(f"workflow: {phase.id}")
+
+        wf_path = phase.workflow_file or phase.workflow_dir
+        sub_workflow = load_workflow(wf_path)
+        sub_workflow.working_dir = self.workflow.working_dir
+        # Propagate vars from parent workflow
+        merged_vars = dict(sub_workflow.vars)
+        merged_vars.update(self.workflow.vars)
+        sub_workflow.vars = merged_vars
+
+        # State file alongside parent's, named by phase ID
+        parent_state = self.state.state_file
+        sub_state = str(parent_state.parent / f".juvenal-state-{phase.id}.json")
+
+        sub_engine = Engine(
+            sub_workflow,
+            state_file=sub_state,
+            _depth=self._depth + 1,
+            _max_depth=effective_max_depth,
+        )
+        sub_engine.backend = self.backend
+        sub_engine.display = self.display
+
+        exit_code = sub_engine.run()
+
+        # Aggregate tokens
+        sub_inp, sub_out = sub_engine.state.total_tokens()
+        self.state.add_tokens(phase.id, sub_inp, sub_out)
+
+        if exit_code != 0:
+            failure_context = f"Sub-workflow execution failed for phase '{phase.id}'"
+            self.display.step_fail(phase.id, failure_context)
+            bounce_target = phase.bounce_target or phase.id
+            return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
+
+        self.display.step_pass(phase.id)
+        return PhaseResult(success=True)
+
+    def _run_dynamic_workflow(self, phase: Phase, effective_max_depth: int) -> PhaseResult:
+        """Run a dynamic sub-workflow: plan via LLM, then execute."""
         failure_context = self.state.get_failure_context(phase.id)
         ps = self.state.phases.get(phase.id)
         attempt = (ps.attempt if ps and ps.attempt > 0 else 0) + 1
@@ -481,7 +533,6 @@ class Engine:
             failure_context = f"Sub-workflow execution failed for phase '{phase.id}'"
             self.display.step_fail(phase.id, failure_context)
             bounce_target = phase.bounce_target or phase.id
-            # Preserve temp dir for debugging
             return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
 
         # Success — clean up temp dir
@@ -827,9 +878,14 @@ class Engine:
                 target = phase.role or phase.prompt[:60].replace("\n", " ")
                 print(f"{prefix} [{phase.type}] {phase.id}: {target}{extra_str}")
             elif phase.type == "workflow":
-                prompt_preview = phase.prompt[:80].replace("\n", " ")
                 print(f"{prefix} [{phase.type}] {phase.id}{extra_str}")
-                print(f"     prompt: {prompt_preview}...")
+                if phase.workflow_file:
+                    print(f"     workflow_file: {phase.workflow_file}")
+                elif phase.workflow_dir:
+                    print(f"     workflow_dir: {phase.workflow_dir}")
+                else:
+                    prompt_preview = phase.prompt[:80].replace("\n", " ")
+                    print(f"     prompt: {prompt_preview}...")
             print()
 
         if self.workflow.parallel_groups:

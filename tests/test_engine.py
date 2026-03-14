@@ -1991,3 +1991,113 @@ class TestMultiVarExpansionEngine:
         engine.backend = backend
         with patch.object(engine, "_get_git_head", return_value=None):
             assert engine.run() == 0
+
+
+class TestStaticWorkflowPhase:
+    def test_workflow_file_success(self, tmp_path):
+        """Static workflow_file phase loads and executes the sub-workflow."""
+        sub_yaml = tmp_path / "sub.yaml"
+        sub_yaml.write_text("name: sub\nphases:\n  - id: inner\n    prompt: 'Inner task.'\n")
+
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="inner done")
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub-wf", type="workflow", workflow_file=str(sub_yaml))],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 0
+        assert len(backend.calls) == 1
+        assert "Inner task." in backend.calls[0]
+
+    def test_workflow_dir_success(self, tmp_path):
+        """Static workflow_dir phase loads and executes the sub-workflow."""
+        sub_dir = tmp_path / "sub"
+        sub_dir.mkdir()
+        phases_dir = sub_dir / "phases"
+        phases_dir.mkdir()
+        p = phases_dir / "01-build"
+        p.mkdir()
+        (p / "prompt.md").write_text("Build inner.")
+
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built")
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub-wf", type="workflow", workflow_dir=str(sub_dir))],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 0
+        assert "Build inner." in backend.calls[0]
+
+    def test_static_workflow_failure_bounces(self, tmp_path):
+        """Static sub-workflow failure bounces back."""
+        sub_yaml = tmp_path / "sub.yaml"
+        sub_yaml.write_text("name: sub\nphases:\n  - id: inner\n    prompt: 'Inner.'\n")
+
+        backend = MockBackend()
+        backend.add_response(exit_code=1, output="crash")  # sub-workflow inner fails
+        backend.add_response(exit_code=0, output="done")  # retry setup after bounce
+        backend.add_response(exit_code=0, output="inner ok")  # sub-workflow inner succeeds
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Setup."),
+                Phase(id="sub-wf", type="workflow", workflow_file=str(sub_yaml), bounce_target="setup"),
+            ],
+            max_bounces=3,
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 0
+
+    def test_static_workflow_respects_max_depth(self, tmp_path):
+        """Static sub-workflows respect recursion depth limits."""
+        sub_yaml = tmp_path / "sub.yaml"
+        sub_yaml.write_text("name: sub\nphases:\n  - id: inner\n    prompt: 'Inner.'\n")
+
+        backend = MockBackend()
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub-wf", type="workflow", workflow_file=str(sub_yaml), max_depth=1)],
+            max_bounces=1,
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True, _depth=1, _max_depth=1)
+        engine.backend = backend
+        assert engine.run() == 1
+        assert len(backend.calls) == 0
+
+    def test_static_workflow_inherits_vars(self, tmp_path):
+        """Parent workflow vars are propagated to static sub-workflows."""
+        sub_yaml = tmp_path / "sub.yaml"
+        sub_yaml.write_text("name: sub\nphases:\n  - id: inner\n    prompt: 'Deploy {{ENV}}.'\n")
+
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="deployed")
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub-wf", type="workflow", workflow_file=str(sub_yaml))],
+            vars={"ENV": "prod"},
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 0
+        assert "Deploy prod." in backend.calls[0]
+
+    def test_static_workflow_dry_run(self, tmp_path, capsys):
+        """Dry run shows workflow_file path."""
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub-wf", type="workflow", workflow_file="/path/to/sub.yaml")],
+        )
+        engine = Engine(workflow, dry_run=True, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.run()
+        captured = capsys.readouterr()
+        assert "/path/to/sub.yaml" in captured.out

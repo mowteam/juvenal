@@ -1079,6 +1079,71 @@ vars:
         assert wf.vars == {"PROJECT": "myapp"}
 
 
+class TestWorkflowFileDir:
+    def test_workflow_file_parsed(self, tmp_path):
+        sub = tmp_path / "sub.yaml"
+        sub.write_text("name: sub\nphases:\n  - id: x\n    prompt: X.\n")
+        yaml_content = """\
+name: test
+phases:
+  - id: auth
+    type: workflow
+    workflow_file: sub.yaml
+"""
+        (tmp_path / "workflow.yaml").write_text(yaml_content)
+        wf = load_workflow(tmp_path / "workflow.yaml")
+        assert wf.phases[0].workflow_file == str(sub.resolve())
+        assert wf.phases[0].workflow_dir is None
+
+    def test_workflow_dir_parsed(self, tmp_path):
+        sub_dir = tmp_path / "sub"
+        sub_dir.mkdir()
+        (sub_dir / "phases").mkdir()
+        p = sub_dir / "phases" / "01-build"
+        p.mkdir()
+        (p / "prompt.md").write_text("Build.")
+        yaml_content = """\
+name: test
+phases:
+  - id: frontend
+    type: workflow
+    workflow_dir: sub
+"""
+        (tmp_path / "workflow.yaml").write_text(yaml_content)
+        wf = load_workflow(tmp_path / "workflow.yaml")
+        assert wf.phases[0].workflow_dir == str(sub_dir.resolve())
+        assert wf.phases[0].workflow_file is None
+
+    def test_workflow_file_and_dir_mutually_exclusive(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: both
+    type: workflow
+    workflow_file: a.yaml
+    workflow_dir: b/
+"""
+        (tmp_path / "workflow.yaml").write_text(yaml_content)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            load_workflow(tmp_path / "workflow.yaml")
+
+    def test_workflow_file_resolved_relative_to_yaml(self, tmp_path):
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        sub = nested / "sub.yaml"
+        sub.write_text("name: sub\nphases:\n  - id: x\n    prompt: X.\n")
+        yaml_content = """\
+name: test
+phases:
+  - id: auth
+    type: workflow
+    workflow_file: sub.yaml
+"""
+        (nested / "workflow.yaml").write_text(yaml_content)
+        wf = load_workflow(nested / "workflow.yaml")
+        assert wf.phases[0].workflow_file == str(sub.resolve())
+
+
 class TestExpandMultiVars:
     def test_single_var_two_values(self):
         """Phase with {{TARGET}} and TARGET=[linux, windows] creates two parallel lanes."""

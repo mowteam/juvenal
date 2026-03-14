@@ -227,7 +227,7 @@ class TestWorkflowPhaseValidation:
             ],
         )
         errors = validate_workflow(wf)
-        assert any("workflow phase has no prompt" in e for e in errors)
+        assert any("workflow phase needs prompt, workflow_file, or workflow_dir" in e for e in errors)
 
     def test_workflow_phase_with_run_is_invalid(self):
         wf = Workflow(
@@ -288,6 +288,36 @@ class TestWorkflowPhaseValidation:
         )
         errors = validate_workflow(wf)
         assert any("max_depth must be >= 1" in e for e in errors)
+
+    def test_workflow_file_valid(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="sub", type="workflow", workflow_file="/some/path.yaml")],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_workflow_dir_valid(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="sub", type="workflow", workflow_dir="/some/dir")],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_workflow_file_and_dir_both_invalid(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="sub", type="workflow", workflow_file="a.yaml", workflow_dir="b/")],
+        )
+        errors = validate_workflow(wf)
+        assert any("mutually exclusive" in e for e in errors)
+
+    def test_workflow_file_on_non_workflow_invalid(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build.", workflow_file="sub.yaml")],
+        )
+        errors = validate_workflow(wf)
+        assert any("only allowed on workflow phases" in e for e in errors)
 
 
 class TestLaneValidation:

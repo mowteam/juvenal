@@ -31,12 +31,12 @@ class Phase:
     - "implement": agentic implementation (default)
     - "check": agentic checker (parses VERDICT)
     - "script": non-agentic shell command
-    - "workflow": dynamic sub-workflow (plan + execute)
+    - "workflow": sub-workflow (dynamic via prompt, or static via workflow_file/workflow_dir)
     """
 
     id: str
     type: str = "implement"  # "implement", "check", "script", "workflow"
-    prompt: str = ""  # for implement, check, and workflow
+    prompt: str = ""  # for implement, check, and workflow (dynamic)
     run: str | None = None  # shell command for script
     role: str | None = None  # built-in role name for check
     bounce_target: str | None = None  # fixed phase to bounce back to on failure
@@ -44,6 +44,8 @@ class Phase:
     timeout: int | None = None  # timeout in seconds (None = no limit)
     env: dict[str, str] = field(default_factory=dict)  # environment variables for the phase
     max_depth: int | None = None  # recursion depth limit for workflow phases
+    workflow_file: str | None = None  # path to static sub-workflow YAML (resolved at load time)
+    workflow_dir: str | None = None  # path to static sub-workflow directory (resolved at load time)
 
     def render_prompt(self, failure_context: str = "", vars: dict[str, str] | None = None) -> str:
         """Render the implementation prompt, injecting failure context on retry."""
@@ -200,6 +202,16 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         bounce_targets = phase_data.get("bounce_targets", [])
         if bounce_target and bounce_targets:
             raise ValueError(f"Phase '{phase_data['id']}': bounce_target and bounce_targets are mutually exclusive")
+        # Resolve workflow_file/workflow_dir relative to the YAML file
+        wf_file = phase_data.get("workflow_file")
+        wf_dir = phase_data.get("workflow_dir")
+        if wf_file and wf_dir:
+            raise ValueError(f"Phase '{phase_data['id']}': workflow_file and workflow_dir are mutually exclusive")
+        if wf_file:
+            wf_file = str((path.parent / wf_file).resolve())
+        if wf_dir:
+            wf_dir = str((path.parent / wf_dir).resolve())
+
         phase = Phase(
             id=phase_data["id"],
             type=phase_data.get("type", "implement"),
@@ -211,6 +223,8 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
             timeout=phase_data.get("timeout"),
             env=phase_data.get("env", {}),
             max_depth=phase_data.get("max_depth"),
+            workflow_file=wf_file,
+            workflow_dir=wf_dir,
         )
         phases.append(phase)
 
@@ -687,6 +701,8 @@ def inject_implementer(workflow: Workflow, role: str) -> Workflow:
                 timeout=phase.timeout,
                 env=dict(phase.env),
                 max_depth=phase.max_depth,
+                workflow_file=phase.workflow_file,
+                workflow_dir=phase.workflow_dir,
             )
         new_phases.append(phase)
 
@@ -788,6 +804,8 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
                     timeout=phase.timeout,
                     env=dict(phase.env),
                     max_depth=phase.max_depth,
+                    workflow_file=phase.workflow_file,
+                    workflow_dir=phase.workflow_dir,
                 )
                 new_phases.append(new_phase)
                 lane_ids.append(new_id)
@@ -853,12 +871,17 @@ def validate_workflow(workflow: Workflow) -> list[str]:
         if phase.type == "script" and not phase.run:
             errors.append(f"Phase {phase.id!r}: script phase has no run command")
         if phase.type == "workflow":
-            if not phase.prompt:
-                errors.append(f"Phase {phase.id!r}: workflow phase has no prompt")
+            has_source = bool(phase.prompt) or bool(phase.workflow_file) or bool(phase.workflow_dir)
+            if not has_source:
+                errors.append(f"Phase {phase.id!r}: workflow phase needs prompt, workflow_file, or workflow_dir")
+            if phase.workflow_file and phase.workflow_dir:
+                errors.append(f"Phase {phase.id!r}: workflow_file and workflow_dir are mutually exclusive")
             if phase.run:
                 errors.append(f"Phase {phase.id!r}: workflow phase must not have 'run'")
             if phase.role:
                 errors.append(f"Phase {phase.id!r}: workflow phase must not have 'role'")
+        if phase.type != "workflow" and (phase.workflow_file or phase.workflow_dir):
+            errors.append(f"Phase {phase.id!r}: workflow_file/workflow_dir only allowed on workflow phases")
         if phase.max_depth is not None and phase.max_depth < 1:
             errors.append(f"Phase {phase.id!r}: max_depth must be >= 1, got {phase.max_depth}")
 
