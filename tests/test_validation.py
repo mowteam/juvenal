@@ -320,6 +320,73 @@ class TestWorkflowPhaseValidation:
         assert any("only allowed on workflow phases" in e for e in errors)
 
 
+class TestTemplateVarValidation:
+    def test_undefined_var_in_prompt(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build {{PROJECT}}.")],
+        )
+        errors = validate_workflow(wf)
+        assert any("PROJECT" in e and "no value defined" in e for e in errors)
+
+    def test_undefined_var_in_run(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build."),
+                Phase(id="test", type="script", run="pytest {{DIR}}", bounce_target="build"),
+            ],
+        )
+        errors = validate_workflow(wf)
+        assert any("DIR" in e and "no value defined" in e for e in errors)
+
+    def test_defined_var_passes(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build {{PROJECT}}.")],
+            vars={"PROJECT": "myapp"},
+        )
+        errors = validate_workflow(wf)
+        assert not any("no value defined" in e for e in errors)
+
+    def test_multiple_undefined_vars(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Deploy {{APP}} to {{ENV}}.")],
+        )
+        errors = validate_workflow(wf)
+        undefined = [e for e in errors if "no value defined" in e]
+        assert len(undefined) == 2
+
+    def test_some_defined_some_not(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Deploy {{APP}} to {{ENV}}.")],
+            vars={"APP": "myservice"},
+        )
+        errors = validate_workflow(wf)
+        undefined = [e for e in errors if "no value defined" in e]
+        assert len(undefined) == 1
+        assert "ENV" in undefined[0]
+
+    def test_no_vars_no_placeholders_passes(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.")],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_duplicate_var_references_single_error(self):
+        """Same undefined var referenced multiple times only produces one error per phase."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{X}} and {{X}} and {{X}}.")],
+        )
+        errors = validate_workflow(wf)
+        undefined = [e for e in errors if "no value defined" in e]
+        assert len(undefined) == 1
+
+
 class TestLaneValidation:
     def test_lane_phase_existence(self):
         """Lane phase IDs must exist in the workflow."""
@@ -416,6 +483,24 @@ class TestValidateCLI:
         assert result == 0
         captured = capsys.readouterr()
         assert "valid" in captured.out
+
+    def test_validate_undefined_template_var(self, tmp_path, capsys):
+        yaml_content = """\
+name: test
+phases:
+  - id: deploy
+    prompt: "Deploy to {{ENV}} in {{REGION}}."
+"""
+        yaml_path = tmp_path / "bad.yaml"
+        yaml_path.write_text(yaml_content)
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(yaml_path)])
+        args.plain = False
+        result = cmd_validate(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ENV" in captured.out
+        assert "REGION" in captured.out
 
     def test_validate_invalid_workflow(self, tmp_path, capsys):
         yaml_content = """\

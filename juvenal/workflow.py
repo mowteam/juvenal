@@ -940,6 +940,14 @@ def validate_workflow(workflow: Workflow) -> list[str]:
         if not url.startswith(("http://", "https://")):
             errors.append(f"notify URL must start with http:// or https://, got {url!r}")
 
+    # Template variable validation: all {{VAR}} references must have values
+    defined_vars = set(workflow.vars.keys())
+    for phase in workflow.phases:
+        all_text = phase.prompt + (phase.run or "")
+        undefined = set(_VAR_RE.findall(all_text)) - defined_vars
+        for var_name in sorted(undefined):
+            errors.append(f"Phase {phase.id!r}: template variable {{{{{var_name}}}}} has no value defined")
+
     return errors
 
 
