@@ -1,6 +1,9 @@
-"""Unit tests for CLI argument parsing."""
+"""Unit tests for CLI argument parsing and commands."""
 
-from juvenal.cli import build_parser
+import time
+
+from juvenal.cli import build_parser, cmd_status
+from juvenal.state import PipelineState
 
 
 class TestArgumentParsing:
@@ -197,3 +200,54 @@ class TestArgumentParsing:
         from juvenal import __version__
 
         assert __version__ in captured.out
+
+
+class TestStatusExitCode:
+    def _make_args(self, state_file):
+        import argparse
+
+        return argparse.Namespace(state_file=str(state_file))
+
+    def test_status_returns_0_when_all_completed(self, tmp_path):
+        """Fully successful pipeline returns exit code 0."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        state.started_at = time.time() - 10
+        state.set_attempt("build", 1)
+        state.mark_completed("build")
+        state.set_attempt("test", 1)
+        state.mark_completed("test")
+        state.completed_at = time.time()
+        state.save()
+
+        assert cmd_status(self._make_args(state_file)) == 0
+
+    def test_status_returns_1_when_failed(self, tmp_path):
+        """Pipeline with a failed phase returns exit code 1."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        state.started_at = time.time() - 10
+        state.set_attempt("build", 1)
+        state.mark_completed("build")
+        state.set_attempt("test", 1)
+        state.mark_failed("test")
+        state.completed_at = time.time()
+        state.save()
+
+        assert cmd_status(self._make_args(state_file)) == 1
+
+    def test_status_returns_1_when_incomplete(self, tmp_path):
+        """Pipeline still running (no completed_at) returns exit code 1."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        state.started_at = time.time()
+        state.set_attempt("build", 1)
+        state.mark_completed("build")
+        state.save()
+
+        assert cmd_status(self._make_args(state_file)) == 1
+
+    def test_status_returns_1_when_no_state(self, tmp_path):
+        """No state file (never run) returns exit code 1."""
+        state_file = tmp_path / "state.json"
+        assert cmd_status(self._make_args(state_file)) == 1

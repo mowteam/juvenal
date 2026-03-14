@@ -195,6 +195,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     state = PipelineState.load(args.state_file)
     state.print_status()
+
+    if not state.completed_at:
+        return 1
+    if any(ps.status == "failed" for ps in state.phases.values()):
+        return 1
     return 0
 
 
