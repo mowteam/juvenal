@@ -44,7 +44,7 @@ include:
 
 phases:
   - id: setup
-    prompt: "Set up the project scaffolding."
+    prompt: "Set up the {{PROJECT}} project scaffolding in {{ENV}}."
     timeout: 300  # seconds
     env:
       NODE_ENV: development
@@ -186,6 +186,32 @@ phases:
 ```
 
 Included phases, parallel groups, and other settings are merged. Circular includes are detected.
+
+## Template Variables
+
+Use `{{VAR}}` placeholders in prompts and script `run` commands. Variables are resolved at runtime.
+
+```yaml
+vars:
+  ENV: staging
+  PROJECT: myapp
+
+phases:
+  - id: deploy
+    prompt: "Deploy {{PROJECT}} to {{ENV}}."
+    checkers:
+      - run: "curl -f https://{{ENV}}.example.com/health"
+```
+
+```bash
+# Override defaults from CLI
+juvenal run workflow.yaml -D ENV=prod -D PROJECT=api
+```
+
+- YAML `vars:` sets defaults; CLI `-D` overrides them
+- Included workflows' vars merge (included = base, including = override)
+- Unrecognized `{{VAR}}` passes through unchanged (safe for prompts containing literal `{{`)
+- `--dry-run` shows active variables
 
 ## CLI Commands
 

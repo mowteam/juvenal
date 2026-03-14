@@ -32,12 +32,12 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 | Module | Purpose |
 |--------|---------|
 | `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups (flat or lane-based). `BounceCounter` for thread-safe global bounce tracking in lanes. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
-| `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. |
+| `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. `apply_vars()` handles `{{VAR}}` template substitution. In directory convention, extra `.md` files in a phase dir become check phases and `.sh` files become script phases (with auto bounce_target). |
 | `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. |
 | `state.py` | Atomic JSON state persistence (`PipelineState`). Thread-safe (RLock). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume, rewind, and scoped invalidation (for lane bounces). |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`) and script execution with timeouts. |
 | `display.py` | Rich TUI with rolling 15-line buffer. Thread-safe (Lock). Falls back to plain text with `--plain` or parallel mode. |
-| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`. |
+| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`, `validate`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`, `-D VAR=VAL`. `status` exits 0 if pipeline fully completed, 1 otherwise. |
 | `notifications.py` | Webhook notification support (`build_notification_payload`, `send_webhook`). |
 
 ### Execution Flow
@@ -54,6 +54,15 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 - **implement** — agent executes a prompt to build/modify code
 - **check** — separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason`
 - **script** — shell command; exit 0 = pass, nonzero = fail (bounces back to phase's `bounce_target` or most recent implement phase)
+
+### Template Variables
+
+Prompts and script `run` commands support `{{VAR}}` placeholders. Variables are set via:
+- **YAML `vars:` block** — workflow-level defaults
+- **CLI `-D VAR=VAL`** — overrides YAML defaults (repeatable)
+- **Includes** — included workflow vars are base defaults; including workflow overrides
+
+Unrecognized `{{VAR}}` placeholders pass through unchanged. Applied at render time via `apply_vars()` in `workflow.py`.
 
 ## Code Conventions
 
