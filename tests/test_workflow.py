@@ -72,6 +72,108 @@ class TestDirectoryLoading:
         assert wf.phases[3].prompt == "Review the implementation.\nVERDICT: PASS or FAIL"
 
 
+class TestDirectoryInlineCheckers:
+    def test_check_md_in_phase_dir(self, tmp_path):
+        """check.md alongside prompt.md creates a check phase with bounce_target."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        phase = phases_dir / "01-build"
+        phase.mkdir()
+        (phase / "prompt.md").write_text("Build the feature.")
+        (phase / "check.md").write_text("Verify the feature.\nVERDICT: PASS or FAIL")
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.phases) == 2
+        assert wf.phases[0].id == "01-build"
+        assert wf.phases[0].type == "implement"
+        assert wf.phases[0].prompt == "Build the feature."
+        assert wf.phases[1].id == "01-build~check-1"
+        assert wf.phases[1].type == "check"
+        assert wf.phases[1].prompt == "Verify the feature.\nVERDICT: PASS or FAIL"
+        assert wf.phases[1].bounce_target == "01-build"
+
+    def test_sh_in_phase_dir(self, tmp_path):
+        """.sh file alongside prompt.md creates a script phase with bounce_target."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        phase = phases_dir / "01-build"
+        phase.mkdir()
+        (phase / "prompt.md").write_text("Build it.")
+        script = phase / "tests.sh"
+        script.write_text("#!/bin/bash\npytest -x\n")
+        script.chmod(0o755)
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.phases) == 2
+        assert wf.phases[1].id == "01-build~script-1"
+        assert wf.phases[1].type == "script"
+        assert wf.phases[1].bounce_target == "01-build"
+
+    def test_multiple_checkers_in_phase_dir(self, tmp_path):
+        """Multiple .md and .sh files create numbered check/script phases."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        phase = phases_dir / "01-build"
+        phase.mkdir()
+        (phase / "prompt.md").write_text("Build it.")
+        (phase / "check-quality.md").write_text("Quality review.")
+        (phase / "check-tests.md").write_text("Test review.")
+        script = phase / "lint.sh"
+        script.write_text("#!/bin/bash\nruff check\n")
+        script.chmod(0o755)
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.phases) == 4
+        assert wf.phases[0].id == "01-build"
+        assert wf.phases[0].type == "implement"
+        # Sorted: check-quality.md, check-tests.md, lint.sh
+        assert wf.phases[1].id == "01-build~check-1"
+        assert wf.phases[1].prompt == "Quality review."
+        assert wf.phases[2].id == "01-build~check-2"
+        assert wf.phases[2].prompt == "Test review."
+        assert wf.phases[3].id == "01-build~script-1"
+        assert wf.phases[3].type == "script"
+
+    def test_check_dir_ignores_extra_files(self, tmp_path):
+        """check- prefixed dirs only use prompt.md, extra files are ignored."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        phase = phases_dir / "01-check-review"
+        phase.mkdir()
+        (phase / "prompt.md").write_text("Review it.")
+        (phase / "extra.md").write_text("Should be ignored.")
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.phases) == 1
+        assert wf.phases[0].type == "check"
+
+    def test_mixed_sequential_with_inline_checkers(self, tmp_path):
+        """Sequential phases where some have inline checkers and some don't."""
+        phases_dir = tmp_path / "phases"
+        phases_dir.mkdir()
+
+        p1 = phases_dir / "01-setup"
+        p1.mkdir()
+        (p1 / "prompt.md").write_text("Set up.")
+
+        p2 = phases_dir / "02-build"
+        p2.mkdir()
+        (p2 / "prompt.md").write_text("Build it.")
+        (p2 / "check.md").write_text("Verify build.")
+
+        p3 = phases_dir / "03-deploy"
+        p3.mkdir()
+        (p3 / "prompt.md").write_text("Deploy it.")
+
+        wf = load_workflow(tmp_path)
+        assert len(wf.phases) == 4
+        assert [p.id for p in wf.phases] == ["01-setup", "02-build", "02-build~check-1", "03-deploy"]
+
+
 class TestBareFileLoading:
     def test_load_bare_md(self, bare_md):
         wf = load_workflow(bare_md)

@@ -74,7 +74,9 @@ parallel_groups:
 my-workflow/
   phases/
     01-setup/
-      prompt.md
+      prompt.md            # implement phase
+      check.md             # check phase (auto-bounces to 01-setup)
+      tests.sh             # script phase (auto-bounces to 01-setup)
     02-parallel/           # "parallel" in name → parallel lane group
       feature-a/           #   each subdir is a lane
         prompt.md          #     implement phase
@@ -82,9 +84,11 @@ my-workflow/
       feature-b/
         prompt.md
         check.md
-    03-finish/
+    03-check-final/        # "check-" prefix → standalone check phase
       prompt.md
 ```
+
+In any phase directory, extra `.md` files (besides `prompt.md`) become check phases and `.sh` files become script phases, all with `bounce_target` set to the implement phase. Directories with `check-` prefix or `-check-` in the name are standalone check phases (only `prompt.md` is used).
 
 Lanes can also use subdirectories: `02-parallel/a/01-implement/prompt.md`, `02-parallel/a/02-check-review/prompt.md`.
 

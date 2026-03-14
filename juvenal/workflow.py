@@ -278,8 +278,11 @@ def _load_directory(root: Path, phases_dir: Path) -> Workflow:
 def _load_phase_dir(phase_dir: Path) -> list[Phase] | None:
     """Load phase(s) from a directory.
 
-    - check- prefix -> check phase
-    - no prefix -> implement phase
+    - check- prefix or -check- in name -> check phase (prompt.md only)
+    - no prefix -> implement phase, plus:
+        - additional .md files (besides prompt.md) -> check phases
+        - .sh files -> script phases
+      Check/script phases auto-get bounce_target set to the implement phase.
     """
     prompt_path = phase_dir / "prompt.md"
     if not prompt_path.exists():
@@ -289,9 +292,28 @@ def _load_phase_dir(phase_dir: Path) -> list[Phase] | None:
     if phase_dir.name.startswith("check-") or "-check-" in phase_dir.name:
         # Check phase
         return [Phase(id=phase_dir.name, type="check", prompt=prompt)]
-    else:
-        # Implement phase
-        return [Phase(id=phase_dir.name, type="implement", prompt=prompt)]
+
+    # Implement phase — also pick up sibling check/script files
+    phase_id = phase_dir.name
+    phases = [Phase(id=phase_id, type="implement", prompt=prompt)]
+
+    check_n = 0
+    script_n = 0
+    for entry in sorted(phase_dir.iterdir()):
+        if entry.name == "prompt.md" or entry.name.startswith(".") or entry.name.startswith("_"):
+            continue
+        if entry.is_file() and entry.suffix == ".sh":
+            script_n += 1
+            phases.append(
+                Phase(id=f"{phase_id}~script-{script_n}", type="script", run=str(entry), bounce_target=phase_id)
+            )
+        elif entry.is_file() and entry.suffix == ".md":
+            check_n += 1
+            phases.append(
+                Phase(id=f"{phase_id}~check-{check_n}", type="check", prompt=entry.read_text(), bounce_target=phase_id)
+            )
+
+    return phases
 
 
 def _load_parallel_dir(parallel_dir: Path) -> tuple[list[Phase], ParallelGroup]:
