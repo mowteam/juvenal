@@ -841,6 +841,7 @@ class Engine:
 
         # Validation
         errors = validate_workflow(self.workflow)
+        has_errors = bool(errors)
         if errors:
             print(f"Validation: {len(errors)} error(s)")
             for err in errors:
@@ -901,7 +902,7 @@ class Engine:
                     print(f"  lanes: {group.lanes}")
                 else:
                     print(f"  {group.phases}")
-        return 0
+        return 1 if has_errors else 0
 
 
 def _plan_workflow_internal(

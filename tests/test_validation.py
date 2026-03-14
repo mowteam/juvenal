@@ -475,14 +475,29 @@ class TestValidateCLI:
         assert args.command == "validate"
         assert args.workflow == "workflow.yaml"
 
+    def test_validate_accepts_run_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["validate", "workflow.yaml", "-D", "ENV=prod", "--checker", "tester"])
+        assert args.defines == ["ENV=prod"]
+        assert args.checker == ["tester"]
+
     def test_validate_valid_workflow(self, sample_yaml, capsys):
         parser = build_parser()
         args = parser.parse_args(["validate", str(sample_yaml)])
-        args.plain = False
+        args.plain = True
         result = cmd_validate(args)
         assert result == 0
         captured = capsys.readouterr()
-        assert "valid" in captured.out
+        assert "Validation: OK" in captured.out
+
+    def test_validate_shows_execution_plan(self, sample_yaml, capsys):
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(sample_yaml)])
+        args.plain = True
+        cmd_validate(args)
+        captured = capsys.readouterr()
+        assert "Execution plan:" in captured.out
+        assert "Phase summary:" in captured.out
 
     def test_validate_undefined_template_var(self, tmp_path, capsys):
         yaml_content = """\
@@ -495,12 +510,27 @@ phases:
         yaml_path.write_text(yaml_content)
         parser = build_parser()
         args = parser.parse_args(["validate", str(yaml_path)])
-        args.plain = False
+        args.plain = True
         result = cmd_validate(args)
         assert result == 1
         captured = capsys.readouterr()
         assert "ENV" in captured.out
         assert "REGION" in captured.out
+
+    def test_validate_with_defines_resolves_vars(self, tmp_path, capsys):
+        yaml_content = """\
+name: test
+phases:
+  - id: deploy
+    prompt: "Deploy to {{ENV}}."
+"""
+        yaml_path = tmp_path / "ok.yaml"
+        yaml_path.write_text(yaml_content)
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(yaml_path), "-D", "ENV=prod"])
+        args.plain = True
+        result = cmd_validate(args)
+        assert result == 0
 
     def test_validate_invalid_workflow(self, tmp_path, capsys):
         yaml_content = """\
@@ -514,7 +544,7 @@ phases:
         yaml_path.write_text(yaml_content)
         parser = build_parser()
         args = parser.parse_args(["validate", str(yaml_path)])
-        args.plain = False
+        args.plain = True
         result = cmd_validate(args)
         assert result == 1
         captured = capsys.readouterr()

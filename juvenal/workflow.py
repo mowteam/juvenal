@@ -193,7 +193,9 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         included_vars.update(included_wf.vars)
 
     phases = list(included_phases)
-    for phase_data in data.get("phases", []):
+    for i, phase_data in enumerate(data.get("phases", [])):
+        if "id" not in phase_data:
+            raise ValueError(f"Phase {i} in {path}: missing required 'id' field")
         prompt = phase_data.get("prompt", "")
         if not prompt and phase_data.get("prompt_file"):
             prompt_path = path.parent / phase_data["prompt_file"]

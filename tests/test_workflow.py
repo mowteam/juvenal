@@ -645,6 +645,27 @@ class TestErrors:
         with pytest.raises(ValueError, match="expected a mapping"):
             load_workflow(bad_yaml)
 
+    def test_yaml_phase_missing_id(self, tmp_path):
+        """Phase without 'id' field should raise with a clear message."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("name: test\nphases:\n  - prompt: 'no id here'\n")
+        with pytest.raises(ValueError, match="missing required 'id' field"):
+            load_workflow(bad_yaml)
+
+    def test_yaml_phase_missing_id_second_phase(self, tmp_path):
+        """Second phase without 'id' gives the right index."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("name: test\nphases:\n  - id: ok\n    prompt: fine\n  - prompt: 'no id'\n")
+        with pytest.raises(ValueError, match="Phase 1"):
+            load_workflow(bad_yaml)
+
+    def test_yaml_phase_not_a_dict(self, tmp_path):
+        """Phase that is a bare string instead of a dict should raise."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("name: test\nphases:\n  - just a string\n")
+        with pytest.raises((ValueError, TypeError, AttributeError)):
+            load_workflow(bad_yaml)
+
     def test_yaml_empty(self, tmp_path):
         """Empty YAML file should raise."""
         bad_yaml = tmp_path / "bad.yaml"

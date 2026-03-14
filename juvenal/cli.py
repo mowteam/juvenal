@@ -87,9 +87,17 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.add_argument("directory", nargs="?", default=".", help="Directory to scaffold (default: .)")
     init_p.add_argument("--template", default="default", help="Template to use (default: default)")
 
-    # validate
-    validate_p = sub.add_parser("validate", help="Validate a workflow definition")
+    # validate (same flags as run, but always dry-run)
+    validate_p = sub.add_parser("validate", help="Validate a workflow and show execution plan")
     validate_p.add_argument("workflow", help="Path to workflow YAML, directory, or bare .md file")
+    validate_p.add_argument("--max-bounces", type=int, default=999)
+    validate_p.add_argument("--backend", choices=["claude", "codex"], default="codex")
+    validate_p.add_argument("--working-dir")
+    validate_p.add_argument("--backoff", type=float, default=None)
+    validate_p.add_argument("--notify", action="append", default=[])
+    validate_p.add_argument("--checker", action="append", default=[])
+    validate_p.add_argument("--implementer")
+    validate_p.add_argument("-D", action="append", default=[], metavar="VAR=VAL", dest="defines")
 
     return parser
 
@@ -260,17 +268,29 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    from juvenal.workflow import load_workflow, validate_workflow
+    from juvenal.engine import Engine
+    from juvenal.workflow import inject_checkers, inject_implementer, load_workflow
 
     workflow = load_workflow(args.workflow)
-    errors = validate_workflow(workflow)
-    if errors:
-        print(f"Validation found {len(errors)} error(s):")
-        for err in errors:
-            print(f"  - {err}")
-        return 1
-    print(f"Workflow {workflow.name!r} is valid ({len(workflow.phases)} phases).")
-    return 0
+    if args.defines:
+        workflow = _apply_defines(workflow, _parse_defines(args.defines))
+    if args.implementer:
+        workflow = inject_implementer(workflow, args.implementer)
+    if args.checker:
+        workflow = inject_checkers(workflow, args.checker)
+    if args.backend:
+        workflow.backend = args.backend
+    if args.max_bounces:
+        workflow.max_bounces = args.max_bounces
+    if args.working_dir:
+        workflow.working_dir = args.working_dir
+    if args.backoff is not None:
+        workflow.backoff = args.backoff
+    if args.notify:
+        workflow.notify.extend(args.notify)
+
+    engine = Engine(workflow, dry_run=True, plain=args.plain)
+    return engine.run()
 
 
 def main(argv: list[str] | None = None) -> None:
