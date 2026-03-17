@@ -2196,10 +2196,10 @@ class TestInteractiveMode:
         engine.backend = backend
         return engine
 
-    def test_interactive_implement_passes(self, tmp_path):
-        """Interactive implement phase calls run_interactive and succeeds."""
+    def test_interactive_completes_immediately_on_sentinel(self, tmp_path):
+        """Agent emits PLAN_COMPLETE on first run — no Q&A needed."""
         backend = MockBackend()
-        backend.add_interactive_response(exit_code=0, session_id="sess-1")
+        backend.add_response(exit_code=0, output="All clear.\nPLAN_COMPLETE", session_id="s1")
         backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
 
         workflow = Workflow(
@@ -2212,8 +2212,52 @@ class TestInteractiveMode:
         )
         engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
         assert engine.run() == 0
-        assert len(backend.interactive_calls) == 1
-        assert "interactive mode" in backend.interactive_calls[0].lower()
+        # First call is the interactive run_agent, second is the checker
+        assert len(backend.calls) == 2
+        assert "interactive mode" in backend.calls[0].lower()
+
+    def test_interactive_qa_loop(self, tmp_path, monkeypatch):
+        """Agent asks a question, user answers, agent emits PLAN_COMPLETE."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="What database should we use?", session_id="s1")
+        backend.add_response(exit_code=0, output="Got it, using postgres.\nPLAN_COMPLETE", session_id="s1")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
+
+        monkeypatch.setattr("builtins.input", lambda prompt="": "postgres")
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="refine", type="implement", prompt="Refine.", interactive=True),
+                Phase(id="review", type="check", prompt="Review.\nVERDICT: PASS or FAIL", bounce_target="refine"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
+        assert engine.run() == 0
+        # run_agent for interactive, resume_agent for user answer, run_agent for checker
+        assert len(backend.calls) == 2  # interactive + checker
+        assert len(backend.resume_calls) == 1
+        assert backend.resume_calls[0] == ("s1", "postgres")
+
+    def test_interactive_multiple_questions(self, tmp_path, monkeypatch):
+        """Agent asks multiple questions one at a time."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="What language?", session_id="s1")
+        backend.add_response(exit_code=0, output="What framework?", session_id="s1")
+        backend.add_response(exit_code=0, output="Done.\nPLAN_COMPLETE", session_id="s1")
+
+        answers = iter(["python", "flask"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="refine", type="implement", prompt="Refine.", interactive=True)],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
+        assert engine.run() == 0
+        assert len(backend.resume_calls) == 2
 
     def test_interactive_skipped_when_engine_not_interactive(self, tmp_path):
         """Phase with interactive=True uses normal run_agent when engine interactive=False."""
@@ -2231,37 +2275,13 @@ class TestInteractiveMode:
         )
         engine = self._make_engine(workflow, backend, tmp_path, interactive=False, plain=True)
         assert engine.run() == 0
-        assert len(backend.interactive_calls) == 0
         assert len(backend.calls) == 2  # normal run_agent for both
 
-    def test_interactive_uses_original_backend_for_non_interactive_phases(self, tmp_path):
-        """Non-interactive phases use the configured backend, not Claude."""
-        backend = MockBackend()
-        backend.add_response(exit_code=0, output="done")  # implement (non-interactive)
-        backend.add_interactive_response(exit_code=0)  # interactive phase
-        backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
-
-        workflow = Workflow(
-            name="test",
-            phases=[
-                Phase(id="setup", type="implement", prompt="Setup."),
-                Phase(id="refine", type="implement", prompt="Refine.", interactive=True),
-                Phase(id="review", type="check", prompt="Review.\nVERDICT: PASS or FAIL", bounce_target="refine"),
-            ],
-            max_bounces=3,
-        )
-        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
-        assert engine.run() == 0
-        # setup + review used run_agent (the mock backend)
-        assert len(backend.calls) == 2
-        # refine used run_interactive (the mock backend)
-        assert len(backend.interactive_calls) == 1
-
     def test_interactive_crash_bounces(self, tmp_path):
-        """Interactive session with nonzero exit bounces back."""
+        """Interactive agent crash bounces back."""
         backend = MockBackend()
-        backend.add_interactive_response(exit_code=1, session_id="sess-1")  # crash
-        backend.add_interactive_response(exit_code=0, session_id="sess-2")  # retry succeeds
+        backend.add_response(exit_code=1, output="crash", session_id="s1")  # crash
+        backend.add_response(exit_code=0, output="Fixed.\nPLAN_COMPLETE", session_id="s2")  # retry
         backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
 
         workflow = Workflow(
@@ -2274,45 +2294,11 @@ class TestInteractiveMode:
         )
         engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
         assert engine.run() == 0
-        assert len(backend.interactive_calls) == 2
-
-    def test_interactive_calls_display_pause_resume(self, tmp_path):
-        """Interactive mode calls display.pause() and display.resume()."""
-        backend = MockBackend()
-        backend.add_interactive_response(exit_code=0)
-
-        workflow = Workflow(
-            name="test",
-            phases=[Phase(id="refine", type="implement", prompt="Refine.", interactive=True)],
-            max_bounces=3,
-        )
-        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
-
-        # Track pause/resume calls
-        pause_calls = []
-        resume_calls = []
-        original_pause = engine.display.pause
-        original_resume = engine.display.resume
-
-        def mock_pause():
-            pause_calls.append(True)
-            original_pause()
-
-        def mock_resume():
-            resume_calls.append(True)
-            original_resume()
-
-        engine.display.pause = mock_pause
-        engine.display.resume = mock_resume
-
-        assert engine.run() == 0
-        assert len(pause_calls) == 1
-        assert len(resume_calls) == 1
 
     def test_interactive_tracks_session_id(self, tmp_path):
         """Interactive session stores session_id for future reference."""
         backend = MockBackend()
-        backend.add_interactive_response(exit_code=0, session_id="tracked-sess")
+        backend.add_response(exit_code=0, output="PLAN_COMPLETE", session_id="tracked-sess")
 
         workflow = Workflow(
             name="test",
@@ -2323,12 +2309,12 @@ class TestInteractiveMode:
         assert engine.run() == 0
         assert engine._session_ids["refine"] == "tracked-sess"
 
-    def test_interactive_bounce_from_checker_relaunches_interactive(self, tmp_path):
-        """When checker FAILs, interactive phase is re-run interactively."""
+    def test_interactive_bounce_from_checker_relaunches(self, tmp_path):
+        """When checker FAILs, interactive phase re-runs the Q&A loop."""
         backend = MockBackend()
-        backend.add_interactive_response(exit_code=0, session_id="sess-1")  # first interactive
+        backend.add_response(exit_code=0, output="PLAN_COMPLETE", session_id="s1")  # first interactive
         backend.add_response(exit_code=0, output="VERDICT: FAIL: needs work")  # checker fails
-        backend.add_interactive_response(exit_code=0, session_id="sess-2")  # re-run interactive
+        backend.add_response(exit_code=0, output="PLAN_COMPLETE", session_id="s2")  # re-run interactive
         backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker passes
 
         workflow = Workflow(
@@ -2341,13 +2327,13 @@ class TestInteractiveMode:
         )
         engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
         assert engine.run() == 0
-        assert len(backend.interactive_calls) == 2
-        assert len(backend.calls) == 2  # two checker calls
+        # Two interactive run_agent calls + two checker run_agent calls
+        assert len(backend.calls) == 4
 
     def test_interactive_logs_step(self, tmp_path):
         """Interactive session logs a step with type 'interactive'."""
         backend = MockBackend()
-        backend.add_interactive_response(exit_code=0)
+        backend.add_response(exit_code=0, output="PLAN_COMPLETE", session_id="s1")
 
         workflow = Workflow(
             name="test",
@@ -2358,6 +2344,21 @@ class TestInteractiveMode:
         assert engine.run() == 0
         ps = engine.state.phases["refine"]
         assert any(entry.get("step") == "interactive" for entry in ps.logs)
+
+    def test_interactive_user_eof_exits_gracefully(self, tmp_path, monkeypatch):
+        """Ctrl+D (EOF) during input exits the interactive loop gracefully."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="What database?", session_id="s1")
+
+        monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError))
+
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="refine", type="implement", prompt="Refine.", interactive=True)],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
+        assert engine.run() == 0
 
 
 class TestPlanWorkflowInternal:

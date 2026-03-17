@@ -243,42 +243,9 @@ class Engine:
         self.state.set_attempt(phase.id, attempt)
         self.display.phase_start(phase.id, attempt)
 
-        # Interactive mode: launch terminal passthrough session
+        # Interactive mode: agent-driven Q&A loop
         if phase.interactive and self.interactive:
-            prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
-            preamble = (
-                "You are in interactive mode. The user is available to discuss the plan "
-                "with you. If you encounter a genuinely important ambiguity that could "
-                "lead the implementation in the wrong direction, ask the user. For "
-                "routine decisions, use your judgment. Ask questions ONE AT A TIME — "
-                "present a single question, wait for the answer, then move on to the "
-                "next. Do not batch multiple questions together. When a decision is "
-                "made, update the plan text to reflect it directly at the relevant "
-                "location. The plan should be self-contained.\n\n"
-            )
-            prompt = preamble + prompt
-            self.display.pause()
-            try:
-                result = self.backend.run_interactive(
-                    prompt, working_dir=self.workflow.working_dir, env=phase.env or None
-                )
-            except NotImplementedError:
-                from juvenal.backends import ClaudeBackend
-
-                result = ClaudeBackend().run_interactive(
-                    prompt, working_dir=self.workflow.working_dir, env=phase.env or None
-                )
-            self.display.resume()
-            self.state.log_step(phase.id, attempt, "interactive", "", input=prompt)
-            if result.session_id:
-                self._session_ids[phase.id] = result.session_id
-            if result.exit_code != 0:
-                failure_context = f"Interactive session exited with code {result.exit_code}"
-                self.display.step_fail("interactive", failure_context)
-                bounce_target = phase.bounce_target or phase.id
-                return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
-            self.display.step_pass("interactive")
-            return PhaseResult(success=True)
+            return self._run_interactive_loop(phase, attempt, failure_context)
 
         # When preserve_context_on_bounce is enabled and we're bouncing back to this
         # phase, resume the previous session instead of starting fresh. The failure
@@ -330,6 +297,85 @@ class Engine:
             return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
 
         self.display.step_pass("implement")
+        return PhaseResult(success=True)
+
+    _INTERACTIVE_SENTINEL = "PLAN_COMPLETE"
+    _INTERACTIVE_PREAMBLE = (
+        "You are in interactive mode. The user is available to discuss the plan "
+        "with you. If you encounter a genuinely important ambiguity that could "
+        "lead the implementation in the wrong direction, ask the user. For "
+        "routine decisions, use your judgment. Ask questions ONE AT A TIME — "
+        "present a single question, wait for the answer, then move on to the "
+        "next. Do not batch multiple questions together. When a decision is "
+        "made, update the plan text to reflect it directly at the relevant "
+        "location. The plan should be self-contained.\n\n"
+        "When you have resolved all ambiguities and finished updating the plan, "
+        "emit PLAN_COMPLETE on its own line as the very last thing you output.\n\n"
+    )
+
+    def _run_interactive_loop(self, phase: Phase, attempt: int, failure_context: str) -> PhaseResult:
+        """Run an agent-driven Q&A loop. Agent asks questions, user answers, agent updates plan."""
+        prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+        prompt = self._INTERACTIVE_PREAMBLE + prompt
+
+        self.display.step_start("interactive")
+        result = self.backend.run_agent(
+            prompt,
+            working_dir=self.workflow.working_dir,
+            display_callback=self.display.live_update,
+            timeout=phase.timeout,
+            env=phase.env or None,
+        )
+        self.state.log_step(phase.id, attempt, "interactive", result.output, input=prompt, transcript=result.transcript)
+        self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
+
+        if result.exit_code != 0:
+            failure_context = f"Interactive agent crashed (exit {result.exit_code}).\n{result.output[-3000:]}"
+            self.display.step_fail("interactive", failure_context[:500])
+            bounce_target = phase.bounce_target or phase.id
+            return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
+
+        session_id = result.session_id
+        if session_id:
+            self._session_ids[phase.id] = session_id
+
+        # Q&A loop: agent asks questions, user answers, until agent emits PLAN_COMPLETE
+        while self._INTERACTIVE_SENTINEL not in result.output:
+            # Show the agent's question and prompt for user input
+            self.display._stop_live()
+            print(f"\n{result.output}\n", flush=True)
+            try:
+                user_input = input(">>> ")
+            except (EOFError, KeyboardInterrupt):
+                print(flush=True)
+                self.display.step_pass("interactive (user exited)")
+                return PhaseResult(success=True)
+
+            if not session_id:
+                self.display.step_fail("interactive", "No session ID for resume")
+                return PhaseResult(success=False)
+
+            self.display.step_start("interactive")
+            result = self.backend.resume_agent(
+                session_id,
+                user_input,
+                working_dir=self.workflow.working_dir,
+                display_callback=self.display.live_update,
+                timeout=phase.timeout,
+                env=phase.env or None,
+            )
+            self.state.log_step(
+                phase.id, attempt, "interactive-resume", result.output, input=user_input, transcript=result.transcript
+            )
+            self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
+
+            if result.exit_code != 0:
+                failure_context = f"Interactive agent crashed (exit {result.exit_code}).\n{result.output[-3000:]}"
+                self.display.step_fail("interactive", failure_context[:500])
+                bounce_target = phase.bounce_target or phase.id
+                return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
+
+        self.display.step_pass("interactive")
         return PhaseResult(success=True)
 
     def _run_script(self, phase: Phase, phases: list[Phase], phase_idx: int) -> PhaseResult:
