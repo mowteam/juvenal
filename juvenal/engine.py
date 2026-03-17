@@ -250,9 +250,11 @@ class Engine:
                 "You are in interactive mode. The user is available to discuss the plan "
                 "with you. If you encounter a genuinely important ambiguity that could "
                 "lead the implementation in the wrong direction, ask the user. For "
-                "routine decisions, use your judgment. When a decision is made, update "
-                "the plan text to reflect it directly at the relevant location. The plan "
-                "should be self-contained.\n\n"
+                "routine decisions, use your judgment. Ask questions ONE AT A TIME — "
+                "present a single question, wait for the answer, then move on to the "
+                "next. Do not batch multiple questions together. When a decision is "
+                "made, update the plan text to reflect it directly at the relevant "
+                "location. The plan should be self-contained.\n\n"
             )
             prompt = preamble + prompt
             self.display.pause()
