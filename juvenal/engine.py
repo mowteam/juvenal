@@ -91,6 +91,7 @@ class Engine:
         _max_depth: int = 3,
         clear_context_on_bounce: bool = False,
         serialize: bool = False,
+        interactive: bool = False,
     ):
         self.workflow = workflow
         self.backend = create_backend(workflow.backend)
@@ -100,6 +101,7 @@ class Engine:
         self.dry_run = dry_run
         self.preserve_context_on_bounce = not clear_context_on_bounce
         self.serialize = serialize
+        self.interactive = interactive
         self._session_ids: dict[str, str] = {}  # phase_id -> last session_id
         self._bounce_targets: set[str] = set()  # phases that should resume on next run
         self._engine_lock = Lock()  # protects _session_ids and _bounce_targets in parallel
@@ -240,6 +242,32 @@ class Engine:
         attempt = (ps.attempt if ps.attempt > 0 else 0) + 1
         self.state.set_attempt(phase.id, attempt)
         self.display.phase_start(phase.id, attempt)
+
+        # Interactive mode: launch terminal passthrough session
+        if phase.interactive and self.interactive:
+            prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+            preamble = (
+                "You are in interactive mode. The user is available to discuss the plan "
+                "with you. If you encounter a genuinely important ambiguity that could "
+                "lead the implementation in the wrong direction, ask the user. For "
+                "routine decisions, use your judgment. When a decision is made, update "
+                "the plan text to reflect it directly at the relevant location. The plan "
+                "should be self-contained.\n\n"
+            )
+            prompt = preamble + prompt
+            self.display.pause()
+            result = self.backend.run_interactive(prompt, working_dir=self.workflow.working_dir, env=phase.env or None)
+            self.display.resume()
+            self.state.log_step(phase.id, attempt, "interactive", "", input=prompt)
+            if result.session_id:
+                self._session_ids[phase.id] = result.session_id
+            if result.exit_code != 0:
+                failure_context = f"Interactive session exited with code {result.exit_code}"
+                self.display.step_fail("interactive", failure_context)
+                bounce_target = phase.bounce_target or phase.id
+                return PhaseResult(success=False, bounce_target=bounce_target, failure_context=failure_context)
+            self.display.step_pass("interactive")
+            return PhaseResult(success=True)
 
         # When preserve_context_on_bounce is enabled and we're bouncing back to this
         # phase, resume the previous session instead of starting fresh. The failure
@@ -916,33 +944,49 @@ def _plan_workflow_internal(
     plain: bool = False,
     depth: int = 0,
     max_depth: int = 3,
+    interactive: bool = False,
+    project_dir: str | None = None,
 ) -> PlanResult:
     """Internal planning logic: generate a sub-workflow YAML from a goal.
 
     Returns a PlanResult with the path to the generated YAML and temp dir.
+    When project_dir is set, plan artifacts go into project_dir/.plan/ and agents
+    run in the project directory (so they can read the codebase). When not set
+    (dynamic sub-workflows), uses a temp dir.
     Callers are responsible for cleanup of temp_dir on success.
     """
     import yaml as _yaml
 
     from juvenal.workflow import load_workflow
 
-    tmp_dir = tempfile.mkdtemp(prefix="juvenal-plan-")
-    tmp_path = Path(tmp_dir)
-    plan_dir = tmp_path / ".plan"
-    plan_dir.mkdir()
+    if project_dir:
+        work_dir = project_dir
+        plan_dir = Path(project_dir) / ".plan"
+        plan_dir.mkdir(exist_ok=True)
+        tmp_dir = None
+    else:
+        tmp_dir = tempfile.mkdtemp(prefix="juvenal-plan-")
+        work_dir = tmp_dir
+        plan_dir = Path(tmp_dir) / ".plan"
+        plan_dir.mkdir()
+
     (plan_dir / "goal.md").write_text(goal)
 
     try:
         plan_yaml = Path(__file__).parent / "workflows" / "plan.yaml"
         workflow = load_workflow(plan_yaml)
-        workflow.working_dir = tmp_dir
+        workflow.working_dir = work_dir
+
+        state_path = str(plan_dir / ".juvenal-state.json")
 
         engine = Engine(
             workflow,
-            state_file=str(tmp_path / ".juvenal-state.json"),
+            state_file=state_path,
             plain=plain,
             _depth=depth,
             _max_depth=max_depth,
+            clear_context_on_bounce=True,
+            interactive=interactive,
         )
         # Share backend/display if provided, otherwise use defaults
         if backend_instance is not None:
@@ -966,7 +1010,7 @@ def _plan_workflow_internal(
                 output_tokens=plan_out,
             )
 
-        produced = tmp_path / "workflow.yaml"
+        produced = Path(work_dir) / "workflow.yaml"
         if not produced.exists():
             return PlanResult(
                 success=False,
@@ -998,19 +1042,26 @@ def _plan_workflow_internal(
         return PlanResult(success=False, temp_dir=tmp_dir, error=str(e))
 
 
-def plan_workflow(goal: str, output_path: str, backend_name: str = "codex", plain: bool = False) -> None:
+def plan_workflow(
+    goal: str, output_path: str, backend_name: str = "codex", plain: bool = False, interactive: bool = False
+) -> None:
     """Generate a workflow YAML from a goal description using a multi-phase pipeline."""
-    result = _plan_workflow_internal(goal=goal, backend_name=backend_name, plain=plain)
+    import os
+
+    result = _plan_workflow_internal(
+        goal=goal, backend_name=backend_name, plain=plain, interactive=interactive, project_dir=os.getcwd()
+    )
 
     if not result.success:
-        print(f"Planning failed: {result.error}. Working directory preserved at: {result.temp_dir}")
+        error_loc = result.temp_dir or ".plan/"
+        print(f"Planning failed: {result.error}. Working directory preserved at: {error_loc}")
         raise SystemExit(1)
 
     # Copy the produced workflow to the output path
     Path(output_path).write_text(Path(result.workflow_yaml_path).read_text())
     print(f"Workflow written to {output_path}")
 
-    # Clean up on success
+    # Clean up temp dir on success (project_dir/.plan/ is kept)
     if result.temp_dir:
         shutil.rmtree(result.temp_dir)
 

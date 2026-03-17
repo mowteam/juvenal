@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
     plan_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
     plan_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
+    plan_p.add_argument(
+        "-i", "--interactive", action="store_true", help="Interactive mode: chat with the agent during plan refinement"
+    )
 
     # do
     do_p = sub.add_parser("do", help="Plan + immediately run a workflow")
@@ -62,6 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     do_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
     do_p.add_argument("--checker", action="append", default=[], help="Inject checker on every implement phase")
     do_p.add_argument("--implementer", help="Prepend implementer role prompt to every implement phase")
+    do_p.add_argument(
+        "-i", "--interactive", action="store_true", help="Interactive mode: chat with the agent during plan refinement"
+    )
     do_p.add_argument(
         "--clear-context-on-bounce",
         action="store_true",
@@ -182,7 +188,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_plan(args: argparse.Namespace) -> int:
     from juvenal.engine import plan_workflow
 
-    plan_workflow(args.goal, args.output, args.backend, plain=args.plain)
+    interactive = args.interactive
+    backend = args.backend
+    if interactive and backend != "claude":
+        print(f"Warning: --interactive requires claude backend, overriding --backend={backend}")
+        backend = "claude"
+    plan_workflow(args.goal, args.output, backend, plain=args.plain, interactive=interactive)
     if args.implementer:
         _inject_implementer_into_yaml(args.output, args.implementer)
     if args.checker:
@@ -235,8 +246,14 @@ def cmd_do(args: argparse.Namespace) -> int:
     from juvenal.engine import Engine, plan_workflow
     from juvenal.workflow import inject_checkers, inject_implementer
 
+    interactive = args.interactive
+    backend = args.backend
+    if interactive and backend != "claude":
+        print(f"Warning: --interactive requires claude backend, overriding --backend={backend}")
+        backend = "claude"
+
     with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
-        plan_workflow(args.goal, f.name, args.backend, plain=args.plain)
+        plan_workflow(args.goal, f.name, backend, plain=args.plain, interactive=interactive)
         workflow = _load_workflow_or_exit(f.name)
 
     if args.defines:

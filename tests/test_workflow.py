@@ -1370,6 +1370,62 @@ phases:
         assert wf.phases[1].run == "pytest -x"
 
 
+class TestInteractiveField:
+    def test_interactive_parsed_from_yaml(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: refine
+    prompt: "Refine."
+    interactive: true
+  - id: build
+    prompt: "Build."
+"""
+        (tmp_path / "workflow.yaml").write_text(yaml_content)
+        wf = load_workflow(tmp_path / "workflow.yaml")
+        assert wf.phases[0].interactive is True
+        assert wf.phases[1].interactive is False
+
+    def test_interactive_defaults_to_false(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: build
+    prompt: "Build."
+"""
+        (tmp_path / "workflow.yaml").write_text(yaml_content)
+        wf = load_workflow(tmp_path / "workflow.yaml")
+        assert wf.phases[0].interactive is False
+
+    def test_interactive_on_non_implement_is_error(self, tmp_path):
+        from juvenal.workflow import validate_workflow
+
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="check-it", type="check", prompt="Check.\nVERDICT: PASS", interactive=True),
+            ],
+        )
+        errors = validate_workflow(wf)
+        assert any("interactive" in e for e in errors)
+
+    def test_interactive_not_flagged_as_unknown_key(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: refine
+    prompt: "Refine."
+    interactive: true
+"""
+        (tmp_path / "workflow.yaml").write_text(yaml_content)
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            load_workflow(tmp_path / "workflow.yaml")
+            assert len(w) == 0
+
+
 class TestUnknownKeyWarning:
     def test_unknown_key_warns(self, tmp_path):
         yaml_content = """\

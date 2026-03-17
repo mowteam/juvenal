@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from juvenal.backends import AgentResult, Backend
+from juvenal.backends import AgentResult, Backend, InteractiveResult
 from juvenal.workflow import Phase, Workflow
 
 
@@ -89,9 +89,11 @@ class MockBackend(Backend):
     def __init__(self, responses: list[AgentResult] | None = None):
         super().__init__()
         self._responses = list(responses or [])
+        self._interactive_responses: list[InteractiveResult] = []
         self._call_count = 0
         self.calls: list[str] = []
         self.resume_calls: list[tuple[str, str]] = []
+        self.interactive_calls: list[str] = []
 
     def name(self) -> str:
         return "mock"
@@ -134,6 +136,15 @@ class MockBackend(Backend):
             result = AgentResult(exit_code=0, output="VERDICT: PASS", transcript="", duration=0.1)
         self._call_count += 1
         return result
+
+    def add_interactive_response(self, exit_code: int = 0, session_id: str = "mock-session"):
+        self._interactive_responses.append(InteractiveResult(session_id=session_id, exit_code=exit_code))
+
+    def run_interactive(self, prompt, working_dir, env=None):
+        self.interactive_calls.append(prompt)
+        if self._interactive_responses:
+            return self._interactive_responses.pop(0)
+        return InteractiveResult(session_id="mock-session", exit_code=0)
 
 
 @pytest.fixture

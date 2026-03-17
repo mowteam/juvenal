@@ -25,6 +25,14 @@ class AgentResult:
     session_id: str | None = None
 
 
+@dataclass
+class InteractiveResult:
+    """Result from an interactive terminal session."""
+
+    session_id: str
+    exit_code: int
+
+
 class Backend(ABC):
     """Abstract base for AI agent backends."""
 
@@ -67,6 +75,15 @@ class Backend(ABC):
     ) -> AgentResult:
         """Resume an existing agent session. Default falls back to run_agent."""
         return self.run_agent(prompt, working_dir, display_callback, timeout, env)
+
+    def run_interactive(
+        self,
+        prompt: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+    ) -> InteractiveResult:
+        """Run an interactive terminal session. Default raises NotImplementedError."""
+        raise NotImplementedError(f"{self.name()} backend does not support interactive mode")
 
 
 class ClaudeBackend(Backend):
@@ -122,6 +139,35 @@ class ClaudeBackend(Backend):
         result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env)
         result.session_id = session_id
         return result
+
+    def run_interactive(
+        self,
+        prompt: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+    ) -> InteractiveResult:
+        session_id = str(uuid.uuid4())
+        cmd = [
+            "claude",
+            "--session-id",
+            session_id,
+            "--dangerously-skip-permissions",
+            "--verbose",
+            prompt,
+        ]
+        proc_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if env:
+            proc_env.update(env)
+
+        proc = subprocess.Popen(cmd, cwd=working_dir, env=proc_env)
+        self._active_procs.append(proc)
+        try:
+            proc.wait()
+        finally:
+            if proc in self._active_procs:
+                self._active_procs.remove(proc)
+
+        return InteractiveResult(session_id=session_id, exit_code=proc.returncode)
 
     def _run_claude_process(
         self,

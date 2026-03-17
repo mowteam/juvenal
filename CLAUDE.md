@@ -33,11 +33,11 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 |--------|---------|
 | `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups (flat or lane-based). `BounceCounter` for thread-safe global bounce tracking in lanes. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
 | `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. `apply_vars()` handles `{{VAR}}` template substitution. In directory convention, extra `.md` files in a phase dir become check phases and `.sh` files become script phases (with auto bounce_target). |
-| `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. |
+| `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. `run_interactive()` for terminal passthrough (Claude only). |
 | `state.py` | Atomic JSON state persistence (`PipelineState`). Thread-safe (RLock). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume, rewind, and scoped invalidation (for lane bounces). |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`) and script execution with timeouts. |
-| `display.py` | Rich TUI with rolling 15-line buffer. Thread-safe (Lock). Falls back to plain text with `--plain` or parallel mode. |
-| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`, `validate`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`, `-D VAR=VAL`, `--serialize`. `status` exits 0 if pipeline fully completed, 1 otherwise. |
+| `display.py` | Rich TUI with rolling 15-line buffer. Thread-safe (Lock). Falls back to plain text with `--plain` or parallel mode. `pause()`/`resume()` for interactive terminal passthrough. |
+| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`, `validate`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`, `-D VAR=VAL`, `--serialize`. `plan`/`do` support `--interactive`/`-i` for human-in-the-loop planning. `status` exits 0 if pipeline fully completed, 1 otherwise. |
 | `notifications.py` | Webhook notification support (`build_notification_payload`, `send_webhook`). |
 
 ### Execution Flow
@@ -51,7 +51,7 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 
 ### Phase Types
 
-- **implement** — agent executes a prompt to build/modify code
+- **implement** — agent executes a prompt to build/modify code. Supports `interactive: true` for terminal passthrough (Claude only, enabled with `--interactive`)
 - **check** — separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason`
 - **script** — shell command; exit 0 = pass, nonzero = fail (bounces back to phase's `bounce_target` or most recent implement phase)
 - **workflow** — sub-workflow: dynamic (LLM plans from `prompt`) or static (`workflow_file` / `workflow_dir`). Recursion depth capped by `max_depth`. Parent vars propagate to sub-workflows.

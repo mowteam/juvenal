@@ -182,6 +182,15 @@ class Display:
         if total_inp or total_out:
             print(f"  Total tokens: {total_inp} in, {total_out} out", flush=True)
 
+    def pause(self) -> None:
+        """Pause display for terminal passthrough (interactive mode)."""
+        with self._display_lock:
+            self._stop_live()
+
+    def resume(self) -> None:
+        """Resume display after interactive session (no-op; next step_start creates new Live)."""
+        pass
+
     def live_update(self, line: str) -> None:
         """Feed a line of output to the live display."""
         with self._display_lock:

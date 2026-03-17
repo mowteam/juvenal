@@ -1,51 +1,49 @@
 name: plan
 backend: claude
-max_bounces: 999
+max_bounces: 10
 
 phases:
   - id: plan-draft
     prompt_file: plan-phases/01-plan-draft.md
 
-  - id: requirements-review
+  - id: plan-smokecheck
     type: check
-    prompt_file: plan-phases/02-plan-review.md
+    bounce_target: plan-draft
+    prompt_file: plan-phases/02-plan-smokecheck.md
 
-  - id: technical-detail
-    prompt_file: plan-phases/03-technical-detail.md
+  - id: plan-refine
+    interactive: true
+    prompt_file: plan-phases/03-plan-refine.md
 
-  - id: technical-review
+  - id: plan-review
     type: check
-    prompt_file: plan-phases/04-technical-review.md
+    bounce_target: plan-refine
+    prompt_file: plan-phases/04-plan-review.md
 
-  - id: phase-split
-    prompt_file: plan-phases/05-phase-split.md
+  - id: plan-cleanup
+    prompt_file: plan-phases/05-plan-cleanup.md
 
-  - id: design-review
+  - id: plan-cleanup-review
     type: check
-    bounce_target: phase-split
-    prompt_file: plan-phases/06-design-review.md
+    bounce_target: plan-cleanup
+    prompt_file: plan-phases/06-plan-cleanup-review.md
 
-  - id: feasibility-review
+  - id: plan-split
+    prompt_file: plan-phases/07-plan-split.md
+
+  - id: plan-split-review
     type: check
-    bounce_target: phase-split
-    prompt_file: plan-phases/07-feasibility-review.md
-
-  - id: validation-design
-    prompt_file: plan-phases/08-validation-design.md
-
-  - id: validation-review
-    type: check
-    bounce_target: validation-design
-    prompt_file: plan-phases/09-validation-review.md
+    bounce_target: plan-split
+    prompt_file: plan-phases/08-plan-split-review.md
 
   - id: write-workflow
-    prompt_file: plan-phases/10-write-workflow.md
+    prompt_file: plan-phases/09-write-workflow.md
 
   - id: yaml-validate
     type: script
     run: "python -c \"import yaml, sys; d=yaml.safe_load(open('workflow.yaml')); assert isinstance(d,dict) and 'phases' in d, 'missing phases key'\""
 
-  - id: workflow-validation-review
+  - id: workflow-review
     type: check
     bounce_target: write-workflow
-    prompt_file: plan-phases/11-workflow-validation-review.md
+    prompt_file: plan-phases/10-workflow-review.md

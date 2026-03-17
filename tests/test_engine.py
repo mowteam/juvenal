@@ -2188,3 +2188,67 @@ class TestStaticWorkflowPhase:
         engine.run()
         captured = capsys.readouterr()
         assert "/path/to/sub.yaml" in captured.out
+
+
+class TestInteractiveMode:
+    def _make_engine(self, workflow, backend, tmp_path, **kwargs):
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), **kwargs)
+        engine.backend = backend
+        return engine
+
+    def test_interactive_implement_passes(self, tmp_path):
+        """Interactive implement phase calls run_interactive and succeeds."""
+        backend = MockBackend()
+        backend.add_interactive_response(exit_code=0, session_id="sess-1")
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="refine", type="implement", prompt="Refine the plan.", interactive=True),
+                Phase(id="review", type="check", prompt="Review.\nVERDICT: PASS or FAIL", bounce_target="refine"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
+        assert engine.run() == 0
+        assert len(backend.interactive_calls) == 1
+        assert "interactive mode" in backend.interactive_calls[0].lower()
+
+    def test_interactive_skipped_when_engine_not_interactive(self, tmp_path):
+        """Phase with interactive=True uses normal run_agent when engine interactive=False."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")  # normal implement
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="refine", type="implement", prompt="Refine.", interactive=True),
+                Phase(id="review", type="check", prompt="Review.\nVERDICT: PASS or FAIL", bounce_target="refine"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, interactive=False, plain=True)
+        assert engine.run() == 0
+        assert len(backend.interactive_calls) == 0
+        assert len(backend.calls) == 2  # normal run_agent for both
+
+    def test_interactive_crash_bounces(self, tmp_path):
+        """Interactive session with nonzero exit bounces back."""
+        backend = MockBackend()
+        backend.add_interactive_response(exit_code=1, session_id="sess-1")  # crash
+        backend.add_interactive_response(exit_code=0, session_id="sess-2")  # retry succeeds
+        backend.add_response(exit_code=0, output="VERDICT: PASS")  # checker
+
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="refine", type="implement", prompt="Refine.", interactive=True),
+                Phase(id="review", type="check", prompt="Review.\nVERDICT: PASS or FAIL", bounce_target="refine"),
+            ],
+            max_bounces=3,
+        )
+        engine = self._make_engine(workflow, backend, tmp_path, interactive=True, plain=True)
+        assert engine.run() == 0
+        assert len(backend.interactive_calls) == 2

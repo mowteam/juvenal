@@ -342,6 +342,31 @@ class TestStatusExitCodeSubprocess:
         )
         assert result.returncode == 1
 
+    def test_plan_interactive_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["plan", "build a web app", "--interactive"])
+        assert args.interactive is True
+
+    def test_plan_interactive_short_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["plan", "build a web app", "-i"])
+        assert args.interactive is True
+
+    def test_plan_no_interactive_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["plan", "build a web app"])
+        assert args.interactive is False
+
+    def test_do_interactive_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["do", "build a web app", "--interactive"])
+        assert args.interactive is True
+
+    def test_do_interactive_short_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["do", "build a web app", "-i"])
+        assert args.interactive is True
+
     def test_status_subprocess_exit_1_on_failure(self, tmp_path):
         """Failed pipeline exits 1 as a real process."""
         state_file = tmp_path / "state.json"

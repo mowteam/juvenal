@@ -43,6 +43,7 @@ class Phase:
     bounce_targets: list[str] = field(default_factory=list)  # agent-guided: checker picks from this list
     timeout: int | None = None  # timeout in seconds (None = no limit)
     env: dict[str, str] = field(default_factory=dict)  # environment variables for the phase
+    interactive: bool = False  # launch interactive TUI session (claude only)
     max_depth: int | None = None  # recursion depth limit for workflow phases
     workflow_file: str | None = None  # path to static sub-workflow YAML (resolved at load time)
     workflow_dir: str | None = None  # path to static sub-workflow directory (resolved at load time)
@@ -203,6 +204,7 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         "bounce_targets",
         "timeout",
         "env",
+        "interactive",
         "max_depth",
         "checks",
         "workflow_file",
@@ -246,6 +248,7 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
             bounce_targets=bounce_targets,
             timeout=phase_data.get("timeout"),
             env=phase_data.get("env", {}),
+            interactive=phase_data.get("interactive", False),
             max_depth=phase_data.get("max_depth"),
             workflow_file=wf_file,
             workflow_dir=wf_dir,
@@ -724,6 +727,7 @@ def inject_implementer(workflow: Workflow, role: str) -> Workflow:
                 bounce_targets=list(phase.bounce_targets),
                 timeout=phase.timeout,
                 env=dict(phase.env),
+                interactive=phase.interactive,
                 max_depth=phase.max_depth,
                 workflow_file=phase.workflow_file,
                 workflow_dir=phase.workflow_dir,
@@ -827,6 +831,7 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
                     bounce_targets=new_bounce_targets,
                     timeout=phase.timeout,
                     env=dict(phase.env),
+                    interactive=phase.interactive,
                     max_depth=phase.max_depth,
                     workflow_file=phase.workflow_file,
                     workflow_dir=phase.workflow_dir,
@@ -908,6 +913,10 @@ def validate_workflow(workflow: Workflow) -> list[str]:
             errors.append(f"Phase {phase.id!r}: workflow_file/workflow_dir only allowed on workflow phases")
         if phase.max_depth is not None and phase.max_depth < 1:
             errors.append(f"Phase {phase.id!r}: max_depth must be >= 1, got {phase.max_depth}")
+
+        # Interactive validation
+        if phase.interactive and phase.type != "implement":
+            errors.append(f"Phase {phase.id!r}: interactive is only valid on implement phases")
 
         # Role validation
         if phase.role and phase.role not in VALID_ROLES:
