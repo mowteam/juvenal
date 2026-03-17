@@ -1003,6 +1003,7 @@ def _plan_workflow_internal(
     max_depth: int = 3,
     interactive: bool = False,
     project_dir: str | None = None,
+    resume: bool = False,
 ) -> PlanResult:
     """Internal planning logic: generate a sub-workflow YAML from a goal.
 
@@ -1027,7 +1028,8 @@ def _plan_workflow_internal(
         plan_dir = Path(tmp_dir) / ".plan"
         plan_dir.mkdir()
 
-    (plan_dir / "goal.md").write_text(goal)
+    if not resume:
+        (plan_dir / "goal.md").write_text(goal)
 
     try:
         plan_yaml = Path(__file__).parent / "workflows" / "plan.yaml"
@@ -1038,6 +1040,7 @@ def _plan_workflow_internal(
 
         engine = Engine(
             workflow,
+            resume=resume,
             state_file=state_path,
             plain=plain,
             _depth=depth,
@@ -1100,13 +1103,23 @@ def _plan_workflow_internal(
 
 
 def plan_workflow(
-    goal: str, output_path: str, backend_name: str = "codex", plain: bool = False, interactive: bool = False
+    goal: str,
+    output_path: str,
+    backend_name: str = "codex",
+    plain: bool = False,
+    interactive: bool = False,
+    resume: bool = False,
 ) -> None:
     """Generate a workflow YAML from a goal description using a multi-phase pipeline."""
     import os
 
     result = _plan_workflow_internal(
-        goal=goal, backend_name=backend_name, plain=plain, interactive=interactive, project_dir=os.getcwd()
+        goal=goal,
+        backend_name=backend_name,
+        plain=plain,
+        interactive=interactive,
+        project_dir=os.getcwd(),
+        resume=resume,
     )
 
     if not result.success:

@@ -367,13 +367,23 @@ class TestStatusExitCodeSubprocess:
         args = parser.parse_args(["do", "build a web app", "-i"])
         assert args.interactive is True
 
+    def test_plan_resume_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["plan", "build a web app", "--resume"])
+        assert args.resume is True
+
+    def test_plan_no_resume_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["plan", "build a web app"])
+        assert args.resume is False
+
     def test_plan_interactive_preserves_backend(self, monkeypatch):
         """--interactive does not override the backend — only interactive phases use Claude."""
         import juvenal.engine
 
         called_with = {}
 
-        def mock_plan_workflow(goal, output, backend, plain=False, interactive=False):
+        def mock_plan_workflow(goal, output, backend, plain=False, interactive=False, resume=False):
             called_with["backend"] = backend
             called_with["interactive"] = interactive
 

@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument(
         "-i", "--interactive", action="store_true", help="Interactive mode: chat with the agent during plan refinement"
     )
+    plan_p.add_argument("--resume", action="store_true", help="Resume a previously interrupted plan")
 
     # do
     do_p = sub.add_parser("do", help="Plan + immediately run a workflow")
@@ -188,7 +189,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_plan(args: argparse.Namespace) -> int:
     from juvenal.engine import plan_workflow
 
-    plan_workflow(args.goal, args.output, args.backend, plain=args.plain, interactive=args.interactive)
+    plan_workflow(
+        args.goal, args.output, args.backend, plain=args.plain, interactive=args.interactive, resume=args.resume
+    )
     if args.implementer:
         _inject_implementer_into_yaml(args.output, args.implementer)
     if args.checker:
