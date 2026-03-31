@@ -3,24 +3,157 @@
 from __future__ import annotations
 
 import itertools
-import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError, meta, nodes
+from jinja2.runtime import missing
+from jinja2.sandbox import SandboxedEnvironment
 
-_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
+
+class _PassthroughUndefined(StrictUndefined):
+    """Preserve unresolved top-level variables but fail on nested lookups."""
+
+    def __str__(self) -> str:
+        if self._undefined_name is None:
+            return ""
+        if self._undefined_obj is missing:
+            return f"{{{{{self._undefined_name}}}}}"
+        return self._fail_with_undefined_error()
 
 
-def apply_vars(text: str, vars: dict[str, str]) -> str:
-    """Replace {{VAR}} placeholders with values from vars dict.
+_JINJA_ENV = SandboxedEnvironment(autoescape=False, keep_trailing_newline=True, undefined=_PassthroughUndefined)
+_JINJA_ENV.globals.clear()
 
-    Unrecognized variables pass through unchanged.
-    """
-    if not vars:
+
+def _find_template_vars(text: str) -> set[str]:
+    """Return undeclared variable names referenced by a Jinja2 template."""
+    if not text:
+        return set()
+    return set(meta.find_undeclared_variables(_JINJA_ENV.parse(text)))
+
+
+def _find_template_vars_safe(text: str) -> set[str]:
+    """Best-effort variable discovery for callers that validate syntax later."""
+    try:
+        return _find_template_vars(text)
+    except TemplateSyntaxError:
+        return set()
+
+
+def _vars_defined_when_true(test: nodes.Node, guaranteed_defined: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Variables guaranteed defined after ``test`` evaluates truthy."""
+    if isinstance(test, nodes.Test) and test.name == "defined" and isinstance(test.node, nodes.Name):
+        return guaranteed_defined | frozenset({test.node.name})
+    if isinstance(test, nodes.Not):
+        return _vars_defined_when_false(test.node, guaranteed_defined)
+    if isinstance(test, nodes.And):
+        left_true = _vars_defined_when_true(test.left, guaranteed_defined)
+        return _vars_defined_when_true(test.right, left_true)
+    if isinstance(test, nodes.Or):
+        left_true = _vars_defined_when_true(test.left, guaranteed_defined)
+        right_true = _vars_defined_when_true(test.right, _vars_defined_when_false(test.left, guaranteed_defined))
+        return left_true & right_true
+    return guaranteed_defined
+
+
+def _vars_defined_when_false(test: nodes.Node, guaranteed_defined: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Variables guaranteed defined after ``test`` evaluates falsy."""
+    if isinstance(test, nodes.Test) and test.name == "undefined" and isinstance(test.node, nodes.Name):
+        return guaranteed_defined | frozenset({test.node.name})
+    if isinstance(test, nodes.Not):
+        return _vars_defined_when_true(test.node, guaranteed_defined)
+    if isinstance(test, nodes.And):
+        left_false = _vars_defined_when_false(test.left, guaranteed_defined)
+        right_false = _vars_defined_when_false(test.right, _vars_defined_when_true(test.left, guaranteed_defined))
+        return left_false & right_false
+    if isinstance(test, nodes.Or):
+        left_false = _vars_defined_when_false(test.left, guaranteed_defined)
+        return _vars_defined_when_false(test.right, left_false)
+    return guaranteed_defined
+
+
+def _find_vars_requiring_values(ast: nodes.Template, missing_vars: set[str], *, allow_passthrough: bool) -> set[str]:
+    """Return missing vars that are used in a way that still requires a value."""
+
+    required: set[str] = set()
+
+    def _walk(
+        node: nodes.Node, parent: nodes.Node | None = None, guaranteed_defined: frozenset[str] = frozenset()
+    ) -> None:
+        if isinstance(node, nodes.Name) and node.ctx == "load" and node.name in missing_vars:
+            if node.name in guaranteed_defined:
+                return
+            if isinstance(parent, nodes.Test) and parent.node is node and parent.name in {"defined", "undefined"}:
+                return
+            if isinstance(parent, nodes.Filter) and parent.node is node and parent.name == "default":
+                return
+            if allow_passthrough and isinstance(parent, nodes.Output) and node in parent.nodes:
+                return
+            required.add(node.name)
+            return
+
+        if isinstance(node, nodes.If):
+            _walk(node.test, node, guaranteed_defined)
+            true_defined = _vars_defined_when_true(node.test, guaranteed_defined)
+            false_defined = _vars_defined_when_false(node.test, guaranteed_defined)
+            for child in node.body:
+                _walk(child, node, true_defined)
+            for elif_node in node.elif_:
+                _walk(elif_node.test, elif_node, false_defined)
+                elif_true_defined = _vars_defined_when_true(elif_node.test, false_defined)
+                for child in elif_node.body:
+                    _walk(child, elif_node, elif_true_defined)
+                false_defined = _vars_defined_when_false(elif_node.test, false_defined)
+            for child in node.else_:
+                _walk(child, node, false_defined)
+            return
+
+        if isinstance(node, nodes.CondExpr):
+            _walk(node.test, node, guaranteed_defined)
+            true_defined = _vars_defined_when_true(node.test, guaranteed_defined)
+            false_defined = _vars_defined_when_false(node.test, guaranteed_defined)
+            _walk(node.expr1, node, true_defined)
+            if node.expr2 is not None:
+                _walk(node.expr2, node, false_defined)
+            return
+
+        if isinstance(node, nodes.And):
+            _walk(node.left, node, guaranteed_defined)
+            _walk(node.right, node, _vars_defined_when_true(node.left, guaranteed_defined))
+            return
+
+        if isinstance(node, nodes.Or):
+            _walk(node.left, node, guaranteed_defined)
+            _walk(node.right, node, _vars_defined_when_false(node.left, guaranteed_defined))
+            return
+
+        for child in node.iter_child_nodes():
+            _walk(child, node, guaranteed_defined)
+
+    _walk(ast)
+    return required
+
+
+def apply_vars(text: str, vars: dict[str, str] | None) -> str:
+    """Render text with Jinja2 using vars as the template context."""
+    if not text:
         return text
-    return _VAR_RE.sub(lambda m: vars.get(m.group(1), m.group(0)), text)
+    context = vars or {}
+    ast = _JINJA_ENV.parse(text)
+    missing_vars = set(meta.find_undeclared_variables(ast)) - set(context.keys())
+    required_vars = _find_vars_requiring_values(ast, missing_vars, allow_passthrough=True)
+    if required_vars:
+        missing_list = ", ".join(sorted(required_vars))
+        raise UndefinedError(f"undefined template variables require values before rendering: {missing_list}")
+    return _JINJA_ENV.from_string(text).render(context)
+
+
+def _describe_template_render_error(phase_id: str, field_name: str, exc: Exception) -> str:
+    """Format a Jinja2 render failure for validation and dry-run output."""
+    return f"Jinja2 render error in {field_name} for phase '{phase_id}': {type(exc).__name__}: {exc}"
 
 
 @dataclass
@@ -47,12 +180,16 @@ class Phase:
     max_depth: int | None = None  # recursion depth limit for workflow phases
     workflow_file: str | None = None  # path to static sub-workflow YAML (resolved at load time)
     workflow_dir: str | None = None  # path to static sub-workflow directory (resolved at load time)
+    template_vars: dict[str, str] = field(default_factory=dict)  # per-phase Jinja2 variables from expansion
+
+    def _render_text(self, text: str, vars: dict[str, str] | None = None) -> str:
+        context = dict(vars or {})
+        context.update(self.template_vars)
+        return apply_vars(text, context)
 
     def render_prompt(self, failure_context: str = "", vars: dict[str, str] | None = None) -> str:
         """Render the implementation prompt, injecting failure context on retry."""
-        text = self.prompt
-        if vars:
-            text = apply_vars(text, vars)
+        text = self._render_text(self.prompt, vars)
         if failure_context:
             text += (
                 "\n\nIMPORTANT: A previous attempt failed verification.\n"
@@ -64,13 +201,16 @@ class Phase:
     def render_check_prompt(self, vars: dict[str, str] | None = None) -> str:
         """Render the checker prompt for check phases."""
         if self.prompt:
-            text = self.prompt
-            if vars:
-                text = apply_vars(text, vars)
-            return text
+            return self._render_text(self.prompt, vars)
         if self.role:
             return _load_role_prompt(self.role)
         return ""
+
+    def render_run(self, vars: dict[str, str] | None = None) -> str | None:
+        """Render the script command for script phases."""
+        if self.run is None:
+            return None
+        return self._render_text(self.run, vars)
 
 
 @dataclass
@@ -121,7 +261,7 @@ class Workflow:
     backoff: float = 0.0  # base backoff delay in seconds between bounces (0 = no backoff)
     max_backoff: float = 60.0  # maximum backoff delay cap in seconds
     notify: list[str] = field(default_factory=list)  # webhook URLs for completion/failure notifications
-    vars: dict[str, str] = field(default_factory=dict)  # template variables for {{VAR}} substitution
+    vars: dict[str, str] = field(default_factory=dict)  # Jinja2 template variables
 
 
 def load_workflow(path: str | Path) -> Workflow:
@@ -487,6 +627,7 @@ def _expand_checkers(
     base_path: Path | None = None,
     check_offset: int = 0,
     script_offset: int = 0,
+    template_vars: dict[str, str] | None = None,
 ) -> list[Phase]:
     """Expand inline checkers on an implement phase into synthetic check/script phases.
 
@@ -517,6 +658,7 @@ def _expand_checkers(
                     type="check",
                     role=entry,
                     bounce_target=parent_id,
+                    template_vars=dict(template_vars or {}),
                 )
             )
         elif isinstance(entry, dict):
@@ -533,6 +675,7 @@ def _expand_checkers(
                         bounce_target=parent_id,
                         timeout=timeout,
                         env=env,
+                        template_vars=dict(template_vars or {}),
                     )
                 )
             elif "role" in entry:
@@ -550,6 +693,7 @@ def _expand_checkers(
                         bounce_target=parent_id,
                         timeout=timeout,
                         env=env,
+                        template_vars=dict(template_vars or {}),
                     )
                 )
             elif "prompt" in entry or "prompt_file" in entry:
@@ -565,6 +709,7 @@ def _expand_checkers(
                         bounce_target=parent_id,
                         timeout=timeout,
                         env=env,
+                        template_vars=dict(template_vars or {}),
                     )
                 )
             else:
@@ -678,7 +823,13 @@ def inject_checkers(workflow: Workflow, checker_specs: list[str]) -> Workflow:
             i += 1
 
         # Expand CLI checkers with proper offsets
-        expanded = _expand_checkers(parent_id, parsed, check_offset=existing_checks, script_offset=existing_scripts)
+        expanded = _expand_checkers(
+            parent_id,
+            parsed,
+            check_offset=existing_checks,
+            script_offset=existing_scripts,
+            template_vars=phase.template_vars,
+        )
         new_phases.extend(expanded)
 
     return Workflow(
@@ -731,6 +882,7 @@ def inject_implementer(workflow: Workflow, role: str) -> Workflow:
                 max_depth=phase.max_depth,
                 workflow_file=phase.workflow_file,
                 workflow_dir=phase.workflow_dir,
+                template_vars=dict(phase.template_vars),
             )
         new_phases.append(phase)
 
@@ -794,7 +946,7 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
         all_text = parent.prompt + (parent.run or "")
         for child in group[1:]:
             all_text += child.prompt + (child.run or "")
-        used_vars = set(_VAR_RE.findall(all_text))
+        used_vars = _find_template_vars_safe(all_text)
         referenced = [k for k in multi_vars if k in used_vars]
 
         if not referenced:
@@ -820,12 +972,14 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
                 if new_bounce in group_old_ids:
                     new_bounce = f"{new_bounce}~{suffix}"
                 new_bounce_targets = [f"{bt}~{suffix}" if bt in group_old_ids else bt for bt in phase.bounce_targets]
+                new_template_vars = dict(phase.template_vars)
+                new_template_vars.update(combo_vars)
 
                 new_phase = Phase(
                     id=new_id,
                     type=phase.type,
-                    prompt=apply_vars(phase.prompt, combo_vars) if phase.prompt else "",
-                    run=apply_vars(phase.run, combo_vars) if phase.run else phase.run,
+                    prompt=phase.prompt,
+                    run=phase.run,
                     role=phase.role,
                     bounce_target=new_bounce,
                     bounce_targets=new_bounce_targets,
@@ -835,6 +989,7 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
                     max_depth=phase.max_depth,
                     workflow_file=phase.workflow_file,
                     workflow_dir=phase.workflow_dir,
+                    template_vars=new_template_vars,
                 )
                 new_phases.append(new_phase)
                 lane_ids.append(new_id)
@@ -973,13 +1128,41 @@ def validate_workflow(workflow: Workflow) -> list[str]:
         if not url.startswith(("http://", "https://")):
             errors.append(f"notify URL must start with http:// or https://, got {url!r}")
 
-    # Template variable validation: all {{VAR}} references must have values
-    defined_vars = set(workflow.vars.keys())
+    # Template validation: referenced Jinja2 variables must have values
     for phase in workflow.phases:
-        all_text = phase.prompt + (phase.run or "")
-        undefined = set(_VAR_RE.findall(all_text)) - defined_vars
+        defined_vars = set(workflow.vars.keys()) | set(phase.template_vars.keys())
+        undefined: set[str] = set()
+        phase_has_template_errors = False
+        for field_name, text in (("prompt", phase.prompt), ("run", phase.run or "")):
+            if not text:
+                continue
+            try:
+                ast = _JINJA_ENV.parse(text)
+            except TemplateSyntaxError as exc:
+                errors.append(f"Phase {phase.id!r}: invalid Jinja2 {field_name}: {exc.message} (line {exc.lineno})")
+                phase_has_template_errors = True
+                continue
+            missing_vars = set(meta.find_undeclared_variables(ast)) - defined_vars
+            undefined.update(_find_vars_requiring_values(ast, missing_vars, allow_passthrough=False))
         for var_name in sorted(undefined):
             errors.append(f"Phase {phase.id!r}: template variable {{{{{var_name}}}}} has no value defined")
+        if undefined or phase_has_template_errors:
+            continue
+
+        try:
+            if phase.type == "implement":
+                phase.render_prompt(vars=workflow.vars)
+            elif phase.type == "script":
+                phase.render_run(vars=workflow.vars)
+            elif phase.type == "check" and not phase.role:
+                phase.render_check_prompt(vars=workflow.vars)
+            elif phase.type == "workflow" and phase.prompt:
+                phase.render_prompt(vars=workflow.vars)
+        except Exception as exc:
+            field_name = "script command" if phase.type == "script" else "prompt"
+            if phase.type == "check":
+                field_name = "checker prompt"
+            errors.append(_describe_template_render_error(phase.id, field_name, exc))
 
     return errors
 

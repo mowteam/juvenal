@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from jinja2 import UndefinedError
 
 from juvenal.workflow import (
     ParallelGroup,
@@ -1001,6 +1002,29 @@ class TestTemplateVars:
     def test_apply_vars_basic(self):
         assert apply_vars("Hello {{NAME}}", {"NAME": "world"}) == "Hello world"
 
+    def test_apply_vars_does_not_expose_builtin_globals(self):
+        assert apply_vars("{{ cycler }}", {}) == "{{cycler}}"
+
+    def test_apply_vars_jinja_filter(self):
+        assert apply_vars("Hello {{ name|title }}", {"name": "juvenal"}) == "Hello Juvenal"
+
+    def test_apply_vars_rejects_filtered_undefined_var(self):
+        with pytest.raises(UndefinedError, match="app"):
+            apply_vars("Deploy {{ app|title }}.", {})
+
+    def test_apply_vars_allows_default_filter_for_undefined_var(self):
+        assert apply_vars('{{ missing|default("fallback") }}', {}) == "fallback"
+
+    def test_apply_vars_allows_defined_test_for_undefined_var(self):
+        assert apply_vars("{% if missing is defined %}value={{ missing }}{% endif %}", {}) == ""
+
+    def test_apply_vars_allows_short_circuit_defined_guard(self):
+        assert apply_vars("{% if missing is defined and missing.foo %}x{% endif %}", {}) == ""
+
+    def test_apply_vars_jinja_control_flow(self):
+        result = apply_vars("{% if LANG == 'Python' %}typed{% else %}other{% endif %}", {"LANG": "Python"})
+        assert result == "typed"
+
     def test_apply_vars_multiple(self):
         result = apply_vars("{{A}} and {{B}}", {"A": "foo", "B": "bar"})
         assert result == "foo and bar"
@@ -1184,6 +1208,14 @@ phases:
 
 
 class TestExpandMultiVars:
+    @staticmethod
+    def _render_prompt(phase: Phase, workflow: Workflow) -> str:
+        return phase.render_prompt(vars=workflow.vars)
+
+    @staticmethod
+    def _render_run(phase: Phase, workflow: Workflow) -> str | None:
+        return phase.render_run(vars=workflow.vars)
+
     def test_single_var_two_values(self):
         """Phase with {{TARGET}} and TARGET=[linux, windows] creates two parallel lanes."""
         wf = Workflow(
@@ -1193,9 +1225,9 @@ class TestExpandMultiVars:
         result = expand_multi_vars(wf, {"TARGET": ["linux", "windows"]})
         assert len(result.phases) == 2
         assert result.phases[0].id == "build~TARGET=linux"
-        assert result.phases[0].prompt == "Build for linux."
+        assert self._render_prompt(result.phases[0], result) == "Build for linux."
         assert result.phases[1].id == "build~TARGET=windows"
-        assert result.phases[1].prompt == "Build for windows."
+        assert self._render_prompt(result.phases[1], result) == "Build for windows."
         assert len(result.parallel_groups) == 1
         assert result.parallel_groups[0].lanes == [["build~TARGET=linux"], ["build~TARGET=windows"]]
 
@@ -1247,8 +1279,8 @@ class TestExpandMultiVars:
         )
         result = expand_multi_vars(wf, {"DIR": ["tests/a", "tests/b"]})
         scripts = [p for p in result.phases if p.type == "script"]
-        assert scripts[0].run == "pytest tests/a -x"
-        assert scripts[1].run == "pytest tests/b -x"
+        assert self._render_run(scripts[0], result) == "pytest tests/a -x"
+        assert self._render_run(scripts[1], result) == "pytest tests/b -x"
 
     def test_cartesian_product(self):
         """Multiple multi-value vars produce cartesian product."""
@@ -1258,8 +1290,46 @@ class TestExpandMultiVars:
         )
         result = expand_multi_vars(wf, {"A": ["x", "y"], "B": ["1", "2"]})
         assert len(result.phases) == 4
-        prompts = {p.prompt for p in result.phases}
+        prompts = {self._render_prompt(p, result) for p in result.phases}
         assert prompts == {"Build x on 1.", "Build x on 2.", "Build y on 1.", "Build y on 2."}
+
+    def test_jinja_expression_references_multi_var(self):
+        """Jinja2 expressions still participate in multi-value expansion."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build {{ TARGET|upper }}.")],
+        )
+        result = expand_multi_vars(wf, {"TARGET": ["linux", "windows"]})
+        assert [self._render_prompt(phase, result) for phase in result.phases] == ["Build LINUX.", "Build WINDOWS."]
+
+    def test_multi_var_expansion_uses_workflow_vars(self):
+        """Single-value workflow vars still render correctly during expansion."""
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(
+                    id="deploy",
+                    type="implement",
+                    prompt="Deploy {{ APP|upper }} to {{ ENV }}.{% if APP == 'svc' %} ready{% endif %}",
+                )
+            ],
+            vars={"APP": "svc"},
+        )
+        result = expand_multi_vars(wf, {"ENV": ["staging", "prod"]})
+        assert [self._render_prompt(phase, result) for phase in result.phases] == [
+            "Deploy SVC to staging. ready",
+            "Deploy SVC to prod. ready",
+        ]
+
+    def test_unresolved_filtered_vars_preserved_during_expansion(self):
+        """Unresolved Jinja vars keep their original expression text after expansion."""
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="deploy", type="implement", prompt="Deploy {{ app|title }} to {{ ENV }}.")],
+        )
+        result = expand_multi_vars(wf, {"ENV": ["prod"]})
+        assert result.phases[0].prompt == "Deploy {{ app|title }} to {{ ENV }}."
+        assert result.phases[0].template_vars == {"ENV": "prod"}
 
     def test_empty_multi_vars_is_noop(self):
         """Empty multi_vars returns workflow unchanged."""

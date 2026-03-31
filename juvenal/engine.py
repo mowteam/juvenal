@@ -11,12 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+from jinja2 import TemplateSyntaxError
+
 from juvenal.backends import Backend, create_backend
 from juvenal.checkers import NO_VERDICT_REASON, parse_verdict, run_script
 from juvenal.display import Display
 from juvenal.notifications import build_notification_payload, send_webhook
 from juvenal.state import PhaseState, PipelineState
-from juvenal.workflow import ParallelGroup, Phase, Workflow, apply_vars
+from juvenal.workflow import ParallelGroup, Phase, Workflow
 
 
 @dataclass
@@ -137,6 +139,12 @@ class Engine:
         """Execute the pipeline. Returns 0 on success, 1 on failure."""
         if self.dry_run:
             return self._dry_run()
+
+        errors = self._collect_validation_errors()
+        if errors:
+            self._print_validation_errors(errors)
+            self.display.pipeline_done(False)
+            return 1
 
         self.state.started_at = time.time()
         phases = self.workflow.phases
@@ -272,7 +280,10 @@ class Engine:
                 env=phase.env or None,
             )
         else:
-            prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+            try:
+                prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+            except Exception as exc:
+                return self._template_render_failure(phase.id, "prompt", "implement", exc)
             result = self.backend.run_agent(
                 prompt,
                 working_dir=self.workflow.working_dir,
@@ -316,7 +327,10 @@ class Engine:
 
     def _run_interactive_loop(self, phase: Phase, attempt: int, failure_context: str) -> PhaseResult:
         """Run an agent-driven Q&A loop. Agent asks questions, user answers, agent updates plan."""
-        prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+        try:
+            prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+        except Exception as exc:
+            return self._template_render_failure(phase.id, "prompt", "interactive", exc)
         prompt = self._INTERACTIVE_PREAMBLE + prompt
 
         self.display.step_start("interactive")
@@ -388,16 +402,19 @@ class Engine:
         self.display.step_start(f"script: {phase.id}")
 
         timeout = phase.timeout or 600
-        run_cmd = apply_vars(phase.run, self.workflow.vars) if self.workflow.vars else phase.run
+        try:
+            run_cmd = phase.render_run(vars=self.workflow.vars)
+        except Exception as exc:
+            return self._template_render_failure(phase.id, "script command", phase.id, exc)
         result = run_script(run_cmd, self.workflow.working_dir, timeout=timeout, env=phase.env or None)
-        self.state.log_step(phase.id, attempt, "script", result.output, input=phase.run)
+        self.state.log_step(phase.id, attempt, "script", result.output, input=run_cmd)
 
         if result.exit_code == 0:
             self.display.step_pass(phase.id)
             return PhaseResult(success=True)
 
         # Failure — resolve bounce target
-        failure_context = f"Script '{phase.run}' failed (exit {result.exit_code}).\nOutput:\n{result.output[-3000:]}"
+        failure_context = f"Script '{run_cmd}' failed (exit {result.exit_code}).\nOutput:\n{result.output[-3000:]}"
         self.display.step_fail(phase.id, failure_context[:500])
 
         target_id = self._resolve_bounce_target(phase, phases, phase_idx)
@@ -421,13 +438,17 @@ class Engine:
         self.display.phase_start(phase.id, attempt)
         self.display.step_start(f"check: {phase.id}")
 
-        prompt = phase.render_check_prompt(vars=self.workflow.vars)
+        try:
+            prompt = phase.render_check_prompt(vars=self.workflow.vars)
+        except Exception as exc:
+            return self._template_render_failure(phase.id, "checker prompt", phase.id, exc)
 
         # Inject the parent implement phase's directions so the checker knows what to verify
-        parent_prompt = self._get_parent_prompt(phase, phases, phase_idx)
+        try:
+            parent_prompt = self._get_parent_prompt(phase, phases, phase_idx)
+        except Exception as exc:
+            return self._template_render_failure(phase.id, "parent implement prompt", phase.id, exc)
         if parent_prompt:
-            if self.workflow.vars:
-                parent_prompt = apply_vars(parent_prompt, self.workflow.vars)
             prompt = (
                 f"You are a CHECKER. You must NOT write any code or implement anything. "
                 f"Another agent has already attempted the task below. "
@@ -585,7 +606,10 @@ class Engine:
 
         # Step 1: Plan the sub-workflow
         self.display.step_start(f"workflow-plan: {phase.id}")
-        prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+        try:
+            prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
+        except Exception as exc:
+            return self._template_render_failure(phase.id, "prompt", f"workflow-plan: {phase.id}", exc)
         plan_result = _plan_workflow_internal(
             goal=prompt,
             backend_instance=self.backend,
@@ -640,6 +664,19 @@ class Engine:
         if plan_result.temp_dir:
             shutil.rmtree(plan_result.temp_dir, ignore_errors=True)
         return PhaseResult(success=True)
+
+    @staticmethod
+    def _describe_template_render_error(phase_id: str, field_name: str, exc: Exception) -> str:
+        """Format a Jinja2 rendering failure for user-facing output."""
+        if isinstance(exc, TemplateSyntaxError):
+            return f"Invalid Jinja2 {field_name} in phase '{phase_id}': {exc.message} (line {exc.lineno})"
+        return f"Jinja2 render error in {field_name} for phase '{phase_id}': {type(exc).__name__}: {exc}"
+
+    def _template_render_failure(self, phase_id: str, field_name: str, step_name: str, exc: Exception) -> PhaseResult:
+        """Convert a Jinja2 render failure into a clean phase failure."""
+        failure_context = self._describe_template_render_error(phase_id, field_name, exc)
+        self.display.step_fail(step_name, failure_context[:500])
+        return PhaseResult(success=False)
 
     def _resolve_bounce_target(
         self, phase: Phase, phases: list[Phase], phase_idx: int, agent_target: str | None = None
@@ -872,7 +909,7 @@ class Engine:
         if target_id:
             for p in phases:
                 if p.id == target_id and p.type == "implement":
-                    return p.prompt or None
+                    return p.render_prompt(vars=self.workflow.vars) or None
         return None
 
     def _get_baseline_sha(self, phase: Phase, phases: list[Phase], phase_idx: int) -> str | None:
@@ -917,10 +954,21 @@ class Engine:
             if not ok:
                 self.display.notify_failed(url)
 
-    def _dry_run(self) -> int:
-        """Print what would be done without executing."""
+    def _collect_validation_errors(self) -> list[str]:
+        """Validate the workflow."""
         from juvenal.workflow import validate_workflow
 
+        return validate_workflow(self.workflow)
+
+    @staticmethod
+    def _print_validation_errors(errors: list[str]) -> None:
+        """Print validation errors in the standard CLI format."""
+        print(f"Validation: {len(errors)} error(s)")
+        for err in errors:
+            print(f"  - {err}")
+
+    def _dry_run(self) -> int:
+        """Print what would be done without executing."""
         print(f"Workflow: {self.workflow.name}")
         print(f"Backend: {self.workflow.backend}")
         print(f"Working dir: {self.workflow.working_dir}")
@@ -934,12 +982,10 @@ class Engine:
         print()
 
         # Validation
-        errors = validate_workflow(self.workflow)
+        errors = self._collect_validation_errors()
         has_errors = bool(errors)
         if errors:
-            print(f"Validation: {len(errors)} error(s)")
-            for err in errors:
-                print(f"  - {err}")
+            self._print_validation_errors(errors)
         else:
             print(f"Validation: OK ({len(self.workflow.phases)} phases)")
         print()
@@ -970,13 +1016,19 @@ class Engine:
                 extras.append(f"max_depth={phase.max_depth}")
             extra_str = f" [{', '.join(extras)}]" if extras else ""
             if phase.type == "implement":
-                prompt_preview = phase.prompt[:80].replace("\n", " ")
+                prompt_preview = phase.prompt if has_errors else phase.render_prompt(vars=self.workflow.vars)
+                prompt_preview = prompt_preview[:80].replace("\n", " ")
                 print(f"{prefix} [{phase.type}] {phase.id}{extra_str}")
                 print(f"     prompt: {prompt_preview}...")
             elif phase.type == "script":
-                print(f"{prefix} [{phase.type}] {phase.id}: {phase.run}{extra_str}")
+                run_preview = phase.run if has_errors else phase.render_run(vars=self.workflow.vars)
+                print(f"{prefix} [{phase.type}] {phase.id}: {run_preview}{extra_str}")
             elif phase.type == "check":
-                target = phase.role or phase.prompt[:60].replace("\n", " ")
+                if phase.role:
+                    target = phase.role
+                else:
+                    check_preview = phase.prompt if has_errors else phase.render_check_prompt(vars=self.workflow.vars)
+                    target = check_preview[:60].replace("\n", " ")
                 print(f"{prefix} [{phase.type}] {phase.id}: {target}{extra_str}")
             elif phase.type == "workflow":
                 print(f"{prefix} [{phase.type}] {phase.id}{extra_str}")
@@ -985,7 +1037,8 @@ class Engine:
                 elif phase.workflow_dir:
                     print(f"     workflow_dir: {phase.workflow_dir}")
                 else:
-                    prompt_preview = phase.prompt[:80].replace("\n", " ")
+                    prompt_preview = phase.prompt if has_errors else phase.render_prompt(vars=self.workflow.vars)
+                    prompt_preview = prompt_preview[:80].replace("\n", " ")
                     print(f"     prompt: {prompt_preview}...")
             print()
 

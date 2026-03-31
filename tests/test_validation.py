@@ -7,7 +7,7 @@ import argparse
 import pytest
 
 from juvenal.cli import build_parser, cmd_validate
-from juvenal.workflow import ParallelGroup, Phase, Workflow, validate_workflow
+from juvenal.workflow import ParallelGroup, Phase, Workflow, expand_multi_vars, validate_workflow
 
 
 class TestValidateWorkflow:
@@ -352,6 +352,14 @@ class TestTemplateVarValidation:
         errors = validate_workflow(wf)
         assert any("PROJECT" in e and "no value defined" in e for e in errors)
 
+    def test_undefined_var_in_jinja_control_block(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{% if PROJECT %}Build it.{% endif %}")],
+        )
+        errors = validate_workflow(wf)
+        assert any("PROJECT" in e and "no value defined" in e for e in errors)
+
     def test_undefined_var_in_run(self):
         wf = Workflow(
             name="test",
@@ -408,6 +416,72 @@ class TestTemplateVarValidation:
         errors = validate_workflow(wf)
         undefined = [e for e in errors if "no value defined" in e]
         assert len(undefined) == 1
+
+    def test_invalid_jinja_syntax_in_prompt(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ PROJECT")],
+        )
+        errors = validate_workflow(wf)
+        assert any("invalid Jinja2 prompt" in e for e in errors)
+
+    def test_builtin_jinja_globals_are_not_treated_as_defined(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ cycler }}")],
+        )
+        errors = validate_workflow(wf)
+        assert any("{{cycler}}" in e and "no value defined" in e for e in errors)
+
+    def test_default_filter_allows_undefined_var(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt='{{ missing|default("fallback") }}')],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_defined_test_allows_guarded_undefined_var(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{% if missing is defined %}{{ missing }}{% endif %}")],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_short_circuit_defined_guard_allows_nested_access(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="{% if missing is defined and missing.foo %}x{% endif %}")
+            ],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_elif_branch_missing_var_is_still_validated(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{% if ok %}A{% elif missing %}B{% endif %}")],
+            vars={"ok": False},
+        )
+        errors = validate_workflow(wf)
+        assert any("{{missing}}" in e and "no value defined" in e for e in errors)
+
+    def test_validate_workflow_reports_render_error(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ 1 / 0 }}")],
+        )
+        errors = validate_workflow(wf)
+        assert any("Jinja2 render error in prompt for phase 'build'" in e for e in errors)
+
+    def test_expand_multi_vars_preserves_filtered_var_name_for_validation(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="deploy", type="implement", prompt="Deploy {{ app|title }} to {{ ENV }}.")],
+            vars={"App": "svc"},
+        )
+        expanded = expand_multi_vars(wf, {"ENV": ["prod"]})
+        errors = validate_workflow(expanded)
+        assert any("{{app}}" in e and "no value defined" in e for e in errors)
 
 
 class TestLaneValidation:
@@ -572,6 +646,66 @@ phases:
         assert result == 1
         captured = capsys.readouterr()
         assert "error" in captured.out
+
+    def test_validate_invalid_jinja_syntax_clean_error(self, tmp_path, capsys):
+        """Invalid Jinja syntax prints a clean validation error, no traceback."""
+        yaml_content = """\
+name: bad
+phases:
+  - id: build
+    prompt: "{{ PROJECT"
+"""
+        yaml_path = tmp_path / "bad-jinja.yaml"
+        yaml_path.write_text(yaml_content)
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(yaml_path)])
+        args.plain = True
+        result = cmd_validate(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "invalid Jinja2 prompt" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_validate_jinja_render_error_clean_error(self, tmp_path, capsys):
+        """Render-time Jinja errors print a clean validation error, no traceback."""
+        yaml_content = """\
+name: bad
+phases:
+  - id: build
+    prompt: "{{ 1 / 0 }}"
+"""
+        yaml_path = tmp_path / "bad-jinja-runtime.yaml"
+        yaml_path.write_text(yaml_content)
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(yaml_path)])
+        args.plain = True
+        result = cmd_validate(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Jinja2 render error in prompt for phase 'build'" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_validate_nested_lookup_missing_clean_error(self, tmp_path, capsys):
+        """Missing nested lookups print a clean validation error, no traceback."""
+        yaml_content = """\
+name: bad
+vars:
+  config: {}
+phases:
+  - id: build
+    prompt: "{{ config.env }}"
+"""
+        yaml_path = tmp_path / "bad-jinja-nested.yaml"
+        yaml_path.write_text(yaml_content)
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(yaml_path)])
+        args.plain = True
+        result = cmd_validate(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Jinja2 render error in prompt for phase 'build'" in captured.out
+        assert "env" in captured.out
+        assert "Traceback" not in captured.out
 
     def test_validate_missing_id_clean_error(self, tmp_path, capsys):
         """Missing phase ID prints a clean error, no stack trace."""

@@ -7,7 +7,7 @@ import pytest
 
 from juvenal.checkers import parse_verdict
 from juvenal.engine import BounceCounter, Engine, _extract_yaml, _plan_workflow_internal
-from juvenal.workflow import ParallelGroup, Phase, Workflow, inject_checkers, inject_implementer
+from juvenal.workflow import ParallelGroup, Phase, Workflow, expand_multi_vars, inject_checkers, inject_implementer
 from tests.conftest import MockBackend
 
 
@@ -617,6 +617,30 @@ class TestPreserveContextOnBounce:
         assert len(backend.resume_calls) == 1
         assert backend.resume_calls[0][0] == "sess-1"
 
+    def test_multi_var_script_bounce_uses_rendered_command_in_failure_context(self, tmp_path):
+        """Expanded script phases should report the rendered command on bounce."""
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="built it", session_id="sess-1")  # implement attempt 1
+        backend.add_response(exit_code=0, output="fixed it", session_id="sess-2")  # implement attempt 2 (resumed)
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build {{TARGET}}."),
+                Phase(id="build~script-1", type="script", run="pytest {{TARGET}} -x", bounce_target="build"),
+            ],
+            max_bounces=2,
+        )
+        workflow = expand_multi_vars(workflow, {"TARGET": ["linux"]})
+        engine = self._make_engine(workflow, backend, tmp_path)
+        with patch("juvenal.engine.run_script") as mock_run:
+            mock_run.return_value = type("R", (), {"exit_code": 1, "output": "boom"})()
+            assert engine.run() == 1
+
+        assert len(backend.resume_calls) == 2
+        assert backend.resume_calls[0][0] == "sess-1"
+        assert all("pytest linux -x" in prompt for _, prompt in backend.resume_calls)
+        assert all("{{TARGET}}" not in prompt for _, prompt in backend.resume_calls)
+
     def test_crash_bounce_to_self_uses_resume(self, tmp_path):
         """Implement crash bouncing to self resumes the session."""
         backend = MockBackend()
@@ -821,6 +845,18 @@ class TestWorkflowPhase:
         assert "dynamic" in captured.out
         assert "max_depth=2" in captured.out
         assert "Build a REST API" in captured.out
+
+    def test_dynamic_workflow_prompt_is_rendered_in_dry_run(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="dynamic", type="workflow", prompt="Plan {{ PROJECT }}.", max_depth=2)],
+            vars={"PROJECT": "svc"},
+        )
+        engine = self._make_engine(workflow, MockBackend(), tmp_path, dry_run=True)
+        assert engine.run() == 0
+        captured = capsys.readouterr()
+        assert "Plan svc." in captured.out
+        assert "Plan {{ PROJECT }}" not in captured.out
 
     def test_dynamic_workflow_inherits_backend_and_execution_flags(self, tmp_path):
         from juvenal.engine import PlanResult
@@ -1931,9 +1967,34 @@ class TestTemplateVarsEngine:
             mock_run.assert_called_once()
             assert mock_run.call_args[0][0] == "pytest tests/unit -x"
 
-    def test_vars_unrecognized_passthrough(self, mock_backend, tmp_path):
-        """Unrecognized {{VAR}} placeholders pass through unchanged."""
+    def test_default_filter_allows_undefined_var_at_runtime(self, mock_backend, tmp_path):
+        """Valid Jinja2 undefined handling should not be blocked by validation."""
         mock_backend.add_response(exit_code=0, output="done")
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt='Use {{ missing|default("fallback") }}.')],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = mock_backend
+        assert engine.run() == 0
+        assert mock_backend.calls == ["Use fallback."]
+
+    def test_short_circuit_defined_guard_allows_runtime(self, mock_backend, tmp_path):
+        """Short-circuit Jinja guards should validate and render cleanly."""
+        mock_backend.add_response(exit_code=0, output="done")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="{% if missing is defined and missing.foo %}x{% endif %}")
+            ],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = mock_backend
+        assert engine.run() == 0
+        assert mock_backend.calls == [""]
+
+    def test_vars_unrecognized_passthrough_fails_validation(self, mock_backend, tmp_path, capsys):
+        """Undefined template vars fail validation before execution."""
         workflow = Workflow(
             name="test",
             phases=[Phase(id="build", type="implement", prompt="Use {{KNOWN}} and {{UNKNOWN}}.")],
@@ -1941,8 +2002,11 @@ class TestTemplateVarsEngine:
         )
         engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
         engine.backend = mock_backend
-        engine.run()
-        assert "Use value and {{UNKNOWN}}." in mock_backend.calls[0]
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "{{UNKNOWN}}" in captured.out
+        assert "no value defined" in captured.out
+        assert mock_backend.calls == []
 
     def test_vars_in_dry_run(self, mock_backend, tmp_path, capsys):
         """Dry run shows variables."""
@@ -1956,6 +2020,132 @@ class TestTemplateVarsEngine:
         captured = capsys.readouterr()
         assert "APP" in captured.out
         assert "myservice" in captured.out
+
+
+class TestInvalidJinjaRuntime:
+    def test_invalid_jinja_in_implement_phase_fails_cleanly(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ PROJECT")],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = MockBackend()
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "invalid Jinja2 prompt" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_invalid_jinja_in_script_phase_fails_cleanly(self, tmp_path, capsys):
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="test", type="script", run="echo {{ PROJECT", bounce_target="build"),
+            ],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "invalid Jinja2 run" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_invalid_jinja_in_dynamic_workflow_phase_fails_cleanly(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub", type="workflow", prompt="{{ PROJECT")],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = MockBackend()
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "invalid Jinja2 prompt" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_render_error_in_implement_phase_fails_cleanly(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ 1 / 0 }}")],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = MockBackend()
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "Jinja2 render error in prompt for phase 'build'" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_render_error_in_script_phase_fails_cleanly(self, tmp_path, capsys):
+        backend = MockBackend()
+        backend.add_response(exit_code=0, output="done")
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build it."),
+                Phase(id="test", type="script", run="echo {{ 1 / 0 }}", bounce_target="build"),
+            ],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "Jinja2 render error in script command for phase 'test'" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_render_error_in_dynamic_workflow_phase_fails_cleanly(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="sub", type="workflow", prompt="{{ 1 / 0 }}")],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = MockBackend()
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "Jinja2 render error in prompt for phase 'sub'" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_nested_lookup_missing_in_implement_phase_fails_cleanly(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ config.env }}")],
+            vars={"config": {}},
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = MockBackend()
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "Jinja2 render error in prompt for phase 'build'" in captured.out
+        assert "env" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_builtin_jinja_globals_are_not_available_at_runtime(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="{{ cycler.__init__.__globals__ }}")],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = MockBackend()
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "{{cycler}}" in captured.out
+        assert "no value defined" in captured.out
+        assert "Traceback" not in captured.out
+
+    def test_invalid_filtered_undefined_var_fails_before_execution(self, tmp_path, capsys):
+        backend = MockBackend()
+        workflow = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Deploy {{ app|title }}.")],
+            vars={"App": "svc"},
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        engine.backend = backend
+        assert engine.run() == 1
+        captured = capsys.readouterr()
+        assert "{{app}}" in captured.out
+        assert "no value defined" in captured.out
+        assert backend.calls == []
 
 
 class TestSerialize:
