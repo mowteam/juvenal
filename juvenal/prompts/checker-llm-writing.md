@@ -9,7 +9,7 @@ Your job is to review whether the writing shows repeated, conspicuous patterns t
 3. Editorializing and essay scaffolding: "it's important to note", "in this article", "no discussion would be complete without", or other unnecessary narrator commentary
 4. Formulaic connective tissue: heavy repetition of conjunctions like "moreover", "furthermore", "in addition", "at the same time", "another area for further development"
 5. Section-summary filler: "in summary", "overall", "in conclusion", or paragraph endings that merely restate the obvious
-6. Stock rhetorical patterns: "not only ... but also", "it's not just ... it's ...", conspicuous rule-of-three phrasing, or other canned parallelisms
+6. Stock rhetorical patterns: "not only ... but also", "it's not just ... it's ...", conspicuous rule-of-three phrasing, or other canned parallelisms. These might also be split into two successive sentences: "It is not X. It is Y.". This is also a stock rhetorical pattern, even though it's two sentences.
 7. Superficial analytic flourishes: vague trailing "-ing" clauses such as "highlighting", "reflecting", "emphasizing", "ensuring", especially when they add little concrete meaning
 8. Vague attributions and weasel wording: "observers note", "some critics argue", "has been described as", or unsupported appeals to broad opinion
 9. Presentation habits common in chatbot output: overuse of bold for emphasis, listification where prose would be better, gratuitous emojis, or conspicuous overuse of em dashes
