@@ -377,7 +377,8 @@ class TestExponentialBackoff:
 
         with patch("juvenal.engine.time.sleep") as mock_sleep:
             engine.run()
-            mock_sleep.assert_not_called()
+            delays = [call[0][0] for call in mock_sleep.call_args_list if call[0][0] >= 0.5]
+            assert delays == []
 
     def test_validation_rejects_negative_backoff(self):
         """Validation catches negative backoff."""

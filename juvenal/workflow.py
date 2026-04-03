@@ -900,6 +900,7 @@ VALID_PHASE_TYPES = {"implement", "check", "workflow"}
 VALID_ROLES = {
     "tester",
     "architect",
+    "always-fail",
     "pm",
     "senior-tester",
     "senior-engineer",

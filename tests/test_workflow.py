@@ -696,6 +696,9 @@ class TestParseCheckerString:
     def test_role_security_engineer(self):
         assert parse_checker_string("security-engineer") == "security-engineer"
 
+    def test_role_always_fail(self):
+        assert parse_checker_string("always-fail") == "always-fail"
+
     def test_role_technical_writer(self):
         assert parse_checker_string("technical-writer") == "technical-writer"
 
@@ -771,6 +774,18 @@ class TestInjectCheckers:
         assert result.phases[1].id == "build~check-1"
         assert result.phases[1].type == "check"
         assert result.phases[1].role == "security-engineer"
+        assert result.phases[1].bounce_target == "build"
+
+    def test_single_implement_always_fail_checker(self):
+        wf = Workflow(
+            name="test",
+            phases=[Phase(id="build", type="implement", prompt="Build it.")],
+        )
+        result = inject_checkers(wf, ["always-fail"])
+        assert len(result.phases) == 2
+        assert result.phases[1].id == "build~check-1"
+        assert result.phases[1].type == "check"
+        assert result.phases[1].role == "always-fail"
         assert result.phases[1].bounce_target == "build"
 
     def test_single_implement_professor_checker(self):
@@ -1506,6 +1521,14 @@ class TestLoadRolePrompt:
         assert "Technical Writer REVIEWING" in prompt
         assert "Technical correctness" in prompt
         assert "Framing and flow" in prompt
+
+    def test_always_fail_role(self):
+        from juvenal.workflow import _load_role_prompt
+
+        prompt = _load_role_prompt("always-fail")
+        assert "Always Fail Checker" in prompt
+        assert "VERDICT: FAIL: keep going" in prompt
+        assert "nothing else" in prompt
 
     def test_llm_writing_role(self):
         from juvenal.workflow import _load_role_prompt
