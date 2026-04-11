@@ -48,6 +48,7 @@ _FRONTIER_STATUSES = (
     "exhausted",
 )
 _PRESERVED_TARGET_STATUSES = frozenset({"no_findings", "blocked", "exhausted"})
+_WRAP_BLOCKED_TARGET_STATUSES = frozenset({"queued", "deferred", "requeue_pending"})
 _UNION_ORIGINS = {Union, types.UnionType}
 
 
@@ -284,8 +285,7 @@ class DynamicSessionState:
                 else:
                     target.status = "queued"
 
-            # Resume behavior for persisted /stop and /wrap is runner-owned. State normalization
-            # intentionally preserves those flags while rewriting interrupted in-flight records.
+            self._apply_resume_control_rewrite_locked(now)
             self.save()
 
     def append_event(self, event_type: str, **payload: Any) -> int:
@@ -395,6 +395,20 @@ class DynamicSessionState:
             self.captain.last_delivered_event_seq = max(self.captain.last_delivered_event_seq, delivered_event_seq)
             self.save()
 
+    def resume_control_action(self) -> tuple[str, str]:
+        """Return the deterministic resume action implied by persisted /stop and /wrap flags."""
+
+        with self._lock:
+            if self.control.stop_requested:
+                return ("stop", "analysis stopped by user")
+            if not self.control.wrap_requested:
+                return ("continue", "")
+            if self._has_active_resume_work_locked():
+                return ("drain", "")
+            if self.control.wrap_summary_pending:
+                return ("summarize", "")
+            return ("finish", "")
+
     def store_worker_artifact(self, artifact: WorkerClaimArtifact) -> None:
         """Persist one worker claim artifact in the audit store."""
 
@@ -409,6 +423,17 @@ class DynamicSessionState:
             for claim in self.claims.values()
             if claim.target_id == target.target_id and claim.generation == active_generation
         ]
+
+    def _apply_resume_control_rewrite_locked(self, now: float) -> None:
+        if not (self.control.stop_requested or self.control.wrap_requested):
+            return
+
+        for target in self.targets.values():
+            if target.status not in _WRAP_BLOCKED_TARGET_STATUSES:
+                continue
+            target.status = "deferred"
+            target.deferred_until_turn = None
+            target.updated_at = now
 
     def _append_event_locked(self, event_type: str, **payload: Any) -> DynamicEvent:
         seq = max((event.seq for event in self.events), default=0) + 1
@@ -437,6 +462,20 @@ class DynamicSessionState:
             return False
         attempt = self.worker_attempts.get(target.active_attempt_id)
         return attempt is not None and attempt.status in _ACTIVE_ATTEMPT_STATUSES
+
+    def _has_active_resume_work_locked(self) -> bool:
+        if any(self._has_active_attempt(target) for target in self.targets.values()):
+            return True
+
+        for verification in self.verifications.values():
+            if verification.status != "pending":
+                continue
+            target = self.targets.get(verification.target_id)
+            if target is None:
+                continue
+            if target.active_generation == verification.generation:
+                return True
+        return False
 
     def _latest_terminal_verification(
         self,

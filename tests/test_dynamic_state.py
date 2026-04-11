@@ -256,6 +256,29 @@ def test_resume_normalization_rewrites_running_verifications_to_pending(tmp_path
     assert loaded.claims["claim-1"].status == "verifying"
 
 
+def test_stop_requested_resume_holds_new_work_and_requests_immediate_stop(tmp_path):
+    state = DynamicSessionState(state_file=tmp_path / "dynamic-state.json")
+    state.control.stop_requested = True
+    state.targets["queued-target"] = make_target(target_id="queued-target", status="queued")
+    state.targets["retry-target"] = make_target(target_id="retry-target", status="requeue_pending")
+    state.targets["verifying-target"] = make_target(target_id="verifying-target", status="verifying")
+    state.verifications["verify-1"] = make_verification(
+        verification_id="verify-1",
+        target_id="verifying-target",
+        claim_id="claim-1",
+        status="pending",
+    )
+
+    state.normalize_for_resume()
+
+    assert state.targets["queued-target"].status == "deferred"
+    assert state.targets["queued-target"].deferred_until_turn is None
+    assert state.targets["retry-target"].status == "deferred"
+    assert state.targets["retry-target"].deferred_until_turn is None
+    assert state.targets["verifying-target"].status == "verifying"
+    assert state.resume_control_action() == ("stop", "analysis stopped by user")
+
+
 def test_normalize_rebuilds_pending_verification_ids_from_active_generation(tmp_path):
     state = DynamicSessionState(state_file=tmp_path / "dynamic-state.json")
     state.targets["target-1"] = make_target(
@@ -296,6 +319,47 @@ def test_normalize_rebuilds_pending_verification_ids_from_active_generation(tmp_
 
     assert state.targets["target-1"].pending_verification_ids == ["verify-active"]
     assert state.targets["target-1"].status == "verifying"
+
+
+def test_wrap_requested_resume_drains_pending_verifications_but_holds_new_targets(tmp_path):
+    state = DynamicSessionState(state_file=tmp_path / "dynamic-state.json")
+    state.control.wrap_requested = True
+    state.control.wrap_summary_pending = True
+    state.targets["queued-target"] = make_target(target_id="queued-target", status="queued")
+    state.targets["verifying-target"] = make_target(target_id="verifying-target", status="verifying")
+    state.claims["claim-1"] = make_claim(claim_id="claim-1", target_id="verifying-target", status="verifying")
+    state.verifications["verify-1"] = make_verification(
+        verification_id="verify-1",
+        target_id="verifying-target",
+        claim_id="claim-1",
+        status="running",
+        session_id="verify-session",
+        started_at=111.0,
+    )
+
+    state.normalize_for_resume()
+
+    assert state.targets["queued-target"].status == "deferred"
+    assert state.targets["queued-target"].deferred_until_turn is None
+    assert state.verifications["verify-1"].status == "pending"
+    assert state.targets["verifying-target"].pending_verification_ids == ["verify-1"]
+    assert state.resume_control_action() == ("drain", "")
+
+
+def test_wrap_requested_resume_requests_summary_then_finish_after_summary(tmp_path):
+    state = DynamicSessionState(state_file=tmp_path / "dynamic-state.json")
+    state.control.wrap_requested = True
+    state.control.wrap_summary_pending = True
+    state.targets["queued-target"] = make_target(target_id="queued-target", status="queued", deferred_until_turn=3)
+
+    state.normalize_for_resume()
+
+    assert state.targets["queued-target"].status == "deferred"
+    assert state.targets["queued-target"].deferred_until_turn is None
+    assert state.resume_control_action() == ("summarize", "")
+
+    state.control.wrap_summary_pending = False
+    assert state.resume_control_action() == ("finish", "")
 
 
 def test_pending_captain_delta_redelivers_unread_events_only(tmp_path):
