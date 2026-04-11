@@ -20,7 +20,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     # run
-    run_p = sub.add_parser("run", help="Execute a workflow")
+    run_p = sub.add_parser(
+        "run",
+        help="Execute a workflow, including type: analysis phases",
+        description=(
+            "Execute a workflow. `type: analysis` phases run Juvenal's dynamic captain/worker/verifier analysis engine."
+        ),
+    )
     run_p.add_argument("workflow", nargs="?", help="Path to workflow YAML, directory, or bare .md file")
     run_p.add_argument("--resume", action="store_true", help="Resume from last saved state")
     run_p.add_argument("--rewind", type=int, metavar="N", help="Rewind N phases back from the resume point")
@@ -64,7 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-D", action="append", default=[], metavar="VAR=VAL", dest="defines", help="Set template variable"
     )
     run_p.add_argument(
-        "-i", "--interactive", action="store_true", help="Interactive mode: chat with the agent during phased planning"
+        "-i",
+        "--interactive",
+        action="store_true",
+        help=("Enable phased-planning chat, implement interactive phases, and analysis review-point interaction"),
     )
     run_p.add_argument("--serialize", action="store_true", help="Disable all parallelization")
 
@@ -125,7 +134,14 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--template", default="default", help="Template to use (default: default)")
 
     # validate (same flags as run, but always dry-run)
-    validate_p = sub.add_parser("validate", help="Validate a workflow and show execution plan")
+    validate_p = sub.add_parser(
+        "validate",
+        help="Validate a workflow and show execution plan, including analysis config",
+        description=(
+            "Validate a workflow and print the execution plan. `type: analysis` phases include their "
+            "nested analysis config in the output."
+        ),
+    )
     validate_p.add_argument("workflow", help="Path to workflow YAML, directory, or bare .md file")
     validate_p.add_argument("--max-bounces", type=int, default=999)
     validate_p.add_argument("--backend", choices=["claude", "codex"], default="codex")

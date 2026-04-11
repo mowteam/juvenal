@@ -200,6 +200,7 @@ juvenal run task.md  # single implement phase from a .md file
 | `implement` | Agent executes a prompt to build/modify code (default) |
 | `check` | Separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason` |
 | `workflow` | Dynamic sub-workflow: plans and executes a sub-pipeline from the prompt |
+| `analysis` | Dynamic captain/worker/verifier analysis for discovery-driven repository investigation |
 
 ### Workflow Phases
 
@@ -211,6 +212,93 @@ A `workflow` phase dynamically generates and executes a sub-pipeline. Useful for
   prompt: "Build a REST API with authentication and tests."
   max_depth: 2  # recursion depth limit (default: 3)
 ```
+
+### Analysis Phases
+
+An `analysis` phase runs a deterministic dynamic-analysis loop inside the normal workflow engine.
+A long-lived captain agent maintains the frontier, fresh workers investigate bounded targets, and
+fresh verifiers independently accept or reject each claim before it feeds back into the next
+captain turn.
+
+From the outer workflow's perspective, it is still one normal phase. The dynamic child state is
+persisted next to the main state file as `.juvenal-state-<phase-id>-analysis.json`, so later phases
+can inspect the verified findings or audit trail if they need to summarize results.
+
+```yaml
+- id: analyze-repo
+  type: analysis
+  prompt: "Analyze the repository for concrete security defects."
+  analysis:
+    captain_backend: claude
+    worker_backend: codex
+    verifier_backend: claude
+    max_workers: 4
+    max_verifiers: 8
+    interaction_timeout: 3.0
+    max_worker_retries: 2
+    max_captain_repairs: 2
+    allow_repo_tools: true
+```
+
+`analysis` config fields:
+
+| Field | Default | Meaning |
+|------|---------|---------|
+| `captain_backend` | `claude` | Backend for the long-lived captain session that discovers and reprioritizes targets |
+| `worker_backend` | `codex` | Backend for fresh worker attempts on bounded targets |
+| `verifier_backend` | `claude` | Backend for fresh independent claim verification attempts |
+| `max_workers` | `4` | Maximum concurrent worker attempts |
+| `max_verifiers` | `8` | Maximum concurrent verifier attempts |
+| `interaction_timeout` | `3.0` | Review window in seconds when `juvenal run --interactive` is enabled |
+| `max_worker_retries` | `2` | Retry budget per target after rejected claims or interrupted work |
+| `max_captain_repairs` | `2` | Repair attempts when the captain emits malformed structured output |
+| `allow_repo_tools` | `true` | Allow repo-local inspection, build, test, and static-analysis commands |
+
+In v1, `analysis` phases may not appear inside `parallel_groups`.
+
+### Analysis Review Points
+
+Run analysis workflows with `--interactive` to open short review windows between scheduling turns:
+
+```bash
+juvenal run juvenal/workflows/analysis-example.yaml --interactive
+```
+
+Each input line is persisted as a directive. Supported commands:
+
+- `/focus TEXT` adds advisory focus for the next captain turn.
+- `/ignore path:<repo-relative-prefix>` prevents future scheduling for targets under that path prefix.
+- `/ignore symbol:<exact-symbol>` prevents future scheduling for targets scoped to that symbol.
+- `/target TEXT` injects a high-priority user target immediately.
+- `/ask TEXT` queues a direct question for the captain to answer on the next turn.
+- `/summary` asks the captain for a concise status summary on the next turn.
+- `/stop` stops scheduling new work immediately, kills active work, and fails the phase.
+- `/wrap` stops new discovery, drains in-flight work, then asks the captain for one final summary turn before the phase completes.
+
+### Analysis Example Workflow
+
+The repository includes [`juvenal/workflows/analysis-example.yaml`](juvenal/workflows/analysis-example.yaml),
+which runs one `analysis` phase and then an implement phase that converts the child-state JSON into
+`analysis-findings.md`.
+
+```bash
+juvenal validate juvenal/workflows/analysis-example.yaml
+juvenal run juvenal/workflows/analysis-example.yaml --interactive
+```
+
+### Analysis Resume Behavior
+
+`--resume` resumes both the outer workflow state and the per-phase analysis child state file. If an
+analysis phase was interrupted mid-run, Juvenal normalizes in-flight workers and verifiers back into
+deterministic schedulable states before continuing.
+
+`--rewind` and `--rewind-to` reset the child state when execution lands on or before an `analysis`
+phase. A bounce back to an analysis phase resumes the child state by default so the captain keeps
+its frontier, but `--clear-context-on-bounce` resets that child state instead.
+
+Persisted `/stop` and `/wrap` directives survive restart. After a restart, `/stop` ends the phase
+immediately, while `/wrap` continues draining outstanding work and, if needed, runs the final
+captain summary turn.
 
 ## Inline Checkers
 
@@ -357,7 +445,7 @@ Juvenal tracks input and output token usage per phase. Token counts are shown in
 
 ```
 juvenal run <workflow> [--resume] [--rewind N] [--rewind-to PHASE_ID] [--phase X]
-                       [--max-bounces N] [--backend claude|codex] [--dry-run]
+                       [--max-bounces N] [--backend claude|codex]
                        [--backoff SECONDS] [--notify URL] [--working-dir DIR]
                        [--state-file PATH] [--checker SPEC] [--implementer ROLE]
                        [--phased-implementer SPEC] [--clear-context-on-bounce]
@@ -378,11 +466,10 @@ juvenal validate <workflow>
 | `--rewind N` | Rewind N phases back from the resume point |
 | `--rewind-to ID` | Rewind to a specific phase by ID |
 | `--phase ID` | Start from a specific phase |
-| `--dry-run` | Print execution plan without running |
 | `--checker SPEC` | Inject checker on every implement phase (`tester`, `tester:"extra instructions"`, or `prompt:"TEXT"`). Repeatable. |
 | `--implementer ROLE` | Prepend implementer role prompt to every implement phase |
 | `--phased-implementer SPEC` | On `run`, first plan a complex goal into linear implement phases, then execute them with your CLI-injected checker stack. Accepts either `GOAL` or `ROLE:"GOAL"`. |
-| `-i`, `--interactive` | For `run --phased-implementer`, `plan`, and `do`, allow the planner/refinement phase to ask the user one question at a time before execution continues. |
+| `-i`, `--interactive` | Enable planner/refinement interaction, implement interactive phases, and analysis review-point directives. |
 | `--clear-context-on-bounce` | Start fresh agent session on bounce (default: resume session) |
 | `-D VAR=VAL` | Set a Jinja2 template variable. Repeatable. |
 | `--backoff SECONDS` | Exponential backoff base delay between bounces |
@@ -403,6 +490,10 @@ juvenal run workflow.yaml --rewind-to setup
 ```
 
 `--rewind` and `--rewind-to` implicitly load existing state (no need for `--resume`) and invalidate from the target phase onward so everything from that point gets re-executed.
+
+For `analysis` phases, Juvenal also persists `.juvenal-state-<phase-id>-analysis.json`. `--resume`
+reuses that child state, rewinding resets it, and bouncing back to the phase resumes it unless you
+pass `--clear-context-on-bounce`.
 
 ### Checker Injection
 

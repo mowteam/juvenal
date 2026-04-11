@@ -1,0 +1,31 @@
+name: analysis-example
+backend: codex
+
+phases:
+  - id: analyze-repo
+    type: analysis
+    prompt: |
+      Analyze this repository for concrete security defects.
+      Prioritize externally reachable attack surfaces, unsafe file handling, auth/authz gaps,
+      injection risks, and missing validation on untrusted input.
+      Produce bounded targets, investigate them directly, and only advance claims that can be verified.
+    analysis:
+      captain_backend: claude      # Long-lived captain that discovers and reprioritizes analysis targets.
+      worker_backend: codex        # Fresh backend used for each bounded analysis task.
+      verifier_backend: claude     # Independent verifier backend that checks each proposed claim.
+      max_workers: 4               # Maximum concurrent worker attempts.
+      max_verifiers: 8             # Maximum concurrent verification attempts.
+      interaction_timeout: 3.0     # Review window in seconds when `juvenal run --interactive` is enabled.
+      max_worker_retries: 2        # Retries per target after rejected claims or interrupted worker progress.
+      max_captain_repairs: 2       # Captain repair attempts for malformed structured captain output.
+      allow_repo_tools: true       # Allow repo-local inspection/build/test/static-analysis commands.
+
+  - id: summarize-findings
+    prompt: |
+      Read `.juvenal-state-analyze-repo-analysis.json` and write `analysis-findings.md`.
+      Summarize:
+      - verified findings with severity and primary code locations
+      - rejected claims and why they were rejected
+      - blocked, exhausted, or no-findings targets
+      - open questions and recommended next investigation steps
+      If the run has no verified findings, say that clearly.

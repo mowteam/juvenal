@@ -14,6 +14,7 @@ from juvenal.workflow import (
     Phase,
     Workflow,
     expand_multi_vars,
+    load_workflow,
     make_command_check_prompt,
     validate_workflow,
 )
@@ -245,12 +246,20 @@ class TestValidateWorkflow:
         captured = capsys.readouterr()
         assert "[analysis] analyze" in captured.out
         assert "Analyze repo." in captured.out
-        assert "captain=claude" in captured.out
-        assert "worker=codex" in captured.out
-        assert "verifier=claude" in captured.out
-        assert "max_workers=6" in captured.out
-        assert "max_verifiers=9" in captured.out
-        assert "interaction_timeout=1.5s" in captured.out
+        assert "analysis:" in captured.out
+        assert "captain_backend: claude" in captured.out
+        assert "worker_backend: codex" in captured.out
+        assert "verifier_backend: claude" in captured.out
+        assert "max_workers: 6" in captured.out
+        assert "max_verifiers: 9" in captured.out
+        assert "interaction_timeout: 1.5s" in captured.out
+
+    def test_analysis_example_workflow_is_valid(self):
+        workflow = load_workflow("juvenal/workflows/analysis-example.yaml")
+
+        assert workflow.phases[0].type == "analysis"
+        assert workflow.phases[1].type == "implement"
+        assert validate_workflow(workflow) == []
 
 
 class TestTimeoutField:
@@ -726,6 +735,34 @@ class TestValidateCLI:
         captured = capsys.readouterr()
         assert "Execution plan:" in captured.out
         assert "Phase summary:" in captured.out
+
+    def test_validate_surfaces_analysis_config(self, tmp_path, capsys):
+        yaml_content = """\
+name: analysis-docs
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze {{TARGET}} for security findings."
+    analysis:
+      max_workers: 2
+      max_verifiers: 3
+      interaction_timeout: 1.5
+"""
+        yaml_path = tmp_path / "analysis.yaml"
+        yaml_path.write_text(yaml_content)
+        parser = build_parser()
+        args = parser.parse_args(["validate", str(yaml_path), "-D", "TARGET=src/"])
+        args.plain = True
+
+        assert cmd_validate(args) == 0
+        captured = capsys.readouterr()
+        assert "[analysis] analyze" in captured.out
+        assert "captain_backend: claude" in captured.out
+        assert "worker_backend: codex" in captured.out
+        assert "verifier_backend: claude" in captured.out
+        assert "max_workers: 2" in captured.out
+        assert "max_verifiers: 3" in captured.out
+        assert "interaction_timeout: 1.5s" in captured.out
 
     def test_validate_undefined_template_var(self, tmp_path, capsys):
         yaml_content = """\

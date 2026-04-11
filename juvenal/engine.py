@@ -1072,16 +1072,19 @@ class Engine:
                 prompt_preview = prompt_preview[:80].replace("\n", " ")
                 print(f"{prefix} [{phase.type}] {phase.id}{extra_str}")
                 print(f"     prompt: {prompt_preview}...")
+                print("     analysis:")
+                print(f"       captain_backend: {config.captain_backend}")
+                print(f"       worker_backend: {config.worker_backend}")
+                print(f"       verifier_backend: {config.verifier_backend}")
+                print(f"       max_workers: {config.max_workers}")
+                print(f"       max_verifiers: {config.max_verifiers}")
                 print(
-                    "     analysis: "
-                    f"captain={config.captain_backend}, worker={config.worker_backend}, "
-                    f"verifier={config.verifier_backend}, max_workers={config.max_workers}, "
-                    f"max_verifiers={config.max_verifiers}, "
-                    f"interaction_timeout={config.interaction_timeout}s, "
-                    f"max_worker_retries={config.max_worker_retries}, "
-                    f"max_captain_repairs={config.max_captain_repairs}, "
-                    f"allow_repo_tools={config.allow_repo_tools}"
+                    "       interaction_timeout: "
+                    f"{config.interaction_timeout}s (review window when --interactive is enabled)"
                 )
+                print(f"       max_worker_retries: {config.max_worker_retries}")
+                print(f"       max_captain_repairs: {config.max_captain_repairs}")
+                print(f"       allow_repo_tools: {str(config.allow_repo_tools).lower()}")
             print()
 
         if self.workflow.parallel_groups:
