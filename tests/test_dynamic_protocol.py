@@ -74,7 +74,8 @@ CAPTAIN_JSON_BEGIN
     }
   ],
   "defer_target_ids": ["target-2"],
-  "termination": {"state": "continue", "reason": "More entry points remain."}
+  "termination_state": "continue",
+  "termination_reason": "More entry points remain."
 }
 CAPTAIN_JSON_END
 """
@@ -87,6 +88,25 @@ CAPTAIN_JSON_END
         assert turn.defer_target_ids == ["target-2"]
         assert turn.termination_state == "continue"
         assert turn.termination_reason == "More entry points remain."
+
+    def test_legacy_nested_termination_still_parses(self):
+        output = """
+CAPTAIN_JSON_BEGIN
+{
+  "message_to_user": "",
+  "acknowledged_directive_ids": [],
+  "mental_model_summary": "Parser work remains localized.",
+  "open_questions": [],
+  "enqueue_targets": [],
+  "defer_target_ids": [],
+  "termination": {"state": "complete", "reason": "No in-scope work remains."}
+}
+CAPTAIN_JSON_END
+"""
+        turn = parse_captain_output(output)
+
+        assert turn.termination_state == "complete"
+        assert turn.termination_reason == "No in-scope work remains."
 
     def test_malformed_captain_json_raises(self):
         output = "CAPTAIN_JSON_BEGIN\n{not-json}\nCAPTAIN_JSON_END"

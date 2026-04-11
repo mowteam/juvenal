@@ -27,12 +27,12 @@ User directives:
 - Directives can include focus shifts, ignore requests, seeded targets, questions, summary requests, stop or wrap requests, or free-form notes.
 - Acknowledge only the directive IDs you actually incorporated in this turn by listing them in `acknowledged_directive_ids`.
 - If a directive asks a question, answer it concisely in `message_to_user`.
-- If a directive changes scope or focus, reflect that in `enqueue_targets`, `defer_target_ids`, or `termination`.
+- If a directive changes scope or focus, reflect that in `enqueue_targets`, `defer_target_ids`, `termination_state`, or `termination_reason`.
 
 Completion:
-- Set `termination.state` to `"complete"` only when the current scope is exhausted, the remaining work is not worth more bounded targets, a wrap-style summary turn has been requested, or the termination policy says discovery should stop.
+- Set `termination_state` to `"complete"` only when the current scope is exhausted, the remaining work is not worth more bounded targets, a wrap-style summary turn has been requested, or the termination policy says discovery should stop.
 - Do not mark completion just because one target finished.
-- If any concrete, high-value next target remains inside scope, return `"state": "continue"`.
+- If any concrete, high-value next target remains inside scope, return `termination_state: "continue"`.
 
 Return exactly one machine-readable block using these markers:
 
@@ -64,10 +64,8 @@ Required JSON shape:
     }
   ],
   "defer_target_ids": ["string"],
-  "termination": {
-    "state": "continue",
-    "reason": "string"
-  }
+  "termination_state": "continue",
+  "termination_reason": "string"
 }
 ```
 
@@ -78,8 +76,8 @@ Field requirements:
 - `open_questions`: unresolved questions worth tracking across turns.
 - `enqueue_targets`: new targets to schedule now. Each target must be bounded and in scope.
 - `defer_target_ids`: target IDs that should stay known but be pushed back for now. No duplicates.
-- `termination.state`: exactly `"continue"` or `"complete"`.
-- `termination.reason`: brief explanation for the chosen state.
+- `termination_state`: exactly `"continue"` or `"complete"`.
+- `termination_reason`: brief explanation for the chosen state.
 
 Target requirements:
 - `target_id` must be stable and unique within this turn.
@@ -125,10 +123,8 @@ CAPTAIN_JSON_BEGIN
     }
   ],
   "defer_target_ids": ["target-log-subsystem-survey"],
-  "termination": {
-    "state": "continue",
-    "reason": "The highest-risk parser boundary is still unresolved and there are two bounded follow-up targets with clear value."
-  }
+  "termination_state": "continue",
+  "termination_reason": "The highest-risk parser boundary is still unresolved and there are two bounded follow-up targets with clear value."
 }
 CAPTAIN_JSON_END
 ```

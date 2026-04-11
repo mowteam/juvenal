@@ -194,7 +194,13 @@ def parse_captain_output(output: str) -> CaptainTurn:
     defer_target_ids = _require_string_list(payload.get("defer_target_ids"), "CAPTAIN_JSON.defer_target_ids")
     _validate_unique(defer_target_ids, "CAPTAIN_JSON.defer_target_ids")
     mental_model = payload.get("mental_model_summary", payload.get("mental_model"))
-    termination = _require_mapping(payload.get("termination"), "CAPTAIN_JSON.termination")
+    if "termination_state" in payload or "termination_reason" in payload:
+        termination_state = payload.get("termination_state")
+        termination_reason = payload.get("termination_reason")
+    else:
+        termination = _require_mapping(payload.get("termination"), "CAPTAIN_JSON.termination")
+        termination_state = termination.get("state")
+        termination_reason = termination.get("reason")
     return CaptainTurn(
         message_to_user=_require_string(payload.get("message_to_user"), "CAPTAIN_JSON.message_to_user"),
         acknowledged_directive_ids=acknowledged_directive_ids,
@@ -203,11 +209,11 @@ def parse_captain_output(output: str) -> CaptainTurn:
         enqueue_targets=enqueue_targets,
         defer_target_ids=defer_target_ids,
         termination_state=_require_literal(
-            termination.get("state"),
-            "CAPTAIN_JSON.termination.state",
+            termination_state,
+            "CAPTAIN_JSON.termination_state",
             ("continue", "complete"),
         ),
-        termination_reason=_require_string(termination.get("reason"), "CAPTAIN_JSON.termination.reason"),
+        termination_reason=_require_string(termination_reason, "CAPTAIN_JSON.termination_reason"),
     )
 
 
