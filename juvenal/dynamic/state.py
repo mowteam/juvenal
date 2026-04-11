@@ -25,7 +25,7 @@ from juvenal.dynamic.models import (
     WorkerClaimArtifact,
 )
 
-_ACTIVE_ATTEMPT_STATUSES = frozenset({"queued", "running"})
+_ACTIVE_ATTEMPT_STATUSES = frozenset({"running"})
 _CAPTAIN_EVENT_TYPES = frozenset(
     {
         "claim.verified",

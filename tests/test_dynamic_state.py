@@ -346,6 +346,26 @@ def test_wrap_requested_resume_drains_pending_verifications_but_holds_new_target
     assert state.resume_control_action() == ("drain", "")
 
 
+def test_wrap_requested_resume_does_not_drain_persisted_queued_worker_attempts(tmp_path):
+    state = DynamicSessionState(state_file=tmp_path / "dynamic-state.json")
+    state.control.wrap_requested = True
+    state.control.wrap_summary_pending = True
+    state.worker_attempts["attempt-1"] = make_attempt(
+        attempt_id="attempt-1",
+        target_id="target-1",
+        status="queued",
+        started_at=None,
+        session_id=None,
+    )
+    state.targets["target-1"] = make_target(status="running", active_attempt_id="attempt-1")
+
+    state.normalize_for_resume()
+
+    assert state.targets["target-1"].status == "deferred"
+    assert state.targets["target-1"].active_attempt_id is None
+    assert state.resume_control_action() == ("summarize", "")
+
+
 def test_wrap_requested_resume_requests_summary_then_finish_after_summary(tmp_path):
     state = DynamicSessionState(state_file=tmp_path / "dynamic-state.json")
     state.control.wrap_requested = True
