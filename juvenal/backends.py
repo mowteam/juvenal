@@ -10,6 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
 
 
 @dataclass
@@ -38,16 +39,37 @@ class Backend(ABC):
 
     def __init__(self):
         self._active_procs: list[subprocess.Popen] = []
+        self._proc_lock = Lock()
+
+    def _register_proc(self, proc: subprocess.Popen) -> None:
+        """Record a subprocess in the active registry."""
+        with self._proc_lock:
+            self._active_procs.append(proc)
+
+    def _unregister_proc(self, proc: subprocess.Popen) -> None:
+        """Remove a subprocess from the active registry if still present."""
+        with self._proc_lock:
+            try:
+                self._active_procs.remove(proc)
+            except ValueError:
+                pass
 
     def kill_active(self) -> None:
         """Kill all active agent subprocesses."""
-        for proc in self._active_procs:
-            try:
-                proc.kill()
-                proc.wait()
-            except (ProcessLookupError, OSError):
-                pass
-        self._active_procs.clear()
+        while True:
+            with self._proc_lock:
+                procs = list(self._active_procs)
+                self._active_procs.clear()
+
+            if not procs:
+                return
+
+            for proc in procs:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except (ProcessLookupError, OSError):
+                    pass
 
     @abstractmethod
     def name(self) -> str: ...
@@ -172,12 +194,11 @@ class ClaudeBackend(Backend):
             pass
 
         proc = subprocess.Popen(cmd, cwd=working_dir, env=proc_env)
-        self._active_procs.append(proc)
+        self._register_proc(proc)
         try:
             proc.wait()
         finally:
-            if proc in self._active_procs:
-                self._active_procs.remove(proc)
+            self._unregister_proc(proc)
             # Restore terminal state so Ctrl-C and normal input work again
             if saved_termios is not None:
                 try:
@@ -216,7 +237,7 @@ class ClaudeBackend(Backend):
             bufsize=1,
             env=proc_env,
         )
-        self._active_procs.append(proc)
+        self._register_proc(proc)
 
         transcript_lines: list[str] = []
         assistant_messages: list[str] = []
@@ -263,8 +284,7 @@ class ClaudeBackend(Backend):
         stderr_output = proc.stderr.read()
         returncode = proc.wait()
         duration = time.time() - start
-        if proc in self._active_procs:
-            self._active_procs.remove(proc)
+        self._unregister_proc(proc)
 
         if stderr_output:
             transcript_lines.append(f"[stderr] {stderr_output}")
@@ -356,7 +376,7 @@ class CodexBackend(Backend):
             bufsize=1,
             env=proc_env,
         )
-        self._active_procs.append(proc)
+        self._register_proc(proc)
 
         if stdin_input:
             proc.stdin.write(stdin_input)
@@ -410,8 +430,7 @@ class CodexBackend(Backend):
 
         returncode = proc.wait()
         duration = time.time() - start
-        if proc in self._active_procs:
-            self._active_procs.remove(proc)
+        self._unregister_proc(proc)
 
         output = "\n".join(assistant_messages)
         if returncode != 0 and not output:

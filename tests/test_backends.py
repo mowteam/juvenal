@@ -1,8 +1,11 @@
 """Unit tests for backend helper functions and factory."""
 
+import threading
+
 import pytest
 
 from juvenal.backends import (
+    Backend,
     ClaudeBackend,
     CodexBackend,
     InteractiveResult,
@@ -13,6 +16,33 @@ from juvenal.backends import (
     _process_codex_event,
     create_backend,
 )
+
+
+class DummyBackend(Backend):
+    def name(self) -> str:
+        return "dummy"
+
+    def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None):
+        raise NotImplementedError
+
+
+class FakeProc:
+    def __init__(self, on_kill=None, on_wait=None):
+        self.on_kill = on_kill
+        self.on_wait = on_wait
+        self.kill_calls = 0
+        self.wait_calls = 0
+
+    def kill(self):
+        self.kill_calls += 1
+        if self.on_kill:
+            self.on_kill()
+
+    def wait(self):
+        self.wait_calls += 1
+        if self.on_wait:
+            self.on_wait()
+        return 0
 
 
 class TestCreateBackend:
@@ -187,4 +217,58 @@ class TestKillActive:
     def test_kill_active_empty(self):
         backend = ClaudeBackend()
         backend.kill_active()  # should not raise
+        assert backend._active_procs == []
+
+    def test_register_unregister_concurrent(self):
+        backend = DummyBackend()
+        thread_count = 8
+        register_barrier = threading.Barrier(thread_count + 1)
+        unregister_barrier = threading.Barrier(thread_count + 1)
+        done_barrier = threading.Barrier(thread_count + 1)
+        errors = []
+
+        def worker(index):
+            proc = FakeProc()
+            try:
+                backend._register_proc(proc)
+                register_barrier.wait()
+                unregister_barrier.wait()
+                backend._unregister_proc(proc)
+                done_barrier.wait()
+            except Exception as exc:  # pragma: no cover - failure path only
+                errors.append((index, exc))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(thread_count)]
+        for thread in threads:
+            thread.start()
+
+        register_barrier.wait()
+        with backend._proc_lock:
+            assert len(backend._active_procs) == thread_count
+
+        unregister_barrier.wait()
+        done_barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert backend._active_procs == []
+
+    def test_kill_active_safe_when_registry_changes_during_iteration(self):
+        backend = DummyBackend()
+        late_proc = FakeProc()
+        first_proc = FakeProc(on_kill=lambda: backend._register_proc(late_proc))
+        second_proc = FakeProc(on_wait=lambda: backend._unregister_proc(first_proc))
+
+        backend._register_proc(first_proc)
+        backend._register_proc(second_proc)
+
+        backend.kill_active()
+
+        assert first_proc.kill_calls == 1
+        assert first_proc.wait_calls == 1
+        assert second_proc.kill_calls == 1
+        assert second_proc.wait_calls == 1
+        assert late_proc.kill_calls == 1
+        assert late_proc.wait_calls == 1
         assert backend._active_procs == []
