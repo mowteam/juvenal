@@ -16,13 +16,14 @@ def _captain_output(
     *,
     enqueue_targets: list[dict] | None = None,
     defer_target_ids: list[str] | None = None,
+    acknowledged_directive_ids: list[str] | None = None,
     termination_state: str = "continue",
     termination_reason: str = "more work remains",
     message_to_user: str = "",
 ) -> str:
     payload = {
         "message_to_user": message_to_user,
-        "acknowledged_directive_ids": [],
+        "acknowledged_directive_ids": acknowledged_directive_ids or [],
         "mental_model_summary": "Current analysis model.",
         "open_questions": [],
         "enqueue_targets": enqueue_targets or [],
@@ -33,14 +34,20 @@ def _captain_output(
     return f"CAPTAIN_JSON_BEGIN\n{json.dumps(payload, indent=2)}\nCAPTAIN_JSON_END"
 
 
-def _target(target_id: str, *, priority: int = 90) -> dict:
+def _target(
+    target_id: str,
+    *,
+    priority: int = 90,
+    scope_paths: list[str] | None = None,
+    scope_symbols: list[str] | None = None,
+) -> dict:
     return {
         "target_id": target_id,
         "title": f"Inspect {target_id}",
         "kind": "module-level",
         "priority": priority,
-        "scope_paths": ["src/app.py"],
-        "scope_symbols": ["app"],
+        "scope_paths": scope_paths or ["src/app.py"],
+        "scope_symbols": scope_symbols or ["app"],
         "instructions": f"Analyze {target_id}.",
         "depends_on_claim_ids": [],
         "spawn_reason": f"Captain queued {target_id}.",
@@ -134,12 +141,34 @@ def _verification_output(
     return f"VERIFICATION_JSON_BEGIN\n{json.dumps(payload, indent=2)}\nVERIFICATION_JSON_END\n{verdict}"
 
 
+class ScriptedInteractionChannel:
+    def __init__(self, responses: list[list[str]] | None = None):
+        self._responses = list(responses or [])
+        self.started = False
+        self.stopped = False
+        self.poll_calls = 0
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def poll(self, timeout: float) -> list[str]:
+        self.poll_calls += 1
+        if self._responses:
+            return self._responses.pop(0)
+        return []
+
+
 def _run_runner(
     tmp_path,
     backend: MockBackend,
     *,
     run_mode: str = "fresh",
     config: AnalysisConfig | None = None,
+    interactive: bool = False,
+    interaction_channel: ScriptedInteractionChannel | None = None,
 ):
     phase = Phase(
         id="analyze",
@@ -157,7 +186,8 @@ def _run_runner(
             state_file=state_file,
             run_mode=run_mode,
             display=Display(plain=True),
-            interactive=False,
+            interactive=interactive,
+            interaction_channel=interaction_channel,
         )
         result = runner.run()
     return result, DynamicSessionState.load(state_file), backend
@@ -364,3 +394,231 @@ def test_empty_frontier_and_captain_complete(tmp_path):
     assert state.captain.turn_index == 1
     assert state.targets == {}
     assert [role for role, _prompt in backend.role_calls] == ["captain"]
+
+
+def test_ignore_path_directive_makes_matching_targets_ineligible(tmp_path):
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            enqueue_targets=[
+                _target("target-1", priority=100, scope_paths=["src/app.py"]),
+                _target("target-2", priority=50, scope_paths=["src/generated/cache.py"]),
+            ]
+        ),
+        session_id="captain-s1",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            termination_state="complete",
+            termination_reason="Ignored generated code is out of scope.",
+        ),
+    )
+    interaction = ScriptedInteractionChannel([["/ignore path:src/generated/"], []])
+
+    result, state, backend = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        interactive=True,
+        interaction_channel=interaction,
+    )
+
+    worker_prompts = [prompt for role, prompt in backend.role_calls if role == "worker"]
+    assert result.success is True
+    assert state.ignored_path_prefixes == ["src/generated/"]
+    assert state.targets["target-2"].status == "queued"
+    assert len(worker_prompts) == 1
+    assert '"target_id": "target-1"' in worker_prompts[0]
+    assert all('"target_id": "target-2"' not in prompt for prompt in worker_prompts)
+    assert state.directives["dir-1"].kind == "ignore"
+    assert state.directives["dir-1"].status == "applied"
+
+
+def test_ignore_symbol_directive_makes_matching_targets_ineligible(tmp_path):
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            enqueue_targets=[
+                _target("target-1", priority=100, scope_symbols=["app"]),
+                _target("target-2", priority=50, scope_symbols=["LegacyParser"]),
+            ]
+        ),
+        session_id="captain-s1",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Ignored symbol is out of scope."),
+    )
+    interaction = ScriptedInteractionChannel([["/ignore symbol:LegacyParser"], []])
+
+    result, state, backend = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        interactive=True,
+        interaction_channel=interaction,
+    )
+
+    worker_prompts = [prompt for role, prompt in backend.role_calls if role == "worker"]
+    assert result.success is True
+    assert state.ignored_symbols == ["LegacyParser"]
+    assert state.targets["target-2"].status == "queued"
+    assert len(worker_prompts) == 1
+    assert '"target_id": "target-1"' in worker_prompts[0]
+    assert all('"target_id": "target-2"' not in prompt for prompt in worker_prompts)
+    assert state.directives["dir-1"].kind == "ignore"
+    assert state.directives["dir-1"].status == "applied"
+
+
+def test_target_directive_creates_user_sourced_target(tmp_path):
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            termination_state="continue",
+            termination_reason="Waiting for more direction before selecting a target.",
+            message_to_user="I have not picked a concrete target yet.",
+        ),
+        session_id="captain-s1",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("user-target-1-g1-attempt-1", "user-target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            termination_state="complete",
+            termination_reason="The user-supplied target is complete.",
+        ),
+    )
+    interaction = ScriptedInteractionChannel([["/target inspect the config loader"], []])
+
+    result, state, backend = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        interactive=True,
+        interaction_channel=interaction,
+    )
+
+    user_targets = [target for target in state.targets.values() if target.source == "user"]
+    worker_prompts = [prompt for role, prompt in backend.role_calls if role == "worker"]
+    assert result.success is True
+    assert len(user_targets) == 1
+    assert user_targets[0].target_id == "user-target-1"
+    assert user_targets[0].title == "inspect the config loader"
+    assert user_targets[0].priority == 100
+    assert user_targets[0].kind == "user-target"
+    assert worker_prompts and '"target_id": "user-target-1"' in worker_prompts[0]
+    assert state.directives["dir-1"].kind == "target"
+    assert state.directives["dir-1"].status == "applied"
+
+
+def test_summary_directive_triggers_captain_turn(tmp_path):
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            termination_state="continue",
+            termination_reason="Need a user-directed summary request before wrapping up.",
+            message_to_user="Ask if you want a summary before I stop.",
+        ),
+        session_id="captain-s1",
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            acknowledged_directive_ids=["dir-1"],
+            termination_state="complete",
+            termination_reason="Summary delivered.",
+            message_to_user="Summary requested by the user.",
+        ),
+    )
+    interaction = ScriptedInteractionChannel([["/summary"]])
+
+    result, state, backend = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        interactive=True,
+        interaction_channel=interaction,
+    )
+
+    assert result.success is True
+    assert state.captain.turn_index == 2
+    assert len(backend.resume_calls) == 1
+    assert backend.resume_calls[0][0] == "captain-s1"
+    assert state.directives["dir-1"].kind == "summary"
+    assert state.directives["dir-1"].status == "acknowledged"
+
+
+def test_stop_directive_ends_run_immediately(tmp_path):
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+        session_id="captain-s1",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    interaction = ScriptedInteractionChannel([["/stop"]])
+
+    result, state, backend = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        interactive=True,
+        interaction_channel=interaction,
+    )
+
+    assert result.success is False
+    assert result.failure_context == "analysis stopped by user"
+    assert state.control.stop_requested is True
+    assert state.directives["dir-1"].kind == "stop"
+    assert state.directives["dir-1"].status == "applied"
+    assert [role for role, _prompt in backend.role_calls].count("captain") == 1
+
+
+def test_wrap_directive_drains_active_work_then_completes(tmp_path):
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            enqueue_targets=[_target("target-1", priority=100), _target("target-2", priority=50)],
+        ),
+        session_id="captain-s1",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            enqueue_targets=[_target("ignored-summary-target")],
+            termination_state="complete",
+            termination_reason="Wrapped after draining active work.",
+            message_to_user="Here is the final wrap summary.",
+        ),
+    )
+    interaction = ScriptedInteractionChannel([["/wrap"], []])
+
+    result, state, backend = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        interactive=True,
+        interaction_channel=interaction,
+    )
+
+    worker_prompts = [prompt for role, prompt in backend.role_calls if role == "worker"]
+    assert result.success is True
+    assert state.control.wrap_requested is True
+    assert state.control.wrap_summary_pending is False
+    assert state.targets["target-1"].status == "no_findings"
+    assert state.targets["target-2"].status == "queued"
+    assert "ignored-summary-target" not in state.targets
+    assert len(worker_prompts) == 1
+    assert '"target_id": "target-1"' in worker_prompts[0]
+    assert all('"target_id": "target-2"' not in prompt for prompt in worker_prompts)
+    assert state.directives["dir-1"].kind == "wrap"
+    assert state.directives["dir-1"].status == "applied"

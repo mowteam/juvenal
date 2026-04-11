@@ -13,10 +13,12 @@ from typing import Any, Literal
 from juvenal.backends import AgentResult, Backend, create_backend
 from juvenal.checkers import VerificationReport, parse_verification_report
 from juvenal.display import Display
+from juvenal.dynamic.interaction import UserInteractionChannel
 from juvenal.dynamic.models import (
     CaptainTurn,
     ClaimRecord,
     TargetRecord,
+    UserDirective,
     VerificationRecord,
     WorkerAttempt,
     WorkerClaimArtifact,
@@ -25,6 +27,7 @@ from juvenal.dynamic.models import (
 from juvenal.dynamic.protocol import (
     claim_to_verifier_packet,
     parse_captain_output,
+    parse_user_directive,
     parse_worker_output,
     validate_target_scope,
 )
@@ -81,6 +84,7 @@ class DynamicAnalysisRunner:
         display: Display,
         interactive: bool,
         failure_context: str = "",
+        interaction_channel: UserInteractionChannel | None = None,
     ) -> None:
         self.phase = phase
         self.workflow = workflow
@@ -104,9 +108,15 @@ class DynamicAnalysisRunner:
         self._captain_termination_state: Literal["continue", "complete"] = "continue"
         self._captain_termination_reason = ""
         self._last_captain_snapshot: tuple[Any, ...] | None = None
+        self._last_review_snapshot: tuple[Any, ...] | None = None
+        self._last_review_event_seq = 0
+        self._last_reviewed_turn_index = 0
         self._terminal_failure = ""
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self._interaction_channel = interaction_channel if interactive else None
+        if self._interaction_channel is None and interactive:
+            self._interaction_channel = UserInteractionChannel()
 
         prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
         self._captain_role_prompt = (prompts_dir / "captain-analysis.md").read_text(encoding="utf-8")
@@ -123,6 +133,12 @@ class DynamicAnalysisRunner:
                 self.state = DynamicSessionState(self.state_file)
                 self.state.save()
 
+            self._last_review_event_seq = max((event.seq for event in self.state.events), default=0)
+            self._last_reviewed_turn_index = self.state.captain.turn_index
+            self._last_review_snapshot = self._review_snapshot()
+            if self._interaction_channel is not None:
+                self._interaction_channel.start()
+
             while True:
                 terminate, success, reason = self._should_terminate()
                 if terminate:
@@ -134,6 +150,13 @@ class DynamicAnalysisRunner:
                 made_progress |= self._drain_completed_futures()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
+                made_progress |= self._apply_review_point()
+
+                terminate, success, reason = self._should_terminate()
+                if terminate:
+                    if not success:
+                        self.kill_active()
+                    return PhaseResult(success=success, failure_context=reason if not success else "")
 
                 if self._needs_captain_turn():
                     self._run_captain_turn()
@@ -148,6 +171,8 @@ class DynamicAnalysisRunner:
                 if not made_progress:
                     time.sleep(_IDLE_SLEEP_SECONDS)
         finally:
+            if self._interaction_channel is not None:
+                self._interaction_channel.stop()
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -436,6 +461,225 @@ class DynamicAnalysisRunner:
 
         return progressed
 
+    def _apply_review_point(self) -> bool:
+        if self._interaction_channel is None or self.state.control.stop_requested:
+            return False
+
+        current_snapshot = self._review_snapshot()
+        if self._last_review_snapshot == current_snapshot:
+            return False
+
+        self.display.pause()
+        try:
+            self._print_review_summary()
+            timeout = self.config.interaction_timeout
+            print(
+                f"Review window: {timeout:.1f}s | /focus /ignore path:... /ignore symbol:... "
+                "/target ... /ask ... /summary /stop /wrap",
+                flush=True,
+            )
+            lines = self._interaction_channel.poll(timeout)
+        finally:
+            self.display.resume()
+
+        changed = False
+        for line in lines:
+            directive_id = self._next_directive_id()
+            try:
+                directive = parse_user_directive(line, directive_id=directive_id)
+            except ValueError as exc:
+                print(f"Ignoring invalid directive {line!r}: {exc}", flush=True)
+                continue
+            changed |= self._persist_directive(directive)
+
+        self._last_review_event_seq = max((event.seq for event in self.state.events), default=0)
+        self._last_reviewed_turn_index = self.state.captain.turn_index
+        self._last_review_snapshot = self._review_snapshot()
+        return changed
+
+    def _review_snapshot(self) -> tuple[Any, ...]:
+        counts = self._review_target_counts()
+        return (
+            max((event.seq for event in self.state.events), default=0),
+            self.state.captain.turn_index,
+            tuple(sorted(counts.items())),
+            self.state.control.stop_requested,
+            self.state.control.wrap_requested,
+            self.state.control.wrap_summary_pending,
+        )
+
+    def _print_review_summary(self) -> None:
+        verified, rejected = self._review_claim_updates()
+        focus = self._focus_area_summaries()
+        counts = self._review_target_counts()
+        message = self.state.captain.last_message_to_user.strip() or self.state.captain.mental_model_summary.strip()
+        if not message:
+            message = "(no captain summary yet)"
+
+        print("\n[analysis review]", flush=True)
+        print(f"Captain: {message}", flush=True)
+        print(f"Focus: {', '.join(focus) if focus else '(none)'}", flush=True)
+        print(f"Verified: {', '.join(verified) if verified else 'none'}", flush=True)
+        print(f"Rejected: {', '.join(rejected) if rejected else 'none'}", flush=True)
+        print(
+            f"Targets: queued={counts['queued']} running={counts['running']} verifying={counts['verifying']}",
+            flush=True,
+        )
+        print(f"Remaining retry budget: {self._remaining_retry_budget()}", flush=True)
+
+    def _review_claim_updates(self) -> tuple[list[str], list[str]]:
+        verified: list[str] = []
+        rejected: list[str] = []
+        for event in self.state.events:
+            if event.seq <= self._last_review_event_seq or event.claim_id is None:
+                continue
+            claim = self.state.claims.get(event.claim_id)
+            if claim is None:
+                summary = event.claim_id
+            else:
+                summary = claim.summary
+                if event.event_type == "claim.rejected" and claim.rejection_class:
+                    summary = f"{summary} [{claim.rejection_class}]"
+            if event.event_type == "claim.verified":
+                verified.append(summary)
+            elif event.event_type == "claim.rejected":
+                rejected.append(summary)
+        return verified[:3], rejected[:3]
+
+    def _focus_area_summaries(self) -> list[str]:
+        active_targets = [
+            target
+            for target in self.state.targets.values()
+            if not self._is_target_ignored(target) and target.status in _NON_TERMINAL_STATUSES
+        ]
+        active_targets.sort(key=lambda target: (-target.priority, target.created_at, target.target_id))
+        focus = [f"{target.title} [{target.status}]" for target in active_targets[:3]]
+        if focus:
+            return focus
+        return list(self.state.captain.open_questions[:3])
+
+    def _review_target_counts(self) -> dict[str, int]:
+        counts = {"queued": 0, "running": 0, "verifying": 0}
+        for target in self.state.targets.values():
+            if self._is_target_ignored(target):
+                continue
+            if target.status in counts:
+                counts[target.status] += 1
+        return counts
+
+    def _remaining_retry_budget(self) -> int:
+        remaining = 0
+        for target in self.state.targets.values():
+            if self._is_target_ignored(target) or self._is_terminal_target(target):
+                continue
+            generation = target.active_generation or target.generation or 1
+            remaining += max(0, self.config.max_worker_retries - (generation - 1))
+        return remaining
+
+    def _persist_directive(self, directive: UserDirective) -> bool:
+        if directive.kind == "ignore":
+            return self._apply_ignore_directive(directive)
+        if directive.kind == "target":
+            return self._apply_user_target_directive(directive)
+        if directive.kind == "stop":
+            return self._apply_stop_directive(directive)
+        if directive.kind == "wrap":
+            return self._apply_wrap_directive(directive)
+        return self._queue_captain_directive(directive)
+
+    def _apply_ignore_directive(self, directive: UserDirective) -> bool:
+        now = time.time()
+        text = directive.text.strip()
+        if text.startswith("path:"):
+            prefix = text.removeprefix("path:").strip()
+            if not prefix:
+                print(f"Ignoring invalid directive {text!r}: empty path prefix", flush=True)
+                return False
+            if prefix not in self.state.ignored_path_prefixes:
+                self.state.ignored_path_prefixes.append(prefix)
+        elif text.startswith("symbol:"):
+            symbol = text.removeprefix("symbol:").strip()
+            if not symbol:
+                print(f"Ignoring invalid directive {text!r}: empty symbol name", flush=True)
+                return False
+            if symbol not in self.state.ignored_symbols:
+                self.state.ignored_symbols.append(symbol)
+        else:
+            print(f"Ignoring invalid directive {text!r}: unsupported /ignore target", flush=True)
+            return False
+
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        for target in self.state.targets.values():
+            if self._is_target_ignored(target):
+                target.updated_at = now
+        self.state.save()
+        return True
+
+    def _apply_user_target_directive(self, directive: UserDirective) -> bool:
+        now = time.time()
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        target = TargetRecord(
+            target_id=self._next_user_target_id(),
+            title=directive.text,
+            kind="user-target",
+            priority=100,
+            status="queued",
+            source="user",
+            scope_paths=[],
+            scope_symbols=[],
+            instructions=directive.text,
+            depends_on_claim_ids=[],
+            spawn_reason="User requested targeted analysis.",
+            generation=1,
+            active_generation=1,
+            active_attempt_id=None,
+            deferred_until_turn=None,
+            pending_verification_ids=[],
+            accepted_claim_ids=[],
+            rejected_claim_ids=[],
+            created_at=now,
+            updated_at=now,
+        )
+        self.state.targets[target.target_id] = target
+        self.state.append_event(
+            "target.discovered",
+            target_id=target.target_id,
+            generation=target.active_generation,
+            source=target.source,
+        )
+        self.state.save()
+        return True
+
+    def _apply_stop_directive(self, directive: UserDirective) -> bool:
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        self.state.control.stop_requested = True
+        self.state.save()
+        self.kill_active()
+        return True
+
+    def _apply_wrap_directive(self, directive: UserDirective) -> bool:
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        self.state.control.wrap_requested = True
+        self.state.control.wrap_summary_pending = True
+        self.state.save()
+        return True
+
+    def _queue_captain_directive(self, directive: UserDirective) -> bool:
+        self.state.directives[directive.directive_id] = directive
+        self.state.append_event("directive.received", directive_id=directive.directive_id)
+        return True
+
+    def _next_directive_id(self) -> str:
+        return f"dir-{len(self.state.directives) + 1}"
+
+    def _next_user_target_id(self) -> str:
+        existing = [target for target in self.state.targets.values() if target.source == "user"]
+        return f"user-target-{len(existing) + 1}"
+
     def _should_terminate(self) -> tuple[bool, bool, str]:
         if self._terminal_failure:
             return True, False, self._terminal_failure
@@ -483,6 +727,11 @@ class DynamicAnalysisRunner:
                 and self._last_captain_snapshot == self._captain_snapshot()
                 and self._captain_termination_state != "complete"
             ):
+                if (
+                    self._interaction_channel is not None
+                    and self._last_reviewed_turn_index < self.state.captain.turn_index
+                ):
+                    return False, False, ""
                 return True, False, "captain left the frontier empty without requesting completion"
 
         return False, False, ""

@@ -1,5 +1,6 @@
 """Dynamic analysis engine protocol types."""
 
+from juvenal.dynamic.interaction import UserInteractionChannel
 from juvenal.dynamic.models import ClaimRecord, CodeLocation, UserDirective, VerificationRecord, WorkerReport
 from juvenal.dynamic.protocol import (
     claim_to_verifier_packet,
@@ -14,6 +15,7 @@ __all__ = [
     "ClaimRecord",
     "CodeLocation",
     "DynamicSessionState",
+    "UserInteractionChannel",
     "UserDirective",
     "VerificationRecord",
     "WorkerReport",
