@@ -8,6 +8,14 @@
 
 Juvenal is a framework for orchestrating AI coding agents through verified implementation phases. It prevents agents from cheating on success criteria, helps agents implement complex projects in phases, etc.
 
+## Fork Changes
+
+This is a fork of juvenal meant to enable a more dynamic workflow. The hope is to build off of juvenal's strong verification architecture while enabling the captain/worker architecture that better suits dynamic workflows such as large program analysis for bug detection.
+
+## Warning
+
+This was prototyped using AI coding agents. As such, the code quality and security is not guaranteed. These are merely some experimental changes made for my own use cases.
+
 ## The Problem
 
 Agents such at giant problems.
