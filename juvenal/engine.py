@@ -534,6 +534,9 @@ class Engine:
 
     def _run_analysis(self, phase: Phase) -> PhaseResult:
         """Run an analysis phase through the dynamic analysis runner."""
+        from juvenal.dynamic.runner import DynamicAnalysisRunner
+
+        failure_context = self.state.get_failure_context(phase.id)
         ps = self.state._ensure_phase(phase.id)
         if ps.baseline_sha is None:
             ps.baseline_sha = self._get_git_head()
@@ -547,12 +550,28 @@ class Engine:
         analysis_state = self._analysis_state_file(phase)
         run_mode = self._analysis_run_mode(phase.id)
         self._bounce_targets.discard(phase.id)
-        if run_mode == "reset":
-            analysis_state.unlink(missing_ok=True)
+        runner = DynamicAnalysisRunner(
+            phase=phase,
+            workflow=self.workflow,
+            state_file=analysis_state,
+            run_mode=run_mode,
+            display=self.display,
+            interactive=self.interactive,
+            failure_context=failure_context,
+        )
+        self._active_dynamic_runner = runner
+        try:
+            result = runner.run()
+        finally:
+            self._active_dynamic_runner = None
 
-        failure_context = "analysis runner not yet implemented"
-        self.display.step_fail(f"analysis: {phase.id}", failure_context)
-        return PhaseResult(success=False, failure_context=failure_context)
+        self.state.add_tokens(phase.id, runner.total_input_tokens, runner.total_output_tokens)
+
+        if result.success:
+            self.display.step_pass(f"analysis: {phase.id}")
+        else:
+            self.display.step_fail(f"analysis: {phase.id}", result.failure_context or "dynamic analysis failed")
+        return result
 
     def _inherit_subworkflow_vars(self, phase: Phase, sub_workflow: Workflow) -> None:
         """Merge parent workflow context into a sub-workflow before validation/execution."""

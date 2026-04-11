@@ -1,13 +1,17 @@
 """Unit tests for the execution engine with mocked backend."""
 
+import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
 from juvenal.checkers import parse_verdict
+from juvenal.dynamic.state import DynamicSessionState
 from juvenal.engine import BounceCounter, Engine, _extract_yaml, _plan_workflow_internal
+from juvenal.execution import PhaseResult
 from juvenal.workflow import (
+    AnalysisConfig,
     ParallelGroup,
     Phase,
     Workflow,
@@ -3102,3 +3106,188 @@ class TestPlanWorkflowInternal:
         assert result.success is False
         assert backend_factory.call_count == 0
         assert seen_backends == [backend]
+
+
+class TestAnalysisEngineIntegration:
+    @staticmethod
+    def _captain_output(*, enqueue_targets=None, termination_state="continue", termination_reason="more work") -> str:
+        payload = {
+            "message_to_user": "",
+            "acknowledged_directive_ids": [],
+            "mental_model_summary": "analysis model",
+            "open_questions": [],
+            "enqueue_targets": enqueue_targets or [],
+            "defer_target_ids": [],
+            "termination_state": termination_state,
+            "termination_reason": termination_reason,
+        }
+        return f"CAPTAIN_JSON_BEGIN\n{json.dumps(payload, indent=2)}\nCAPTAIN_JSON_END"
+
+    @staticmethod
+    def _target(target_id: str) -> dict:
+        return {
+            "target_id": target_id,
+            "title": f"Inspect {target_id}",
+            "kind": "module-level",
+            "priority": 90,
+            "scope_paths": ["src/app.py"],
+            "scope_symbols": ["app"],
+            "instructions": f"Analyze {target_id}.",
+            "depends_on_claim_ids": [],
+            "spawn_reason": f"Captain queued {target_id}.",
+        }
+
+    @staticmethod
+    def _worker_claim_output(task_id: str, target_id: str) -> str:
+        payload = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "target_id": target_id,
+            "outcome": "claims",
+            "summary": "One candidate issue.",
+            "claims": [
+                {
+                    "worker_claim_id": "c1",
+                    "kind": "input-validation",
+                    "subcategory": "missing-check",
+                    "summary": "Missing validation path.",
+                    "assertion": "The path lacks a required validation check.",
+                    "severity": "medium",
+                    "worker_confidence": "medium",
+                    "primary_location": {"path": "src/app.py", "line": 10, "symbol": "app", "role": "sink"},
+                    "locations": [{"path": "src/app.py", "line": 10, "symbol": "app", "role": "sink"}],
+                    "preconditions": ["Input reaches the sink."],
+                    "candidate_code_refs": [{"path": "src/app.py", "line": 10, "symbol": None, "role": None}],
+                    "reasoning": "The expected guard is missing.",
+                    "trace": [{"path": "src/app.py", "line": 10, "symbol": "app", "role": "sink"}],
+                    "commands_run": ['rg "app" src/app.py'],
+                    "counterevidence_checked": ["No nearby guard was found."],
+                    "follow_up_hints": [],
+                    "related_claim_ids": [],
+                }
+            ],
+            "blocker": None,
+            "follow_up_hints": [],
+        }
+        return f"WORKER_JSON_BEGIN\n{json.dumps(payload, indent=2)}\nWORKER_JSON_END"
+
+    @staticmethod
+    def _verification_output(claim_id: str, target_id: str) -> str:
+        payload = {
+            "schema_version": 1,
+            "claim_id": claim_id,
+            "target_id": target_id,
+            "verifier_role": "analysis-verifier",
+            "backend": "claude",
+            "disposition": "verified",
+            "rejection_class": None,
+            "summary": "The claim is supported by the code.",
+            "follow_up_action": None,
+            "follow_up_strategy": None,
+        }
+        return f"VERIFICATION_JSON_BEGIN\n{json.dumps(payload, indent=2)}\nVERIFICATION_JSON_END\nVERDICT: PASS"
+
+    def test_engine_dispatches_analysis_phase_to_run_analysis(self, tmp_path):
+        workflow = Workflow(
+            name="analysis",
+            phases=[Phase(id="analyze", type="analysis", prompt="Analyze.", analysis=AnalysisConfig())],
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+
+        with patch.object(engine, "_run_analysis", return_value=PhaseResult(success=True)) as run_analysis:
+            assert engine.run() == 0
+
+        run_analysis.assert_called_once_with(workflow.phases[0])
+        assert engine.state.phases["analyze"].status == "completed"
+
+    def test_analysis_run_mode_selection(self, tmp_path):
+        workflow = Workflow(
+            name="analysis",
+            phases=[Phase(id="analyze", type="analysis", prompt="Analyze.", analysis=AnalysisConfig())],
+        )
+
+        fresh_engine = Engine(workflow, state_file=str(tmp_path / "fresh.json"), plain=True)
+        assert fresh_engine._analysis_run_mode("analyze") == "fresh"
+
+        resume_engine = Engine(workflow, state_file=str(tmp_path / "resume.json"), resume=True, plain=True)
+        assert resume_engine._analysis_run_mode("analyze") == "resume"
+
+        rewind_engine = Engine(workflow, state_file=str(tmp_path / "rewind.json"), rewind=1, plain=True)
+        assert rewind_engine._analysis_run_mode("analyze") == "reset"
+
+        bounce_engine = Engine(workflow, state_file=str(tmp_path / "bounce.json"), plain=True)
+        bounce_engine._bounce_targets.add("analyze")
+        assert bounce_engine._analysis_run_mode("analyze") == "resume"
+
+        reset_bounce_engine = Engine(
+            workflow,
+            state_file=str(tmp_path / "reset-bounce.json"),
+            plain=True,
+            clear_context_on_bounce=True,
+        )
+        reset_bounce_engine._bounce_targets.add("analyze")
+        assert reset_bounce_engine._analysis_run_mode("analyze") == "reset"
+
+    def test_run_analysis_instantiates_runner_with_selected_mode(self, tmp_path):
+        phase = Phase(id="analyze", type="analysis", prompt="Analyze.", analysis=AnalysisConfig())
+        workflow = Workflow(name="analysis", phases=[phase])
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+
+        with patch("juvenal.dynamic.runner.DynamicAnalysisRunner") as runner_cls:
+            runner = runner_cls.return_value
+            runner.run.return_value = PhaseResult(success=True)
+            runner.total_input_tokens = 3
+            runner.total_output_tokens = 5
+
+            with patch.object(engine, "_get_git_head", return_value=None):
+                result = engine._run_analysis(phase)
+
+        assert result.success is True
+        kwargs = runner_cls.call_args.kwargs
+        assert kwargs["run_mode"] == "fresh"
+        assert kwargs["state_file"] == tmp_path / ".juvenal-state-analyze-analysis.json"
+        assert engine.state.phases["analyze"].attempt == 1
+        assert engine.state.phases["analyze"].input_tokens == 3
+        assert engine.state.phases["analyze"].output_tokens == 5
+
+    def test_engine_runs_analysis_phase_end_to_end(self, tmp_path):
+        backend = MockBackend()
+        backend.add_role_response(
+            "captain",
+            output=self._captain_output(enqueue_targets=[self._target("target-1")]),
+            session_id="captain-s1",
+        )
+        backend.add_role_response("worker", output=self._worker_claim_output("target-1-g1-attempt-1", "target-1"))
+        backend.add_role_response("verifier", output=self._verification_output("target-1-g1-claim-c1", "target-1"))
+        backend.add_role_response(
+            "captain",
+            output=self._captain_output(termination_state="complete", termination_reason="No more work remains."),
+        )
+
+        workflow = Workflow(
+            name="analysis",
+            phases=[
+                Phase(
+                    id="analyze",
+                    type="analysis",
+                    prompt="Analyze the repository.",
+                    analysis=AnalysisConfig(max_workers=1, max_verifiers=1),
+                )
+            ],
+        )
+        outer_backend = MockBackend()
+        engine = Engine(
+            workflow,
+            state_file=str(tmp_path / "state.json"),
+            plain=True,
+            backend_instance=outer_backend,
+        )
+
+        with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+            with patch.object(engine, "_get_git_head", return_value=None):
+                assert engine.run() == 0
+
+        child_state = DynamicSessionState.load(tmp_path / ".juvenal-state-analyze-analysis.json")
+        assert engine.state.phases["analyze"].status == "completed"
+        assert child_state.targets["target-1"].status == "completed"
+        assert child_state.claims["target-1-g1-claim-c1"].status == "verified"

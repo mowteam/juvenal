@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from threading import Lock
 
 import pytest
 
@@ -88,11 +89,14 @@ class MockBackend(Backend):
     def __init__(self, responses: list[AgentResult] | None = None):
         super().__init__()
         self._responses = list(responses or [])
+        self._role_responses: dict[str, list[AgentResult]] = {"captain": [], "worker": [], "verifier": []}
         self._interactive_responses: list[InteractiveResult] = []
         self._call_count = 0
+        self._queue_lock = Lock()
         self.calls: list[str] = []
         self.resume_calls: list[tuple[str, str]] = []
         self.interactive_calls: list[str] = []
+        self.role_calls: list[tuple[str | None, str]] = []
 
     def name(self) -> str:
         return "mock"
@@ -105,36 +109,79 @@ class MockBackend(Backend):
         input_tokens: int = 0,
         output_tokens: int = 0,
         session_id: str | None = None,
+        role: str | None = None,
     ):
-        self._responses.append(
-            AgentResult(
-                exit_code=exit_code,
-                output=output,
-                transcript=transcript,
-                duration=0.1,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                session_id=session_id,
-            )
+        result = AgentResult(
+            exit_code=exit_code,
+            output=output,
+            transcript=transcript,
+            duration=0.1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            session_id=session_id,
+        )
+        if role is None:
+            self._responses.append(result)
+            return
+        if role not in self._role_responses:
+            raise ValueError(f"Unknown mock backend role: {role!r}")
+        self._role_responses[role].append(result)
+
+    def add_role_response(
+        self,
+        role: str,
+        *,
+        exit_code: int = 0,
+        output: str = "",
+        transcript: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        session_id: str | None = None,
+    ) -> None:
+        self.add_response(
+            exit_code=exit_code,
+            output=output,
+            transcript=transcript,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            session_id=session_id,
+            role=role,
         )
 
+    def _detect_role(self, prompt: str, env: dict[str, str] | None) -> str | None:
+        if env is not None:
+            role = env.get("JUVENAL_ANALYSIS_ROLE")
+            if role in self._role_responses:
+                return role
+        if "You are the captain for Juvenal's dynamic `analysis` phase." in prompt:
+            return "captain"
+        if "You are a scoped analysis worker for Juvenal's dynamic `analysis` phase." in prompt:
+            return "worker"
+        if "You are an independent verifier for Juvenal's dynamic `analysis` phase." in prompt:
+            return "verifier"
+        return None
+
+    def _next_result(self, role: str | None) -> AgentResult:
+        with self._queue_lock:
+            if role is not None and self._role_responses[role]:
+                self._call_count += 1
+                return self._role_responses[role].pop(0)
+            if self._responses:
+                self._call_count += 1
+                return self._responses.pop(0)
+        return AgentResult(exit_code=0, output="VERDICT: PASS", transcript="", duration=0.1)
+
     def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None):
+        role = self._detect_role(prompt, env)
         self.calls.append(prompt)
-        if self._call_count < len(self._responses):
-            result = self._responses[self._call_count]
-        else:
-            result = AgentResult(exit_code=0, output="VERDICT: PASS", transcript="", duration=0.1)
-        self._call_count += 1
-        return result
+        self.role_calls.append((role, prompt))
+        return self._next_result(role)
 
     def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None):
+        role = self._detect_role(prompt, env)
         self.resume_calls.append((session_id, prompt))
-        if self._call_count < len(self._responses):
-            result = self._responses[self._call_count]
-        else:
-            result = AgentResult(exit_code=0, output="VERDICT: PASS", transcript="", duration=0.1)
-        self._call_count += 1
-        return result
+        self.role_calls.append((role, prompt))
+        return self._next_result(role)
 
     def add_interactive_response(self, exit_code: int = 0, session_id: str = "mock-session"):
         self._interactive_responses.append(InteractiveResult(session_id=session_id, exit_code=exit_code))
