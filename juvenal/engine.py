@@ -8,42 +8,22 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
+from typing import Literal
 
 from jinja2 import TemplateSyntaxError
 
 from juvenal.backends import Backend, create_backend
 from juvenal.checkers import NO_VERDICT_REASON, parse_verdict
 from juvenal.display import Display
+from juvenal.execution import PhaseResult, PlanResult
 from juvenal.notifications import build_notification_payload, send_webhook
 from juvenal.state import PhaseState, PipelineState
-from juvenal.workflow import ParallelGroup, Phase, Workflow
+from juvenal.workflow import AnalysisConfig, ParallelGroup, Phase, Workflow
 
 _BASH_CODE_BLOCK_RE = re.compile(r"```bash\n(.*?)\n```", re.DOTALL)
 _sleep = time.sleep
-
-
-@dataclass
-class PhaseResult:
-    """Result of executing a single phase."""
-
-    success: bool
-    bounce_target: str | None = None
-    failure_context: str = ""
-
-
-@dataclass
-class PlanResult:
-    """Result of planning a workflow from a goal description."""
-
-    success: bool
-    workflow_yaml_path: str | None = None
-    temp_dir: str | None = None
-    error: str | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
 
 
 class BounceCounter:
@@ -109,8 +89,10 @@ class Engine:
         self.preserve_context_on_bounce = not clear_context_on_bounce
         self.serialize = serialize
         self.interactive = interactive
+        self._run_intent: Literal["fresh", "resume", "rewind", "rewind-to", "start-phase"] = "fresh"
         self._session_ids: dict[str, str] = {}  # phase_id -> last session_id
         self._bounce_targets: set[str] = set()  # phases that should resume on next run
+        self._active_dynamic_runner: object | None = None
         self._engine_lock = Lock()  # protects _session_ids and _bounce_targets in parallel
 
         sf = state_file or ".juvenal-state.json"
@@ -123,15 +105,19 @@ class Engine:
 
         # Determine starting phase index
         if rewind_to is not None:
+            self._run_intent = "rewind-to"
             self._start_idx = self._find_phase_index(rewind_to)
             self.state.invalidate_from(rewind_to)
         elif rewind is not None:
+            self._run_intent = "rewind"
             resume_idx = self.state.get_resume_phase_index(self.workflow.phases)
             self._start_idx = max(0, resume_idx - rewind)
             self.state.invalidate_from(self.workflow.phases[self._start_idx].id)
         elif start_phase:
+            self._run_intent = "start-phase"
             self._start_idx = self._find_phase_index(start_phase)
         elif resume:
+            self._run_intent = "resume"
             self._start_idx = self.state.get_resume_phase_index(self.workflow.phases)
         else:
             self._start_idx = 0
@@ -197,6 +183,8 @@ class Engine:
                     result = self._run_check(phase, phases, phase_idx)
                 elif phase.type == "workflow":
                     result = self._run_workflow(phase)
+                elif phase.type == "analysis":
+                    result = self._run_analysis(phase)
                 else:
                     raise ValueError(f"Unknown phase type: {phase.type!r}")
 
@@ -236,6 +224,11 @@ class Engine:
             return 1
 
         except KeyboardInterrupt:
+            if self._active_dynamic_runner is not None:
+                try:
+                    self._active_dynamic_runner.kill_active()
+                except Exception:
+                    pass
             self.backend.kill_active()
             self.state.save()
             print("\nInterrupted. State saved. Resume with --resume.")
@@ -525,6 +518,42 @@ class Engine:
             return self._run_static_workflow(phase, effective_max_depth)
         return self._run_dynamic_workflow(phase, effective_max_depth)
 
+    def _analysis_state_file(self, phase: Phase) -> Path:
+        """Return the child state file for a dynamic analysis phase."""
+        return self.state.state_file.parent / f".juvenal-state-{phase.id}-analysis.json"
+
+    def _analysis_run_mode(self, phase_id: str) -> Literal["fresh", "resume", "reset"]:
+        """Choose how the analysis child state should be handled for this run."""
+        if phase_id in self._bounce_targets:
+            return "resume" if self.preserve_context_on_bounce else "reset"
+        if self._run_intent == "resume":
+            return "resume"
+        if self._run_intent in {"rewind", "rewind-to"}:
+            return "reset"
+        return "fresh"
+
+    def _run_analysis(self, phase: Phase) -> PhaseResult:
+        """Run an analysis phase through the dynamic analysis runner."""
+        ps = self.state._ensure_phase(phase.id)
+        if ps.baseline_sha is None:
+            ps.baseline_sha = self._get_git_head()
+            self.state.save()
+
+        attempt = (ps.attempt if ps.attempt > 0 else 0) + 1
+        self.state.set_attempt(phase.id, attempt)
+        self.display.phase_start(phase.id, attempt)
+        self.display.step_start(f"analysis: {phase.id}")
+
+        analysis_state = self._analysis_state_file(phase)
+        run_mode = self._analysis_run_mode(phase.id)
+        self._bounce_targets.discard(phase.id)
+        if run_mode == "reset":
+            analysis_state.unlink(missing_ok=True)
+
+        failure_context = "analysis runner not yet implemented"
+        self.display.step_fail(f"analysis: {phase.id}", failure_context)
+        return PhaseResult(success=False, failure_context=failure_context)
+
     def _inherit_subworkflow_vars(self, phase: Phase, sub_workflow: Workflow) -> None:
         """Merge parent workflow context into a sub-workflow before validation/execution."""
         merged_vars = dict(sub_workflow.vars)
@@ -681,9 +710,9 @@ class Engine:
         return self._find_last_rework_phase(phases, phase_idx)
 
     def _find_last_rework_phase(self, phases: list[Phase], before_idx: int) -> str | None:
-        """Find the most recent implement/workflow phase before the given index."""
+        """Find the most recent re-runnable phase before the given index."""
         for i in range(before_idx - 1, -1, -1):
-            if phases[i].type in {"implement", "workflow"}:
+            if phases[i].type in {"implement", "workflow", "analysis"}:
                 return phases[i].id
         return None
 
@@ -786,6 +815,8 @@ class Engine:
                 result = self._run_implement(phase)
             elif phase.type == "workflow":
                 result = self._run_workflow(phase)
+            elif phase.type == "analysis":
+                result = self._run_analysis(phase)
             elif phase.type == "check":
                 result = self._run_check(phase, lane_phases, phase_idx)
             else:
@@ -891,7 +922,7 @@ class Engine:
         target_id = self._resolve_bounce_target(phase, phases, phase_idx)
         if target_id:
             for p in phases:
-                if p.id == target_id and p.type in {"implement", "workflow"}:
+                if p.id == target_id and p.type in {"implement", "workflow", "analysis"}:
                     return p.render_prompt(vars=self.workflow.vars) or None
         return None
 
@@ -1016,6 +1047,22 @@ class Engine:
                     prompt_preview = phase.prompt if has_errors else phase.render_prompt(vars=self.workflow.vars)
                     prompt_preview = prompt_preview[:80].replace("\n", " ")
                     print(f"     prompt: {prompt_preview}...")
+            elif phase.type == "analysis":
+                config = phase.analysis or AnalysisConfig()
+                prompt_preview = phase.prompt if has_errors else phase.render_prompt(vars=self.workflow.vars)
+                prompt_preview = prompt_preview[:80].replace("\n", " ")
+                print(f"{prefix} [{phase.type}] {phase.id}{extra_str}")
+                print(f"     prompt: {prompt_preview}...")
+                print(
+                    "     analysis: "
+                    f"captain={config.captain_backend}, worker={config.worker_backend}, "
+                    f"verifier={config.verifier_backend}, max_workers={config.max_workers}, "
+                    f"max_verifiers={config.max_verifiers}, "
+                    f"interaction_timeout={config.interaction_timeout}s, "
+                    f"max_worker_retries={config.max_worker_retries}, "
+                    f"max_captain_repairs={config.max_captain_repairs}, "
+                    f"allow_repo_tools={config.allow_repo_tools}"
+                )
             print()
 
         if self.workflow.parallel_groups:

@@ -6,6 +6,7 @@ import pytest
 from jinja2 import UndefinedError
 
 from juvenal.workflow import (
+    AnalysisConfig,
     ParallelGroup,
     Phase,
     Workflow,
@@ -63,6 +64,74 @@ phases:
         yaml_path.write_text(yaml_content)
         wf = load_workflow(yaml_path)
         assert wf.phases[0].type == "implement"
+
+    def test_yaml_analysis_phase_loads(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      captain_backend: codex
+      worker_backend: claude
+      verifier_backend: codex
+      max_workers: 2
+      max_verifiers: 3
+      interaction_timeout: 4.5
+      max_worker_retries: 1
+      max_captain_repairs: 5
+      allow_repo_tools: false
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        assert wf.phases[0].type == "analysis"
+        assert wf.phases[0].analysis == AnalysisConfig(
+            captain_backend="codex",
+            worker_backend="claude",
+            verifier_backend="codex",
+            max_workers=2,
+            max_verifiers=3,
+            interaction_timeout=4.5,
+            max_worker_retries=1,
+            max_captain_repairs=5,
+            allow_repo_tools=False,
+        )
+
+    def test_yaml_analysis_phase_defaults(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        assert wf.phases[0].type == "analysis"
+        assert wf.phases[0].analysis == AnalysisConfig()
+
+    def test_yaml_analysis_phase_rejects_checks(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    checks:
+      - tester
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        with pytest.raises(ValueError, match="analysis phases do not support 'checks'"):
+            load_workflow(yaml_path)
 
 
 class TestDirectoryLoading:

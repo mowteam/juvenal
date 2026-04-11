@@ -7,7 +7,9 @@ import argparse
 import pytest
 
 from juvenal.cli import build_parser, cmd_validate
+from juvenal.engine import Engine
 from juvenal.workflow import (
+    AnalysisConfig,
     ParallelGroup,
     Phase,
     Workflow,
@@ -170,6 +172,85 @@ class TestValidateWorkflow:
         )
         errors = validate_workflow(wf)
         assert len(errors) >= 3  # invalid type, duplicate ID, missing verification inputs
+
+    def test_analysis_phase_with_defaults_is_valid(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="analyze", type="analysis", prompt="Analyze the repository."),
+            ],
+        )
+        assert validate_workflow(wf) == []
+
+    def test_analysis_phase_invalid_field_combinations(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="setup", type="implement", prompt="Set up."),
+                Phase(
+                    id="analyze",
+                    type="analysis",
+                    prompt="Analyze the repository.",
+                    role="tester",
+                    bounce_target="setup",
+                    bounce_targets=["setup"],
+                    workflow_file="/tmp/sub.yaml",
+                    workflow_dir="/tmp/subdir",
+                ),
+            ],
+        )
+        errors = validate_workflow(wf)
+        assert any("analysis phase must not have 'role'" in e for e in errors)
+        assert any("analysis phase must not have 'bounce_target'" in e for e in errors)
+        assert any("analysis phase must not have 'bounce_targets'" in e for e in errors)
+        assert any("analysis phase must not have workflow_file or workflow_dir" in e for e in errors)
+
+    def test_non_analysis_phase_rejects_analysis_config(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="build", type="implement", prompt="Build.", analysis=AnalysisConfig()),
+            ],
+        )
+        errors = validate_workflow(wf)
+        assert any("analysis config is only allowed on analysis phases" in e for e in errors)
+
+    def test_analysis_phase_rejected_in_parallel_groups(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="analyze", type="analysis", prompt="Analyze."),
+            ],
+            parallel_groups=[ParallelGroup(phases=["analyze"])],
+        )
+        errors = validate_workflow(wf)
+        assert any("analysis phase" in e and "parallel_groups" in e for e in errors)
+
+    def test_analysis_phase_dry_run_rendering(self, tmp_path, capsys):
+        workflow = Workflow(
+            name="test",
+            phases=[
+                Phase(
+                    id="analyze",
+                    type="analysis",
+                    prompt="Analyze {{TARGET}}.",
+                    analysis=AnalysisConfig(max_workers=6, max_verifiers=9, interaction_timeout=1.5),
+                ),
+            ],
+            vars={"TARGET": "repo"},
+        )
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), dry_run=True, plain=True)
+
+        assert engine.run() == 0
+        captured = capsys.readouterr()
+        assert "[analysis] analyze" in captured.out
+        assert "Analyze repo." in captured.out
+        assert "captain=claude" in captured.out
+        assert "worker=codex" in captured.out
+        assert "verifier=claude" in captured.out
+        assert "max_workers=6" in captured.out
+        assert "max_verifiers=9" in captured.out
+        assert "interaction_timeout=1.5s" in captured.out
 
 
 class TestTimeoutField:

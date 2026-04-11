@@ -6,6 +6,7 @@ import itertools
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError, meta, nodes
@@ -314,6 +315,132 @@ def _describe_template_render_error(phase_id: str, field_name: str, exc: Excepti
 
 
 @dataclass
+class AnalysisConfig:
+    """Configuration for a dynamic analysis phase."""
+
+    captain_backend: str = "claude"
+    worker_backend: str = "codex"
+    verifier_backend: str = "claude"
+    max_workers: int = 4
+    max_verifiers: int = 8
+    interaction_timeout: float = 3.0
+    max_worker_retries: int = 2
+    max_captain_repairs: int = 2
+    allow_repo_tools: bool = True
+
+
+_ANALYSIS_BACKENDS = {"claude", "codex"}
+_ANALYSIS_CONFIG_KEYS = {
+    "captain_backend",
+    "worker_backend",
+    "verifier_backend",
+    "max_workers",
+    "max_verifiers",
+    "interaction_timeout",
+    "max_worker_retries",
+    "max_captain_repairs",
+    "allow_repo_tools",
+}
+
+
+def _parse_analysis_backend(value: Any, *, phase_id: str, field_name: str) -> str:
+    """Validate an analysis backend name."""
+    if not isinstance(value, str):
+        raise ValueError(f"Phase '{phase_id}': analysis.{field_name} must be a string")
+    if value not in _ANALYSIS_BACKENDS:
+        raise ValueError(
+            f"Phase '{phase_id}': analysis.{field_name} must be one of {sorted(_ANALYSIS_BACKENDS)}, got {value!r}"
+        )
+    return value
+
+
+def _parse_analysis_int(value: Any, *, phase_id: str, field_name: str, minimum: int = 0) -> int:
+    """Validate an integer analysis setting."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Phase '{phase_id}': analysis.{field_name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"Phase '{phase_id}': analysis.{field_name} must be >= {minimum}, got {value}")
+    return value
+
+
+def _parse_analysis_float(value: Any, *, phase_id: str, field_name: str, minimum: float = 0.0) -> float:
+    """Validate a floating-point analysis setting."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Phase '{phase_id}': analysis.{field_name} must be a number")
+    value = float(value)
+    if value <= minimum:
+        raise ValueError(f"Phase '{phase_id}': analysis.{field_name} must be > {minimum}, got {value}")
+    return value
+
+
+def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> AnalysisConfig | None:
+    """Parse the nested analysis config from YAML."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"Phase '{phase_id}': analysis must be a mapping")
+
+    unknown = set(raw.keys()) - _ANALYSIS_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"Phase '{phase_id}': analysis has unknown keys {sorted(unknown)}")
+
+    defaults = AnalysisConfig()
+    captain_backend = _parse_analysis_backend(
+        raw.get("captain_backend", defaults.captain_backend),
+        phase_id=phase_id,
+        field_name="captain_backend",
+    )
+    worker_backend = _parse_analysis_backend(
+        raw.get("worker_backend", defaults.worker_backend),
+        phase_id=phase_id,
+        field_name="worker_backend",
+    )
+    verifier_backend = _parse_analysis_backend(
+        raw.get("verifier_backend", defaults.verifier_backend),
+        phase_id=phase_id,
+        field_name="verifier_backend",
+    )
+    max_workers = _parse_analysis_int(
+        raw.get("max_workers", defaults.max_workers), phase_id=phase_id, field_name="max_workers", minimum=1
+    )
+    max_verifiers = _parse_analysis_int(
+        raw.get("max_verifiers", defaults.max_verifiers), phase_id=phase_id, field_name="max_verifiers", minimum=1
+    )
+    interaction_timeout = _parse_analysis_float(
+        raw.get("interaction_timeout", defaults.interaction_timeout),
+        phase_id=phase_id,
+        field_name="interaction_timeout",
+    )
+    max_worker_retries = _parse_analysis_int(
+        raw.get("max_worker_retries", defaults.max_worker_retries),
+        phase_id=phase_id,
+        field_name="max_worker_retries",
+        minimum=0,
+    )
+    max_captain_repairs = _parse_analysis_int(
+        raw.get("max_captain_repairs", defaults.max_captain_repairs),
+        phase_id=phase_id,
+        field_name="max_captain_repairs",
+        minimum=0,
+    )
+    allow_repo_tools = raw.get("allow_repo_tools", defaults.allow_repo_tools)
+    if not isinstance(allow_repo_tools, bool):
+        raise ValueError(f"Phase '{phase_id}': analysis.allow_repo_tools must be a boolean")
+
+    return AnalysisConfig(
+        captain_backend=captain_backend,
+        worker_backend=worker_backend,
+        verifier_backend=verifier_backend,
+        max_workers=max_workers,
+        max_verifiers=max_verifiers,
+        interaction_timeout=interaction_timeout,
+        max_worker_retries=max_worker_retries,
+        max_captain_repairs=max_captain_repairs,
+        allow_repo_tools=allow_repo_tools,
+    )
+
+
+@dataclass
 class Phase:
     """A single phase in the workflow pipeline.
 
@@ -321,10 +448,11 @@ class Phase:
     - "implement": agentic implementation (default)
     - "check": agentic checker (parses VERDICT)
     - "workflow": sub-workflow (dynamic via prompt, or static via workflow_file/workflow_dir)
+    - "analysis": dynamic captain/worker/verifier analysis
     """
 
     id: str
-    type: str = "implement"  # "implement", "check", "workflow"
+    type: str = "implement"  # "implement", "check", "workflow", "analysis"
     prompt: str = ""  # for implement, check, and workflow (dynamic)
     role: str | None = None  # built-in role name for check
     bounce_target: str | None = None  # fixed phase to bounce back to on failure
@@ -335,6 +463,7 @@ class Phase:
     max_depth: int | None = None  # recursion depth limit for workflow phases
     workflow_file: str | None = None  # path to static sub-workflow YAML (resolved at load time)
     workflow_dir: str | None = None  # path to static sub-workflow directory (resolved at load time)
+    analysis: AnalysisConfig | None = None  # nested analysis runner config
     template_vars: dict[str, str] = field(default_factory=dict)  # per-phase Jinja2 variables from expansion
 
     def _render_text(self, text: str, vars: dict[str, str] | None = None) -> str:
@@ -488,6 +617,7 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         "type",
         "prompt",
         "prompt_file",
+        "analysis",
         "role",
         "bounce_target",
         "bounce_targets",
@@ -535,6 +665,12 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
             raise ValueError(
                 f"Phase '{phase_data['id']}': type 'script' is no longer supported; use type 'check' with a prompt"
             )
+        if phase_type == "analysis" and "checks" in phase_data:
+            raise ValueError(f"Phase '{phase_data['id']}': analysis phases do not support 'checks'")
+
+        analysis_config = _parse_analysis_config(phase_data.get("analysis"), phase_id=phase_data["id"])
+        if phase_type == "analysis" and analysis_config is None:
+            analysis_config = AnalysisConfig()
 
         phase = Phase(
             id=phase_data["id"],
@@ -549,6 +685,7 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
             max_depth=phase_data.get("max_depth"),
             workflow_file=wf_file,
             workflow_dir=wf_dir,
+            analysis=analysis_config,
         )
         phases.append(phase)
 
@@ -896,7 +1033,7 @@ def make_command_check_prompt(command: str) -> str:
     )
 
 
-VALID_PHASE_TYPES = {"implement", "check", "workflow"}
+VALID_PHASE_TYPES = {"implement", "check", "workflow", "analysis"}
 VALID_ROLES = {
     "tester",
     "architect",
@@ -1053,6 +1190,7 @@ def inject_implementer(workflow: Workflow, role: str) -> Workflow:
                 max_depth=phase.max_depth,
                 workflow_file=phase.workflow_file,
                 workflow_dir=phase.workflow_dir,
+                analysis=phase.analysis,
                 template_vars=dict(phase.template_vars),
             )
         new_phases.append(phase)
@@ -1190,6 +1328,7 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
                     max_depth=phase.max_depth,
                     workflow_file=phase.workflow_file,
                     workflow_dir=phase.workflow_dir,
+                    analysis=phase.analysis,
                     template_vars=new_template_vars,
                 )
                 new_phases.append(new_phase)
@@ -1222,12 +1361,14 @@ def validate_workflow(workflow: Workflow) -> list[str]:
     - bounce_target references existing phase IDs
     - implement phases have a prompt
     - check phases have a prompt or role
+    - analysis phases have a prompt and valid analysis config
     - Parallel group phase IDs reference existing phases
     - Check phases with roles reference valid built-in roles
     """
     errors: list[str] = []
     phase_ids = set()
     all_ids = {p.id for p in workflow.phases}
+    phase_by_id = {p.id: p for p in workflow.phases}
 
     for phase in workflow.phases:
         # Duplicate ID check
@@ -1261,8 +1402,54 @@ def validate_workflow(workflow: Workflow) -> list[str]:
                 errors.append(f"Phase {phase.id!r}: workflow_file and workflow_dir are mutually exclusive")
             if phase.role:
                 errors.append(f"Phase {phase.id!r}: workflow phase must not have 'role'")
+        if phase.type == "analysis":
+            if not phase.prompt:
+                errors.append(f"Phase {phase.id!r}: analysis phase has no prompt")
+            if phase.bounce_target:
+                errors.append(f"Phase {phase.id!r}: analysis phase must not have 'bounce_target'")
+            if phase.bounce_targets:
+                errors.append(f"Phase {phase.id!r}: analysis phase must not have 'bounce_targets'")
+            if phase.workflow_file or phase.workflow_dir:
+                errors.append(f"Phase {phase.id!r}: analysis phase must not have workflow_file or workflow_dir")
+            if phase.role:
+                errors.append(f"Phase {phase.id!r}: analysis phase must not have 'role'")
+
+            analysis = phase.analysis or AnalysisConfig()
+            if analysis.captain_backend not in _ANALYSIS_BACKENDS:
+                errors.append(
+                    f"Phase {phase.id!r}: analysis.captain_backend must be one of "
+                    f"{sorted(_ANALYSIS_BACKENDS)}, got {analysis.captain_backend!r}"
+                )
+            if analysis.worker_backend not in _ANALYSIS_BACKENDS:
+                errors.append(
+                    f"Phase {phase.id!r}: analysis.worker_backend must be one of "
+                    f"{sorted(_ANALYSIS_BACKENDS)}, got {analysis.worker_backend!r}"
+                )
+            if analysis.verifier_backend not in _ANALYSIS_BACKENDS:
+                errors.append(
+                    f"Phase {phase.id!r}: analysis.verifier_backend must be one of "
+                    f"{sorted(_ANALYSIS_BACKENDS)}, got {analysis.verifier_backend!r}"
+                )
+            if analysis.max_workers < 1:
+                errors.append(f"Phase {phase.id!r}: analysis.max_workers must be >= 1, got {analysis.max_workers}")
+            if analysis.max_verifiers < 1:
+                errors.append(f"Phase {phase.id!r}: analysis.max_verifiers must be >= 1, got {analysis.max_verifiers}")
+            if analysis.interaction_timeout <= 0:
+                errors.append(
+                    f"Phase {phase.id!r}: analysis.interaction_timeout must be > 0, got {analysis.interaction_timeout}"
+                )
+            if analysis.max_worker_retries < 0:
+                errors.append(
+                    f"Phase {phase.id!r}: analysis.max_worker_retries must be >= 0, got {analysis.max_worker_retries}"
+                )
+            if analysis.max_captain_repairs < 0:
+                errors.append(
+                    f"Phase {phase.id!r}: analysis.max_captain_repairs must be >= 0, got {analysis.max_captain_repairs}"
+                )
         if phase.type != "workflow" and (phase.workflow_file or phase.workflow_dir):
             errors.append(f"Phase {phase.id!r}: workflow_file/workflow_dir only allowed on workflow phases")
+        if phase.type != "analysis" and phase.analysis is not None:
+            errors.append(f"Phase {phase.id!r}: analysis config is only allowed on analysis phases")
         if phase.max_depth is not None and phase.max_depth < 1:
             errors.append(f"Phase {phase.id!r}: max_depth must be >= 1, got {phase.max_depth}")
 
@@ -1279,6 +1466,9 @@ def validate_workflow(workflow: Workflow) -> list[str]:
         for pid in group.all_phase_ids():
             if pid not in all_ids:
                 errors.append(f"Parallel group {i}: phase ID {pid!r} does not match any phase")
+                continue
+            if phase_by_id[pid].type == "analysis":
+                errors.append(f"Parallel group {i}: analysis phase {pid!r} is not allowed in parallel_groups")
 
         if group.is_lane_group():
             # Lane-specific validation
@@ -1300,7 +1490,7 @@ def validate_workflow(workflow: Workflow) -> list[str]:
                 for pid in lane:
                     if pid not in all_ids:
                         continue
-                    phase = next(p for p in workflow.phases if p.id == pid)
+                    phase = phase_by_id[pid]
                     if phase.bounce_target and phase.bounce_target not in lane_set:
                         errors.append(
                             f"Parallel group {i}, lane {li}: phase {pid!r} bounce_target "
@@ -1359,7 +1549,7 @@ def validate_workflow(workflow: Workflow) -> list[str]:
             continue
 
         try:
-            if phase.type == "implement":
+            if phase.type in {"implement", "analysis"}:
                 phase.render_prompt(vars=workflow.vars)
             elif phase.type == "check" and phase.prompt:
                 phase._render_text(phase.prompt, vars=workflow.vars)
