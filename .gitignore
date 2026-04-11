@@ -12,4 +12,3 @@ venv/
 .ruff_cache/
 *.juvenal-state.json
 .plan/
-workflows/

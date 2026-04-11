@@ -1,0 +1,165 @@
+name: bug-bounty
+backend: codex
+
+vars:
+  REPO: ""               # Repository name or clone URL (e.g. "curl/curl" or "https://github.com/curl/curl")
+  BOUNTY_SCOPE: ""        # Bug bounty scope document: what is in-scope and out-of-scope
+
+phases:
+  - id: hunt-bugs
+    type: analysis
+    prompt: |
+      You are performing a bug-bounty-style analysis of the open-source project: {{ REPO }}
+
+      ## Bug bounty scope
+
+      {{ BOUNTY_SCOPE }}
+
+      ## Mission
+
+      Find real, reproducible bugs in this codebase. The bar is a working proof of concept (PoC),
+      not a theoretical concern. Every claim you advance must be something a maintainer could
+      reproduce by following concrete steps.
+
+      ### What counts
+
+      - Memory safety bugs (buffer overflows, use-after-free, double-free, uninitialized reads)
+      - Logic errors that violate documented invariants or produce incorrect results
+      - Injection and input-validation failures (command injection, SQL injection, path traversal, XSS, SSRF)
+      - Authentication and authorization bypasses
+      - Cryptographic misuse (weak primitives, nonce reuse, timing side-channels, improper key handling)
+      - Race conditions and TOCTOU bugs with observable impact
+      - Denial-of-service via algorithmic complexity, resource exhaustion, or crash-inducing input
+      - Information disclosure (secrets leaked in logs/errors, unintended data exposure)
+      - Deserialization and type confusion bugs
+
+      ### What does NOT count
+
+      - Stylistic issues, missing documentation, code-quality complaints
+      - Theoretical attack surfaces with no concrete path from attacker-controlled input to impact
+      - Bugs in test code, examples, or vendored third-party dependencies (unless the scope document says otherwise)
+      - Findings that are explicitly listed as out-of-scope in the bounty scope above
+
+      ### Captain guidance
+
+      You are the strategic coordinator. Your job is to build a mental model of the project's
+      architecture and attack surface, then decompose it into bounded investigation targets that
+      workers can execute independently.
+
+      Prioritize:
+      1. Code that parses, deserializes, or decodes untrusted input (network, file, IPC, env)
+      2. Boundaries where privilege level changes (auth checks, permission gates, sandboxing)
+      3. State machines and concurrency primitives (locks, atomics, async callbacks)
+      4. Allocation and lifetime management in unsafe/native code
+      5. Integration points with external systems (databases, filesystems, subprocesses, DNS, HTTP)
+
+      Start with entry-point enumeration and module-level surveys of the most exposed subsystems,
+      then narrow to function-level and data-flow targets as evidence accumulates.
+
+      Adapt aggressively: if a subsystem yields repeated no-findings or rejections, deprioritize it
+      and pivot to unexplored attack surface. If a verified claim opens a new seam, follow it.
+
+      ### Worker guidance — PoCs are mandatory
+
+      Workers: you are investigators, not theorists. Your job is to find concrete bugs and prove
+      they are real. Every claim you submit MUST include a proof of concept.
+
+      **What a PoC means:**
+      - A specific sequence of steps, inputs, or commands that triggers the bug
+      - For memory bugs: a crafted input or call sequence that causes the corruption, ideally
+        observable under AddressSanitizer, Valgrind, or a debugger
+      - For logic bugs: a concrete test case showing incorrect output vs. expected output
+      - For injection/validation bugs: an actual malicious input string and the code path it takes
+      - For race conditions: a reproduction script or interleaving description that triggers the race
+      - For crashes/DoS: a minimal input or request that causes the crash or resource exhaustion
+
+      **PoC requirements:**
+      - Write the PoC as a script, test case, or step-by-step command sequence in your report
+      - Record the PoC commands in `commands_run`
+      - If you ran the PoC and it triggered the bug, say so and include the output
+      - If the environment prevents running the PoC (no build toolchain, missing dependencies),
+        write the PoC anyway and note the blocker — the verifier will attempt to run it
+      - A claim without a PoC is incomplete. If you cannot construct a PoC, your confidence should
+        be `low` and you should explain in `reasoning` exactly why a PoC was not possible
+
+      **Why PoCs matter:**
+      Static code reading alone produces false positives. Guards, sanitizers, type constraints,
+      and caller-side preconditions are easy to miss. A PoC that actually triggers the bug is the
+      difference between a real finding and a wasted cycle. The verifier will attempt to reproduce
+      your PoC independently — if it does not reproduce, the claim will be rejected.
+
+      Do not submit theoretical "this could be a bug" claims. Either prove it or return `no_findings`.
+
+      ### Verifier guidance — reproduce the PoC, then judge
+
+      Verifiers: you are the last gate. A claim reaches you with an assertion, code locations,
+      and (critically) a proof of concept. Your job is to independently verify the bug is real.
+
+      **Verification protocol:**
+      1. Read the cited code locations yourself. Do not trust the worker's description of what the
+         code does — read it and form your own understanding.
+      2. Check for guards, sanitizers, type constraints, or caller-side preconditions that would
+         prevent the alleged bug from being reachable.
+      3. Locate the worker's PoC. Attempt to run it or, if the environment does not permit
+         execution, carefully trace the PoC through the code to determine whether it would trigger
+         the alleged behavior.
+      4. If the PoC reproduces the bug (or you can confirm by code tracing that it would): PASS.
+      5. If the PoC does not reproduce, or you find a guard/sanitizer that blocks the path: REJECT
+         with the appropriate rejection class.
+      6. If no PoC was provided at all, reject with `insufficient-evidence` — a claim without a
+         PoC has not met the evidence bar.
+
+      **Why PoC verification is critical:**
+      Workers operate on bounded context and can miss project-wide invariants. A PoC is the
+      empirical test of the worker's static understanding. When a PoC fails, it usually means
+      the worker missed a guard or misread the data flow. When a PoC succeeds, the finding is
+      almost certainly real. PoC reproduction is what separates verified bugs from false positives.
+
+      Reject aggressively. A real bug will survive scrutiny. A false positive wastes everyone's time.
+
+    analysis:
+      captain_backend: claude
+      worker_backend: codex
+      verifier_backend: claude
+      max_workers: 4
+      max_verifiers: 8
+      interaction_timeout: 3.0
+      max_worker_retries: 2
+      max_captain_repairs: 2
+      allow_repo_tools: true
+
+  - id: summarize-findings
+    prompt: |
+      Read `.juvenal-state-hunt-bugs-analysis.json` and write `bug-bounty-report.md`.
+
+      Target repository: {{ REPO }}
+
+      Produce a structured bug bounty report with these sections:
+
+      ## Verified Findings
+
+      For each verified finding:
+      - **Title**: one-line summary
+      - **Severity**: critical / high / medium / low
+      - **Location**: primary file and line
+      - **Description**: what the bug is and why it matters
+      - **Proof of Concept**: the reproduction steps or script
+      - **Impact**: what an attacker can achieve
+
+      ## Rejected Claims
+
+      Briefly list claims that were rejected and why (e.g., guard found, precondition not met).
+      This helps avoid duplicate investigation in future runs.
+
+      ## Incomplete Targets
+
+      List any targets that were blocked, exhausted, or returned no findings, with brief notes
+      on what was tried and why investigation stalled.
+
+      ## Recommendations
+
+      - Suggested next investigation areas based on open questions
+      - Subsystems that were not fully explored
+      - Any patterns observed across multiple findings
+
+      If the run produced no verified findings, state that clearly and explain what was investigated.
