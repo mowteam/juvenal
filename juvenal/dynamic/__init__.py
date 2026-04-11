@@ -8,10 +8,12 @@ from juvenal.dynamic.protocol import (
     parse_worker_output,
     validate_target_scope,
 )
+from juvenal.dynamic.state import DynamicSessionState
 
 __all__ = [
     "ClaimRecord",
     "CodeLocation",
+    "DynamicSessionState",
     "UserDirective",
     "VerificationRecord",
     "WorkerReport",
