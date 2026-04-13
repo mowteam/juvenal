@@ -229,7 +229,8 @@ class PipelineState:
                 continue
             detail_table, summary = result
             console.print()
-            console.print(Panel(detail_table, title=f"[cyan]{pid}[/] Analysis Detail", border_style="dim"))
+            title = f"[cyan]{pid}[/] Analysis Detail (captain turn {summary['captain_turns']})"
+            console.print(Panel(detail_table, title=title, border_style="dim"))
             console.print(
                 f"  {summary['total']} targets | "
                 f"{summary['completed']} completed | "
@@ -251,8 +252,6 @@ class PipelineState:
             return None
 
         dss = DynamicSessionState.load(state_path)
-        if not dss.targets:
-            return None
 
         detail = Table(show_header=True, box=SIMPLE, padding=(0, 1))
         detail.add_column("Target", style="cyan")
@@ -289,7 +288,12 @@ class PipelineState:
             "running": 0,
             "claims_verified": 0,
             "claims_rejected": 0,
+            "captain_turns": dss.captain.turn_index,
         }
+
+        if not sorted_targets:
+            detail.add_row("[dim]No targets yet[/dim]", "", "", "")
+            return detail, summary
 
         for target in sorted_targets:
             target_claims = [
