@@ -35,8 +35,16 @@ class TmuxCaptainSession:
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt, encoding="utf-8")
 
+        import shutil
+
+        claude_path = shutil.which("claude") or "claude"
+        # Use a short initial prompt that instructs claude to read the full prompt from the file.
+        # This avoids shell quoting issues with the potentially very long prompt text.
+        read_instruction = f"Read and follow the instructions in {prompt_file} — that is your mission."
         claude_cmd = (
-            f'claude --session-id={self.session_id} --dangerously-skip-permissions --verbose "$(cat {prompt_file})"'
+            f"{claude_path} --session-id={self.session_id}"
+            f" --dangerously-skip-permissions --verbose"
+            f" '{read_instruction}'"
         )
 
         cmd = [
@@ -51,10 +59,18 @@ class TmuxCaptainSession:
         ]
 
         run_env = dict(os.environ)
+        # Allow nested tmux sessions (when juvenal is run from inside tmux)
+        run_env.pop("TMUX", None)
+        run_env.pop("TMUX_PANE", None)
         if env:
             run_env.update(env)
 
-        subprocess.run(cmd, env=run_env, check=True, capture_output=True)
+        result = subprocess.run(cmd, env=run_env, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to start tmux session '{self.session_name}': "
+                f"{result.stderr.strip() or result.stdout.strip() or f'exit code {result.returncode}'}"
+            )
         self._started = True
 
     def inject(self, text: str) -> None:
