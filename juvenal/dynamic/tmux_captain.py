@@ -36,7 +36,6 @@ class TmuxCaptainSession:
         prompt_file.write_text(prompt, encoding="utf-8")
 
         import shutil
-        import time as _time
 
         claude_path = shutil.which("claude") or "claude"
         # Start claude in interactive TUI mode (no positional prompt arg).
@@ -69,13 +68,9 @@ class TmuxCaptainSession:
             )
         self._started = True
 
-        # Claude Code shows a trust prompt on first launch — accept it, then wait for the input prompt
-        _time.sleep(1.5)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", self.session_name, "Enter"],
-            capture_output=True,
-        )
-        _time.sleep(3.0)
+        # Claude Code may show setup dialogs (trust prompt, text style, etc.) before the input prompt.
+        # Poll the pane content and dismiss each dialog until we see the input prompt.
+        self._wait_for_input_prompt()
 
         # Now send the initial mission prompt
         read_instruction = f"Read and follow the instructions in {prompt_file} — that is your mission."
@@ -85,12 +80,58 @@ class TmuxCaptainSession:
         """Send text into the tmux session as if the user typed it."""
         if not self.is_alive():
             return
-        # Use tmux send-keys to inject. Split into lines to avoid issues with long text.
-        for line in text.splitlines():
-            subprocess.run(
-                ["tmux", "send-keys", "-t", self.session_name, line, "Enter"],
-                capture_output=True,
-            )
+        # Send the text, then Enter twice (Claude Code TUI needs double Enter to submit)
+        full_text = text.replace("\n", " ")[:4000]  # Flatten + limit length
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session_name, full_text, "Enter", "Enter"],
+            capture_output=True,
+        )
+
+    def _capture_pane(self) -> str:
+        """Capture the current tmux pane content as plain text."""
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", self.session_name, "-p", "-S", "-30"],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout if result.returncode == 0 else ""
+
+    def _send_key(self, *keys: str) -> None:
+        """Send raw keys to the tmux session."""
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session_name, *keys],
+            capture_output=True,
+        )
+
+    def _wait_for_input_prompt(self, max_attempts: int = 30, interval: float = 2.0) -> None:
+        """Poll the pane and dismiss Claude Code setup dialogs until the input prompt appears."""
+        import time as _time
+
+        for _ in range(max_attempts):
+            _time.sleep(interval)
+            if not self.is_alive():
+                return
+
+            pane = self._capture_pane()
+
+            # Detect the input prompt (❯ or > at start of line)
+            if "❯" in pane or "\n> " in pane:
+                return
+
+            # Trust/accept prompt — select the acceptance option
+            if "Yes, I trust" in pane or "Yes, I accept" in pane:
+                self._send_key("Enter")
+                continue
+
+            # Setup dialogs (text style, getting started, etc.)
+            if "Choose the text style" in pane or "Let's get started" in pane or "Enter to confirm" in pane:
+                self._send_key("Enter")
+                continue
+
+            # If pane has content but no recognizable dialog, send Enter as a generic dismissal
+            if pane.strip():
+                self._send_key("Enter")
+                continue
 
     def is_alive(self) -> bool:
         """Check if the tmux session still exists."""
