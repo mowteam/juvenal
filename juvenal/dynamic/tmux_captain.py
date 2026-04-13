@@ -69,8 +69,15 @@ class TmuxCaptainSession:
             )
         self._started = True
 
-        # Wait for claude TUI to initialize, then send the initial prompt
-        _time.sleep(2.0)
+        # Claude Code shows a trust prompt on first launch — accept it, then wait for the input prompt
+        _time.sleep(1.5)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session_name, "Enter"],
+            capture_output=True,
+        )
+        _time.sleep(3.0)
+
+        # Now send the initial mission prompt
         read_instruction = f"Read and follow the instructions in {prompt_file} — that is your mission."
         self.inject(read_instruction)
 
