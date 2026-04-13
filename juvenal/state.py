@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import RLock
 
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 
@@ -27,6 +28,8 @@ class PhaseState:
     input_tokens: int = 0
     output_tokens: int = 0
     baseline_sha: str | None = None  # git HEAD before first implement run
+    phase_type: str | None = None  # "implement", "check", "workflow", "analysis"
+    analysis_state_file: str | None = None  # child state file for analysis phases
 
 
 @dataclass
@@ -188,11 +191,13 @@ class PipelineState:
                     input_tokens=pdata.get("input_tokens", 0),
                     output_tokens=pdata.get("output_tokens", 0),
                     baseline_sha=pdata.get("baseline_sha"),
+                    phase_type=pdata.get("phase_type"),
+                    analysis_state_file=pdata.get("analysis_state_file"),
                 )
         return state
 
     def print_status(self) -> None:
-        """Print a Rich-formatted status table."""
+        """Print a Rich-formatted status table with analysis sub-detail."""
         console = Console()
         table = Table(title="Juvenal Pipeline Status")
         table.add_column("Phase", style="cyan")
@@ -215,6 +220,134 @@ class PipelineState:
 
         console.print(table)
 
+        # Render analysis sub-detail for each analysis phase
+        for pid, ps in self.phases.items():
+            if ps.phase_type != "analysis" or not ps.analysis_state_file:
+                continue
+            result = self._render_analysis_detail(ps.analysis_state_file)
+            if result is None:
+                continue
+            detail_table, summary = result
+            console.print()
+            console.print(Panel(detail_table, title=f"[cyan]{pid}[/] Analysis Detail", border_style="dim"))
+            console.print(
+                f"  {summary['total']} targets | "
+                f"{summary['completed']} completed | "
+                f"{summary['blocked']} blocked/exhausted | "
+                f"{summary['verifying']} verifying | "
+                f"{summary['running']} running | "
+                f"{summary['claims_verified']} claims verified | "
+                f"{summary['claims_rejected']} claims rejected"
+            )
+
+    def _render_analysis_detail(self, analysis_state_file: str) -> tuple[Table, dict[str, int]] | None:
+        """Load analysis child state and render a nested detail table."""
+        from rich.box import SIMPLE
+
+        from juvenal.dynamic.state import DynamicSessionState
+
+        state_path = self.state_file.parent / analysis_state_file
+        if not state_path.exists():
+            return None
+
+        dss = DynamicSessionState.load(state_path)
+        if not dss.targets:
+            return None
+
+        detail = Table(show_header=True, box=SIMPLE, padding=(0, 1))
+        detail.add_column("Target", style="cyan")
+        detail.add_column("Status")
+        detail.add_column("Gen", justify="right")
+        detail.add_column("Claims")
+
+        _target_styles = {
+            "completed": "green",
+            "running": "yellow",
+            "verifying": "blue",
+            "queued": "dim",
+            "no_findings": "dim green",
+            "blocked": "red",
+            "exhausted": "dim red",
+            "deferred": "dim yellow",
+            "requeue_pending": "yellow",
+        }
+        _claim_styles = {
+            "verified": "green",
+            "rejected": "red",
+            "verifying": "blue",
+            "proposed": "dim",
+            "superseded": "dim",
+        }
+
+        sorted_targets = sorted(dss.targets.values(), key=lambda t: (-t.priority, t.created_at, t.target_id))
+
+        summary: dict[str, int] = {
+            "total": len(sorted_targets),
+            "completed": 0,
+            "blocked": 0,
+            "verifying": 0,
+            "running": 0,
+            "claims_verified": 0,
+            "claims_rejected": 0,
+        }
+
+        for target in sorted_targets:
+            target_claims = [
+                c
+                for c in dss.claims.values()
+                if c.target_id == target.target_id and c.generation == target.active_generation
+            ]
+            # Filter to leaf claims for summary counts
+            superseded_ids: set[str] = set()
+            for c in target_claims:
+                if c.retry_of_claim_id is not None:
+                    superseded_ids.add(c.retry_of_claim_id)
+            leaf_claims = [c for c in target_claims if c.claim_id not in superseded_ids]
+
+            n_verified = sum(1 for c in leaf_claims if c.status == "verified")
+            n_rejected = sum(1 for c in leaf_claims if c.status == "rejected")
+            n_pending = sum(1 for c in leaf_claims if c.status in ("proposed", "verifying"))
+
+            if leaf_claims:
+                claims_text = f"{n_verified} verified  {n_rejected} rejected  {n_pending} pending"
+            elif target.status == "running":
+                claims_text = "(worker active)"
+            else:
+                claims_text = "-"
+
+            target_style = _target_styles.get(target.status, "dim")
+            detail.add_row(
+                (target.title or target.target_id)[:50],
+                f"[{target_style}]{target.status}[/]",
+                str(target.active_generation or target.generation),
+                claims_text,
+            )
+
+            # Claim detail rows
+            for claim in leaf_claims:
+                claim_style = _claim_styles.get(claim.status, "dim")
+                retry_text = f" retry {claim.retry_count}" if claim.retry_count > 0 else ""
+                detail.add_row(
+                    f"  [dim]{claim.summary[:45]}[/dim]",
+                    f"[{claim_style}]{claim.status}[/]",
+                    "",
+                    f"[dim]{claim.severity}{retry_text}[/dim]",
+                )
+
+            # Update summary counters
+            if target.status == "completed":
+                summary["completed"] += 1
+            elif target.status in ("blocked", "exhausted"):
+                summary["blocked"] += 1
+            elif target.status == "verifying":
+                summary["verifying"] += 1
+            elif target.status == "running":
+                summary["running"] += 1
+            summary["claims_verified"] += n_verified
+            summary["claims_rejected"] += n_rejected
+
+        return detail, summary
+
     def _ensure_phase(self, phase_id: str) -> PhaseState:
         if phase_id not in self.phases:
             self.phases[phase_id] = PhaseState(phase_id=phase_id)
@@ -235,6 +368,8 @@ class PipelineState:
                     "input_tokens": ps.input_tokens,
                     "output_tokens": ps.output_tokens,
                     "baseline_sha": ps.baseline_sha,
+                    "phase_type": ps.phase_type,
+                    "analysis_state_file": ps.analysis_state_file,
                 }
                 for pid, ps in self.phases.items()
             },

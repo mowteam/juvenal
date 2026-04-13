@@ -318,3 +318,115 @@ class TestCorruptedState:
 
         with pytest.raises(json.JSONDecodeError):
             PipelineState.load(state_file)
+
+
+class TestAnalysisStatusDisplay:
+    def test_phase_type_persists(self, tmp_path):
+        """phase_type and analysis_state_file survive save/load."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        ps = state._ensure_phase("analyze")
+        ps.phase_type = "analysis"
+        ps.analysis_state_file = ".juvenal-state-analyze-analysis.json"
+        state.save()
+
+        loaded = PipelineState.load(state_file)
+        assert loaded.phases["analyze"].phase_type == "analysis"
+        assert loaded.phases["analyze"].analysis_state_file == ".juvenal-state-analyze-analysis.json"
+
+    def test_backward_compat_no_phase_type(self, tmp_path):
+        """Old state files without phase_type load with None defaults."""
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "started_at": None,
+                    "completed_at": None,
+                    "phases": {"build": {"status": "completed", "attempt": 1}},
+                }
+            )
+        )
+        loaded = PipelineState.load(state_file)
+        assert loaded.phases["build"].phase_type is None
+        assert loaded.phases["build"].analysis_state_file is None
+
+    def test_print_status_with_analysis_detail(self, tmp_path):
+        """print_status renders without errors when analysis state exists."""
+        import time
+
+        from juvenal.dynamic.models import ClaimRecord, CodeLocation, TargetRecord
+        from juvenal.dynamic.state import DynamicSessionState
+
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        ps = state._ensure_phase("analyze")
+        ps.phase_type = "analysis"
+        ps.analysis_state_file = ".juvenal-state-analyze-analysis.json"
+        ps.status = "running"
+        ps.started_at = time.time() - 60
+        state.save()
+
+        # Create child analysis state with test data
+        dss = DynamicSessionState(state_file=tmp_path / ".juvenal-state-analyze-analysis.json")
+        now = time.time()
+        dss.targets["t1"] = TargetRecord(
+            target_id="t1",
+            title="input-parser-overflow",
+            kind="module-level",
+            priority=90,
+            status="completed",
+            source="captain",
+            scope_paths=["src/app.py"],
+            scope_symbols=[],
+            instructions="Analyze",
+            depends_on_claim_ids=[],
+            spawn_reason="test",
+            generation=1,
+            active_generation=1,
+            active_attempt_id=None,
+            deferred_until_turn=None,
+            pending_verification_ids=[],
+            accepted_claim_ids=["c1"],
+            rejected_claim_ids=[],
+            created_at=now,
+            updated_at=now,
+        )
+        dss.claims["c1"] = ClaimRecord(
+            claim_id="c1",
+            worker_claim_id="wc1",
+            target_id="t1",
+            attempt_id="a1",
+            generation=1,
+            kind="input-validation",
+            subcategory=None,
+            summary="Missing validation",
+            assertion="No validation",
+            severity="medium",
+            worker_confidence="medium",
+            primary_location=CodeLocation(path="src/app.py", line=10),
+            locations=[],
+            preconditions=[],
+            candidate_code_refs=[],
+            related_claim_ids=[],
+            audit_artifact_id="art1",
+            status="verified",
+            verification_ids=[],
+            rejection_class=None,
+            verified_at=now,
+            rejected_at=None,
+        )
+        dss.save()
+
+        # Should not raise
+        state.print_status()
+
+    def test_print_status_missing_analysis_file(self, tmp_path):
+        """print_status gracefully handles missing analysis state file."""
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        ps = state._ensure_phase("analyze")
+        ps.phase_type = "analysis"
+        ps.analysis_state_file = ".juvenal-state-analyze-analysis.json"
+        state.save()
+        # Don't create the child file — should not raise
+        state.print_status()

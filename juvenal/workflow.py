@@ -319,7 +319,7 @@ class AnalysisConfig:
     """Configuration for a dynamic analysis phase."""
 
     captain_backend: str = "claude"
-    worker_backend: str = "codex"
+    worker_backend: str = "claude"
     verifier_backend: str = "claude"
     max_workers: int = 4
     max_verifiers: int = 8
@@ -327,6 +327,7 @@ class AnalysisConfig:
     max_worker_retries: int = 2
     max_captain_repairs: int = 2
     allow_repo_tools: bool = True
+    max_consecutive_errors: int = 5
 
 
 _ANALYSIS_BACKENDS = {"claude", "codex"}
@@ -340,6 +341,7 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_worker_retries",
     "max_captain_repairs",
     "allow_repo_tools",
+    "max_consecutive_errors",
 }
 
 
@@ -533,7 +535,7 @@ class Workflow:
 
     name: str
     phases: list[Phase]
-    backend: str = "codex"
+    backend: str = "claude"
     working_dir: str = "."
     max_bounces: int = 999
     parallel_groups: list[ParallelGroup] = field(default_factory=list)
@@ -706,7 +708,7 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
     return Workflow(
         name=data.get("name", path.stem),
         phases=phases,
-        backend=data.get("backend", "codex"),
+        backend=data.get("backend", "claude"),
         working_dir=data.get("working_dir", "."),
         max_bounces=data.get("max_bounces", data.get("max_retries", 999)),
         parallel_groups=parallel_groups,

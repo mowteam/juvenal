@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
@@ -89,6 +89,7 @@ class TargetRecord:
     rejected_claim_ids: list[str]
     created_at: float
     updated_at: float
+    error_retry_count: int = 0
 
 
 @dataclass
@@ -102,6 +103,7 @@ class WorkerAttempt:
     started_at: float | None
     completed_at: float | None
     error: str = ""
+    retry_claim_id: str | None = None
 
 
 @dataclass
@@ -161,6 +163,9 @@ class ClaimRecord:
     rejection_class: str | None
     verified_at: float | None
     rejected_at: float | None
+    retry_count: int = 0
+    retry_of_claim_id: str | None = None
+    retry_claim_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -232,6 +237,7 @@ class DynamicEvent:
         "claim.proposed",
         "claim.verified",
         "claim.rejected",
+        "claim.retry_scheduled",
         "directive.received",
         "directive.acknowledged",
     ]

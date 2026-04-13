@@ -219,7 +219,8 @@ def test_bootstrap_worker_verifier_pass_and_complete(tmp_path):
     assert any(event.event_type == "target.completed" for event in state.events)
 
 
-def test_verifier_fail_reopens_target_with_new_generation(tmp_path):
+def test_verifier_fail_triggers_claim_scoped_retry(tmp_path):
+    """When a verifier rejects a claim, a scoped retry worker runs for that claim."""
     backend = MockBackend()
     backend.add_role_response(
         "captain",
@@ -237,8 +238,12 @@ def test_verifier_fail_reopens_target_with_new_generation(tmp_path):
             summary="A guard defeats the reported issue.",
         ),
     )
-    backend.add_role_response("captain", output=_captain_output(termination_reason="Retrying the target first."))
-    backend.add_role_response("worker", output=_no_findings_output("target-1-g2-attempt-1", "target-1"))
+    # Captain turn 2: sees claim rejected + retry scheduled
+    backend.add_role_response("captain", output=_captain_output(termination_reason="Claim retry in progress."))
+    # Claim retry worker confirms no findings — original rejection stands
+    retry_attempt_id = "target-1-g1-retry-target-1-g1-claim-c1-1"
+    backend.add_role_response("worker", output=_no_findings_output(retry_attempt_id, "target-1"))
+    # Captain turn 3: sees exhausted target and completes
     backend.add_role_response(
         "captain",
         output=_captain_output(termination_state="complete", termination_reason="Retry produced no findings."),
@@ -247,10 +252,12 @@ def test_verifier_fail_reopens_target_with_new_generation(tmp_path):
     result, state, _ = _run_runner(tmp_path, backend)
 
     assert result.success is True
-    assert state.targets["target-1"].generation == 2
-    assert state.targets["target-1"].active_generation == 2
-    assert state.targets["target-1"].status == "no_findings"
+    # Generation stays at 1 (no generation bump in claim-scoped model)
+    assert state.targets["target-1"].generation == 1
+    assert state.targets["target-1"].active_generation == 1
+    assert state.targets["target-1"].status == "exhausted"
     assert state.claims["target-1-g1-claim-c1"].status == "rejected"
+    # Two worker attempts: original + claim retry
     assert len(state.worker_attempts) == 2
 
 
@@ -622,3 +629,104 @@ def test_wrap_directive_drains_active_work_then_completes(tmp_path):
     assert all('"target_id": "target-2"' not in prompt for prompt in worker_prompts)
     assert state.directives["dir-1"].kind == "wrap"
     assert state.directives["dir-1"].status == "applied"
+
+
+def test_worker_crash_does_not_kill_analysis(tmp_path):
+    """A worker crash blocks the target but other targets can continue."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1"), _target("target-2")]),
+        session_id="captain-s1",
+    )
+    # target-1 worker crashes (exit code 1)
+    backend.add_role_response("worker", output="CRASH", exit_code=1)
+    # target-1 retry also crashes (exhausts budget with max_worker_retries=1)
+    backend.add_role_response("worker", output="CRASH AGAIN", exit_code=1)
+    # target-2 worker succeeds
+    backend.add_role_response("worker", output=_no_findings_output("target-2-g1-attempt-1", "target-2"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    result, state, _ = _run_runner(tmp_path, backend)
+
+    assert result.success is True
+    assert state.targets["target-1"].status == "blocked"
+    assert state.targets["target-2"].status == "no_findings"
+
+
+def test_claim_retry_worker_produces_verified_replacement(tmp_path):
+    """A claim retry worker can produce a new claim that passes verification."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+        session_id="captain-s1",
+    )
+    backend.add_role_response("worker", output=_claim_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "verifier",
+        output=_verification_output(
+            "target-1-g1-claim-c1", "target-1", disposition="rejected", rejection_class="guard-found"
+        ),
+    )
+    # Captain sees the rejection
+    backend.add_role_response("captain", output=_captain_output(termination_reason="Retry in progress."))
+    # Retry worker produces a new claim with stronger evidence
+    retry_attempt_id = "target-1-g1-retry-target-1-g1-claim-c1-1"
+    backend.add_role_response(
+        "worker",
+        output=_claim_output(retry_attempt_id, "target-1", worker_claim_id="c1-retry"),
+    )
+    # Verifier approves the retry claim
+    backend.add_role_response(
+        "verifier",
+        output=_verification_output("target-1-g1-retry-c1-retry", "target-1", disposition="verified"),
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Retry succeeded."),
+    )
+
+    result, state, _ = _run_runner(tmp_path, backend)
+
+    assert result.success is True
+    assert state.targets["target-1"].status == "completed"
+    # Original claim was rejected, retry claim was verified
+    assert state.claims["target-1-g1-claim-c1"].status == "rejected"
+    retry_claim = state.claims.get("target-1-g1-retry-c1-retry")
+    assert retry_claim is not None
+    assert retry_claim.status == "verified"
+    assert retry_claim.retry_of_claim_id == "target-1-g1-claim-c1"
+    assert retry_claim.retry_count == 1
+
+
+def test_consecutive_errors_pause_analysis(tmp_path):
+    """Consecutive infrastructure errors trigger a clean pause (not per-target exhaustion)."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1"), _target("target-2"), _target("target-3")]),
+        session_id="captain-s1",
+    )
+    # All workers crash — 3 initial + retries = at least 5 consecutive errors
+    for _ in range(10):
+        backend.add_role_response("worker", output="CRASH", exit_code=1)
+    # Captain that would normally be called (but won't be reached)
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    result, state, _ = _run_runner(
+        tmp_path,
+        backend,
+        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=2, max_consecutive_errors=3),
+    )
+
+    assert result.success is False
+    assert "consecutive infrastructure errors" in result.failure_context
+    # State was saved — targets still exist for resume
+    assert len(state.targets) == 3

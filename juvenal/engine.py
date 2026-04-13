@@ -538,9 +538,11 @@ class Engine:
 
         failure_context = self.state.get_failure_context(phase.id)
         ps = self.state._ensure_phase(phase.id)
+        ps.phase_type = "analysis"
+        ps.analysis_state_file = str(self._analysis_state_file(phase).name)
         if ps.baseline_sha is None:
             ps.baseline_sha = self._get_git_head()
-            self.state.save()
+        self.state.save()
 
         attempt = (ps.attempt if ps.attempt > 0 else 0) + 1
         self.state.set_attempt(phase.id, attempt)
@@ -1114,7 +1116,7 @@ def _plan_workflow_internal(
     backend_instance: Backend | None = None,
     display: Display | None = None,
     working_dir: str | None = None,
-    backend_name: str = "codex",
+    backend_name: str = "claude",
     plain: bool = False,
     serialize: bool = False,
     depth: int = 0,
@@ -1224,7 +1226,7 @@ def _plan_workflow_internal(
 def plan_workflow(
     goal: str,
     output_path: str,
-    backend_name: str = "codex",
+    backend_name: str = "claude",
     plain: bool = False,
     interactive: bool = False,
     resume: bool = False,

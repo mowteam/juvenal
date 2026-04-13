@@ -39,6 +39,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
     {
         "claim.verified",
         "claim.rejected",
+        "claim.retry_scheduled",
         "target.no_findings",
         "target.blocked",
         "target.exhausted",
@@ -112,6 +113,8 @@ class DynamicAnalysisRunner:
         self._last_review_event_seq = 0
         self._last_reviewed_turn_index = 0
         self._terminal_failure = ""
+        self._pending_claim_retries: list[tuple[str, str]] = []  # [(target_id, claim_id)]
+        self._consecutive_errors = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self._interaction_channel = interaction_channel if interactive else None
@@ -133,6 +136,7 @@ class DynamicAnalysisRunner:
                 self.state = DynamicSessionState(self.state_file)
                 self.state.save()
 
+            self._rebuild_pending_claim_retries()
             self._last_review_event_seq = max((event.seq for event in self.state.events), default=0)
             self._last_reviewed_turn_index = self.state.captain.turn_index
             self._last_review_snapshot = self._review_snapshot()
@@ -338,12 +342,15 @@ class DynamicAnalysisRunner:
         if available <= 0:
             return changed
 
+        # Targets with pending claim retries should be serviced by the retry path, not re-scheduled
+        targets_with_retries = {t for t, _ in self._pending_claim_retries}
         queued_targets = [
             target
             for target in self.state.targets.values()
             if target.status == "queued"
             and not self._is_target_ignored(target)
             and self._dependencies_satisfied(target)
+            and target.target_id not in targets_with_retries
         ]
         queued_targets.sort(key=lambda target: (-target.priority, target.created_at, target.target_id))
 
@@ -354,6 +361,25 @@ class DynamicAnalysisRunner:
             future = self._worker_executor.submit(self._execute_worker_attempt, attempt, prompt)
             self._worker_futures[future] = attempt.attempt_id
             scheduled = True
+
+        # Process pending claim retries within remaining budget
+        available = self.config.max_workers - len(self._worker_futures)
+        if available > 0 and self._pending_claim_retries:
+            retries = self._pending_claim_retries[:available]
+            self._pending_claim_retries = self._pending_claim_retries[available:]
+            for target_id, claim_id in retries:
+                target = self.state.targets.get(target_id)
+                claim = self.state.claims.get(claim_id)
+                if target is None or claim is None or claim.status != "rejected":
+                    continue
+                if self._is_target_ignored(target):
+                    continue
+                attempt = self._start_claim_retry_attempt(target, claim)
+                prompt = self._build_claim_retry_prompt(target, claim, attempt)
+                future = self._worker_executor.submit(self._execute_worker_attempt, attempt, prompt)
+                self._worker_futures[future] = attempt.attempt_id
+                scheduled = True
+
         return changed or scheduled
 
     def _schedule_verifiers(self) -> bool:
@@ -443,7 +469,21 @@ class DynamicAnalysisRunner:
             try:
                 result = future.result()
             except Exception as exc:  # pragma: no cover - defensive, worker wrapper catches normally
-                self._terminal_failure = f"worker future {attempt_id} crashed: {exc}"
+                attempt = self.state.worker_attempts.get(attempt_id)
+                if attempt is not None:
+                    attempt.status = "failed"
+                    attempt.error = f"future crashed: {exc}"
+                    target = self.state.targets.get(attempt.target_id)
+                    if target is not None and target.active_attempt_id == attempt_id:
+                        target.active_attempt_id = None
+                        target.error_retry_count += 1
+                        if target.error_retry_count > self.config.max_worker_retries:
+                            target.status = "blocked"
+                        else:
+                            target.status = "queued"
+                        target.updated_at = time.time()
+                    self.state.save()
+                self._record_infrastructure_error()
                 continue
             self._apply_worker_result(result)
 
@@ -455,7 +495,14 @@ class DynamicAnalysisRunner:
             try:
                 result = future.result()
             except Exception as exc:  # pragma: no cover - defensive, verifier wrapper catches normally
-                self._terminal_failure = f"verifier future {verification_id} crashed: {exc}"
+                verification = self.state.verifications.get(verification_id)
+                if verification is not None:
+                    verification.status = "failed"
+                    verification.error = f"future crashed: {exc}"
+                    claim = self.state.claims.get(verification.claim_id)
+                    target = self.state.targets.get(verification.target_id)
+                    if claim is not None and target is not None:
+                        self._handle_verifier_error(verification, claim, target)
                 continue
             self._apply_verifier_result(result)
 
@@ -572,8 +619,9 @@ class DynamicAnalysisRunner:
         for target in self.state.targets.values():
             if self._is_target_ignored(target) or self._is_terminal_target(target):
                 continue
-            generation = target.active_generation or target.generation or 1
-            remaining += max(0, self.config.max_worker_retries - (generation - 1))
+            for claim in self._active_claims_for_target(target):
+                if claim.status == "rejected":
+                    remaining += max(0, self.config.max_worker_retries - claim.retry_count)
         return remaining
 
     def _persist_directive(self, directive: UserDirective) -> bool:
@@ -914,15 +962,42 @@ class DynamicAnalysisRunner:
             attempt.error = result.error
             if target.active_attempt_id == attempt.attempt_id:
                 target.active_attempt_id = None
+                target.error_retry_count += 1
+                if target.error_retry_count > self.config.max_worker_retries:
+                    target.status = "blocked"
+                    self.state.append_event(
+                        "target.blocked",
+                        target_id=target.target_id,
+                        generation=attempt.generation,
+                        blocker=result.error,
+                    )
+                else:
+                    target.status = "queued"
                 target.updated_at = time.time()
             self.state.save()
-            self._terminal_failure = result.error
+            self._record_infrastructure_error()
             return
 
         report = result.report
         if report is None:
-            self._terminal_failure = "worker finished without a parsed report"
+            attempt.status = "failed"
+            attempt.error = "worker finished without a parsed report"
+            if target.active_attempt_id == attempt.attempt_id:
+                target.active_attempt_id = None
+                target.error_retry_count += 1
+                if target.error_retry_count > self.config.max_worker_retries:
+                    target.status = "blocked"
+                    self.state.append_event(
+                        "target.blocked",
+                        target_id=target.target_id,
+                        generation=attempt.generation,
+                        blocker=attempt.error,
+                    )
+                else:
+                    target.status = "queued"
+                target.updated_at = time.time()
             self.state.save()
+            self._record_infrastructure_error()
             return
         if report.task_id != attempt.attempt_id or report.target_id != target.target_id:
             attempt.status = "failed"
@@ -930,12 +1005,27 @@ class DynamicAnalysisRunner:
                 f"worker report identity mismatch: expected task {attempt.attempt_id}/{target.target_id}, "
                 f"got {report.task_id}/{report.target_id}"
             )
+            if target.active_attempt_id == attempt.attempt_id:
+                target.active_attempt_id = None
+                target.error_retry_count += 1
+                if target.error_retry_count > self.config.max_worker_retries:
+                    target.status = "blocked"
+                    self.state.append_event(
+                        "target.blocked",
+                        target_id=target.target_id,
+                        generation=attempt.generation,
+                        blocker=attempt.error,
+                    )
+                else:
+                    target.status = "queued"
+                target.updated_at = time.time()
             self.state.save()
-            self._terminal_failure = attempt.error
+            self._record_infrastructure_error()
             return
 
         attempt.status = "completed"
         attempt.error = ""
+        self._record_success()
         if target.active_generation != attempt.generation or target.active_attempt_id != attempt.attempt_id:
             target.active_attempt_id = None
             target.updated_at = time.time()
@@ -944,6 +1034,11 @@ class DynamicAnalysisRunner:
 
         target.active_attempt_id = None
         target.updated_at = time.time()
+
+        # Claim retry worker handling
+        if attempt.retry_claim_id is not None:
+            self._apply_claim_retry_result(target, attempt, report)
+            return
 
         if report.outcome == "no_findings":
             target.status = "no_findings"
@@ -1027,16 +1122,14 @@ class DynamicAnalysisRunner:
         if result.error:
             verification.status = "failed"
             verification.error = result.error
-            self.state.save()
-            self._terminal_failure = result.error
+            self._handle_verifier_error(verification, claim, target)
             return
 
         report = result.report
         if report is None:
             verification.status = "failed"
             verification.error = "verifier finished without a parsed report"
-            self.state.save()
-            self._terminal_failure = verification.error
+            self._handle_verifier_error(verification, claim, target)
             return
 
         if report.claim_id != claim.claim_id or report.target_id != target.target_id or report.raw_json is None:
@@ -1045,9 +1138,11 @@ class DynamicAnalysisRunner:
                 f"verifier report identity mismatch: expected claim {claim.claim_id}/{target.target_id}, "
                 f"got {report.claim_id}/{report.target_id}"
             )
-            self.state.save()
-            self._terminal_failure = verification.error
+            self._handle_verifier_error(verification, claim, target)
             return
+
+        # Verifier returned a valid structured response — reset infrastructure error counter
+        self._record_success()
 
         if target.active_generation != verification.generation:
             verification.status = "superseded"
@@ -1096,29 +1191,88 @@ class DynamicAnalysisRunner:
             generation=verification.generation,
         )
 
-        next_generation = verification.generation + 1
-        if (next_generation - 1) > self.config.max_worker_retries:
-            self._supersede_active_generation(target, rejected_claim_id=claim.claim_id)
-            target.status = "exhausted"
-            target.active_attempt_id = None
-            target.pending_verification_ids = []
-            target.rejected_claim_ids = [claim.claim_id]
-            target.updated_at = time.time()
-            self.state.append_event("target.exhausted", target_id=target.target_id, generation=verification.generation)
+        # Claim-scoped retry: only retry the rejected claim, not the whole target
+        if claim.retry_count < self.config.max_worker_retries:
+            self._pending_claim_retries.append((target.target_id, claim.claim_id))
+            self.state.append_event(
+                "claim.retry_scheduled",
+                target_id=target.target_id,
+                claim_id=claim.claim_id,
+                generation=verification.generation,
+            )
+
+        self._refresh_target_after_verification(target)
+        self.state.save()
+
+    def _apply_claim_retry_result(self, target: TargetRecord, attempt: WorkerAttempt, report: WorkerReport) -> None:
+        """Handle a completed claim retry worker."""
+        original_claim = self.state.claims.get(attempt.retry_claim_id or "")
+
+        if report.outcome in ("no_findings", "blocked"):
+            # Retry worker confirms the claim was false or can't determine — original rejection stands
+            # Consume the retry budget so _refresh_target_after_verification sees it as exhausted
+            if original_claim is not None:
+                original_claim.retry_count += 1
+            self._refresh_target_after_verification(target)
             self.state.save()
             return
 
-        self._supersede_active_generation(target, rejected_claim_id=claim.claim_id)
-        target.generation = next_generation
-        target.active_generation = next_generation
-        target.status = "requeue_pending"
-        target.source = "retry"
-        target.active_attempt_id = None
-        target.deferred_until_turn = None
-        target.pending_verification_ids = []
-        target.accepted_claim_ids = []
-        target.rejected_claim_ids = []
-        target.updated_at = time.time()
+        # outcome == "claims" — create new claims linked to the original
+        now = time.time()
+        generation = attempt.generation
+        for proposed_claim in report.claims:
+            claim_id = f"{target.target_id}-g{generation}-retry-{proposed_claim.worker_claim_id}"
+            artifact_id = f"{claim_id}-artifact"
+            retry_count = (original_claim.retry_count + 1) if original_claim else 1
+            claim = ClaimRecord(
+                claim_id=claim_id,
+                worker_claim_id=proposed_claim.worker_claim_id,
+                target_id=target.target_id,
+                attempt_id=attempt.attempt_id,
+                generation=generation,
+                kind=proposed_claim.kind,
+                subcategory=proposed_claim.subcategory,
+                summary=proposed_claim.summary,
+                assertion=proposed_claim.assertion,
+                severity=proposed_claim.severity,
+                worker_confidence=proposed_claim.worker_confidence,
+                primary_location=proposed_claim.primary_location,
+                locations=list(proposed_claim.locations),
+                preconditions=list(proposed_claim.preconditions),
+                candidate_code_refs=list(proposed_claim.candidate_code_refs),
+                related_claim_ids=list(proposed_claim.related_claim_ids),
+                audit_artifact_id=artifact_id,
+                status="proposed",
+                verification_ids=[],
+                rejection_class=None,
+                verified_at=None,
+                rejected_at=None,
+                retry_count=retry_count,
+                retry_of_claim_id=attempt.retry_claim_id,
+            )
+            artifact = WorkerClaimArtifact(
+                artifact_id=artifact_id,
+                claim_id=claim_id,
+                worker_reasoning=proposed_claim.reasoning,
+                worker_trace=list(proposed_claim.trace),
+                commands_run=list(proposed_claim.commands_run),
+                counterevidence_checked=list(proposed_claim.counterevidence_checked),
+                follow_up_hints=list(proposed_claim.follow_up_hints),
+            )
+            self.state.claims[claim.claim_id] = claim
+            self.state.store_worker_artifact(artifact)
+            self.state.append_event(
+                "claim.proposed",
+                target_id=target.target_id,
+                claim_id=claim.claim_id,
+                generation=generation,
+            )
+            # Link original claim to its retry successor
+            if original_claim is not None:
+                original_claim.retry_claim_ids.append(claim.claim_id)
+            target.updated_at = now
+
+        target.status = "verifying"
         self.state.save()
 
     def _start_worker_attempt(self, target: TargetRecord) -> WorkerAttempt:
@@ -1146,6 +1300,76 @@ class DynamicAnalysisRunner:
         )
         self.state.save()
         return attempt
+
+    def _start_claim_retry_attempt(self, target: TargetRecord, claim: ClaimRecord) -> WorkerAttempt:
+        """Start a worker attempt scoped to retrying a single rejected claim."""
+        generation = target.active_generation or target.generation or 1
+        existing = [
+            a
+            for a in self.state.worker_attempts.values()
+            if a.target_id == target.target_id and a.retry_claim_id == claim.claim_id
+        ]
+        attempt = WorkerAttempt(
+            attempt_id=f"{target.target_id}-g{generation}-retry-{claim.claim_id}-{len(existing) + 1}",
+            target_id=target.target_id,
+            generation=generation,
+            backend=self.config.worker_backend,
+            session_id=None,
+            status="running",
+            started_at=time.time(),
+            completed_at=None,
+            retry_claim_id=claim.claim_id,
+        )
+        target.status = "running"
+        target.active_attempt_id = attempt.attempt_id
+        target.updated_at = time.time()
+        self.state.worker_attempts[attempt.attempt_id] = attempt
+        self.state.save()
+        return attempt
+
+    def _build_claim_retry_prompt(self, target: TargetRecord, claim: ClaimRecord, attempt: WorkerAttempt) -> str:
+        """Build a worker prompt scoped to re-investigating a single rejected claim."""
+        rejection_reason = self._latest_rejection_reason(claim) or "No specific reason provided."
+        verified_siblings = [
+            self._claim_prompt_summary(c)
+            for c in self._active_claims_for_target(target)
+            if c.claim_id != claim.claim_id and c.status == "verified"
+        ]
+        rejected_detail = self._claim_prompt_summary(claim)
+        rejected_detail["rejection_reason"] = rejection_reason
+        rejected_detail["rejection_class"] = claim.rejection_class
+        task_packet = {
+            "task_id": attempt.attempt_id,
+            "target_id": target.target_id,
+            "generation": attempt.generation,
+            "retry_mode": True,
+            "retry_claim_id": claim.claim_id,
+            "retry_attempt": claim.retry_count + 1,
+            "max_retries": self.config.max_worker_retries,
+        }
+        return (
+            f"{self._worker_role_prompt}\n\n"
+            f"Repository root: `{self.working_dir}`\n\n"
+            "## CLAIM RETRY MODE\n\n"
+            "You are re-investigating a SINGLE rejected claim. Do NOT re-report findings that\n"
+            "have already been verified. Focus exclusively on the rejected claim described below.\n\n"
+            "Task packet:\n"
+            f"```text\n{json.dumps(task_packet, indent=2)}\n```\n\n"
+            "Rejected claim to re-investigate:\n"
+            f"```text\n{json.dumps(rejected_detail, indent=2)}\n```\n\n"
+            "Verified claims on this target (for context only — do NOT re-report these):\n"
+            f"```text\n{json.dumps(verified_siblings, indent=2)}\n```\n\n"
+            "Target context:\n"
+            f"```text\n{json.dumps(self._target_prompt_summary(target), indent=2)}\n```\n\n"
+            "Code context pack:\n"
+            f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n\n"
+            "Instructions:\n"
+            "- Re-examine the rejected claim in light of the verifier's feedback\n"
+            "- If the issue is real but the original evidence was insufficient, gather stronger evidence\n"
+            "- If the verifier identified a guard/mitigation, determine if it fully addresses the issue\n"
+            '- If the claim was genuinely false, report outcome: "no_findings"\n'
+            "- Use the same WORKER_JSON_BEGIN/END output format\n"
+        )
 
     def _normalize_captain_targets(self, turn: CaptainTurn) -> list[TargetRecord]:
         now = time.time()
@@ -1201,6 +1425,8 @@ class DynamicAnalysisRunner:
 
     def _has_active_runtime_work(self) -> bool:
         if self._worker_futures or self._verifier_futures:
+            return True
+        if self._pending_claim_retries:
             return True
         for verification in self.state.verifications.values():
             if verification.status not in {"pending", "running"}:
@@ -1316,25 +1542,48 @@ class DynamicAnalysisRunner:
         return payload
 
     def _refresh_target_after_verification(self, target: TargetRecord) -> None:
-        active_claims = [
-            claim
-            for claim in self.state.claims.values()
-            if claim.target_id == target.target_id and claim.generation == target.active_generation
-        ]
-        target.accepted_claim_ids = sorted(claim.claim_id for claim in active_claims if claim.status == "verified")
-        target.rejected_claim_ids = sorted(claim.claim_id for claim in active_claims if claim.status == "rejected")
+        leaf_claims = self._active_claims_for_target(target)
+        target.accepted_claim_ids = sorted(claim.claim_id for claim in leaf_claims if claim.status == "verified")
+        target.rejected_claim_ids = sorted(claim.claim_id for claim in leaf_claims if claim.status == "rejected")
         target.updated_at = time.time()
 
         if target.pending_verification_ids:
             target.status = "verifying"
             return
-        if active_claims and all(claim.status == "verified" for claim in active_claims):
+        if any(claim.status in ("proposed", "verifying") for claim in leaf_claims):
+            target.status = "verifying"
+            return
+        if self._has_active_attempt(target):
+            target.status = "running"
+            return
+        if leaf_claims and all(claim.status == "verified" for claim in leaf_claims):
             target.status = "completed"
             self.state.append_event("target.completed", target_id=target.target_id, generation=target.active_generation)
             return
-        if target.active_attempt_id:
-            target.status = "running"
+
+        # Check for retryable rejected claims
+        retryable = [
+            claim
+            for claim in leaf_claims
+            if claim.status == "rejected"
+            and claim.retry_count < self.config.max_worker_retries
+            and not self._has_pending_retry(claim)
+        ]
+        if retryable:
+            target.status = "queued"
             return
+
+        # Check for exhausted rejected claims (no retries left)
+        exhausted_rejected = [
+            claim
+            for claim in leaf_claims
+            if claim.status == "rejected" and claim.retry_count >= self.config.max_worker_retries
+        ]
+        if exhausted_rejected:
+            target.status = "exhausted"
+            self.state.append_event("target.exhausted", target_id=target.target_id, generation=target.active_generation)
+            return
+
         target.status = "queued"
 
     def _supersede_active_generation(self, target: TargetRecord, *, rejected_claim_id: str) -> None:
@@ -1356,6 +1605,49 @@ class DynamicAnalysisRunner:
                 verification.completed_at = verification.completed_at or time.time()
                 verification.error = "superseded-after-target-requeue"
 
+    def _handle_verifier_error(
+        self, verification: VerificationRecord, claim: ClaimRecord, target: TargetRecord
+    ) -> None:
+        """Handle a verifier crash: retry verification or treat as inconclusive rejection."""
+        target.error_retry_count += 1
+        if verification.verification_id in target.pending_verification_ids:
+            target.pending_verification_ids.remove(verification.verification_id)
+        if target.error_retry_count <= self.config.max_worker_retries:
+            new_verification = VerificationRecord(
+                verification_id=self._next_verification_id(claim.claim_id),
+                claim_id=claim.claim_id,
+                target_id=claim.target_id,
+                generation=verification.generation,
+                backend=self.config.verifier_backend,
+                verifier_role="analysis-verifier",
+                session_id=None,
+                status="pending",
+                disposition=None,
+                reason="",
+                rejection_class=None,
+                raw_output="",
+                started_at=None,
+                completed_at=None,
+            )
+            self.state.verifications[new_verification.verification_id] = new_verification
+            claim.verification_ids.append(new_verification.verification_id)
+            if new_verification.verification_id not in target.pending_verification_ids:
+                target.pending_verification_ids.append(new_verification.verification_id)
+        else:
+            claim.status = "rejected"
+            claim.rejection_class = "verification-error"
+            claim.rejected_at = time.time()
+            self.state.append_event(
+                "claim.rejected",
+                target_id=target.target_id,
+                claim_id=claim.claim_id,
+                generation=verification.generation,
+            )
+            self._refresh_target_after_verification(target)
+        target.updated_at = time.time()
+        self.state.save()
+        self._record_infrastructure_error()
+
     def _latest_rejection_reason(self, claim: ClaimRecord) -> str | None:
         candidates = [
             verification
@@ -1370,6 +1662,50 @@ class DynamicAnalysisRunner:
         )
         return latest.reason
 
+    def _active_claims_for_target(self, target: TargetRecord) -> list[ClaimRecord]:
+        """Return the leaf claims for a target (latest in each retry chain)."""
+        active_claims = [
+            claim
+            for claim in self.state.claims.values()
+            if claim.target_id == target.target_id and claim.generation == target.active_generation
+        ]
+        superseded_ids: set[str] = set()
+        for claim in active_claims:
+            if claim.retry_of_claim_id is not None:
+                superseded_ids.add(claim.retry_of_claim_id)
+        return [claim for claim in active_claims if claim.claim_id not in superseded_ids]
+
+    def _has_pending_retry(self, claim: ClaimRecord) -> bool:
+        """Check if a rejected claim already has a pending retry in the queue or in flight."""
+        if (claim.target_id, claim.claim_id) in [(t, c) for t, c in self._pending_claim_retries]:
+            return True
+        for retry_id in claim.retry_claim_ids:
+            retry_claim = self.state.claims.get(retry_id)
+            if retry_claim is not None and retry_claim.status not in ("rejected", "verified"):
+                return True
+        return False
+
+    def _has_active_attempt(self, target: TargetRecord) -> bool:
+        """Check if the target has an active (running) worker attempt."""
+        if target.active_attempt_id is None:
+            return False
+        attempt = self.state.worker_attempts.get(target.active_attempt_id)
+        return attempt is not None and attempt.status == "running"
+
+    def _rebuild_pending_claim_retries(self) -> None:
+        """Rebuild the in-memory claim retry queue from persisted state (for resume)."""
+        self._pending_claim_retries = []
+        for target in self.state.targets.values():
+            if self._is_target_ignored(target) or target.status in ("completed", "no_findings", "blocked", "exhausted"):
+                continue
+            for claim in self._active_claims_for_target(target):
+                if (
+                    claim.status == "rejected"
+                    and claim.retry_count < self.config.max_worker_retries
+                    and not self._has_pending_retry(claim)
+                ):
+                    self._pending_claim_retries.append((target.target_id, claim.claim_id))
+
     def _is_terminal_target(self, target: TargetRecord) -> bool:
         return target.status not in _NON_TERMINAL_STATUSES
 
@@ -1381,6 +1717,24 @@ class DynamicAnalysisRunner:
             if symbol in target.scope_symbols:
                 return True
         return False
+
+    def _record_infrastructure_error(self) -> None:
+        """Track a worker/verifier infrastructure failure (crash, malformed output, non-zero exit).
+
+        Does NOT count verifier rejections — those are normal operation.
+        When consecutive infrastructure errors hit the threshold, triggers a clean pause
+        so the run can be resumed later (e.g., after API rate limits reset).
+        """
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= self.config.max_consecutive_errors:
+            self._terminal_failure = (
+                f"Pausing: {self._consecutive_errors} consecutive infrastructure errors "
+                f"(likely rate limit or API outage). State saved — resume with --resume."
+            )
+
+    def _record_success(self) -> None:
+        """Reset the consecutive error counter on any successful worker/verifier completion."""
+        self._consecutive_errors = 0
 
     def _dependencies_satisfied(self, target: TargetRecord) -> bool:
         return all(

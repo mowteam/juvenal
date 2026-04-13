@@ -30,6 +30,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
     {
         "claim.verified",
         "claim.rejected",
+        "claim.retry_scheduled",
         "target.no_findings",
         "target.blocked",
         "target.exhausted",
@@ -257,11 +258,12 @@ class DynamicSessionState:
 
             for target in self.targets.values():
                 active_claims = self._active_generation_claims(target)
+                leaf_claims = self._leaf_claims(active_claims)
                 target.accepted_claim_ids = sorted(
-                    claim.claim_id for claim in active_claims if claim.status == "verified"
+                    claim.claim_id for claim in leaf_claims if claim.status == "verified"
                 )
                 target.rejected_claim_ids = sorted(
-                    claim.claim_id for claim in active_claims if claim.status == "rejected"
+                    claim.claim_id for claim in leaf_claims if claim.status == "rejected"
                 )
 
                 if target.status == "deferred":
@@ -270,18 +272,17 @@ class DynamicSessionState:
                 if target.status in _PRESERVED_TARGET_STATUSES:
                     continue
 
-                if target.rejected_claim_ids:
-                    target.status = "requeue_pending"
-                elif (
-                    active_claims
-                    and all(claim.status == "verified" for claim in active_claims)
-                    and not target.pending_verification_ids
-                ):
+                if target.pending_verification_ids:
+                    target.status = "verifying"
+                elif leaf_claims and all(claim.status == "verified" for claim in leaf_claims):
                     target.status = "completed"
-                elif target.pending_verification_ids:
+                elif any(claim.status in ("proposed", "verifying") for claim in leaf_claims):
                     target.status = "verifying"
                 elif self._has_active_attempt(target):
                     target.status = "running"
+                elif target.rejected_claim_ids:
+                    # Rejected claims exist — runner will schedule retries if budget allows
+                    target.status = "queued"
                 else:
                     target.status = "queued"
 
@@ -423,6 +424,14 @@ class DynamicSessionState:
             for claim in self.claims.values()
             if claim.target_id == target.target_id and claim.generation == active_generation
         ]
+
+    def _leaf_claims(self, claims: list[ClaimRecord]) -> list[ClaimRecord]:
+        """Return only the leaf claims in each retry chain (latest retry or never-retried)."""
+        superseded_ids: set[str] = set()
+        for claim in claims:
+            if claim.retry_of_claim_id is not None:
+                superseded_ids.add(claim.retry_of_claim_id)
+        return [claim for claim in claims if claim.claim_id not in superseded_ids]
 
     def _apply_resume_control_rewrite_locked(self, now: float) -> None:
         if not (self.control.stop_requested or self.control.wrap_requested):
