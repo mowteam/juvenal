@@ -150,11 +150,16 @@ class DynamicAnalysisRunner:
                         self.kill_active()
                     return PhaseResult(success=success, failure_context=reason if not success else "")
 
+                # Background work (always runs)
                 made_progress = False
                 made_progress |= self._drain_completed_futures()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
-                made_progress |= self._apply_review_point()
+
+                # Non-interactive: timed review point collects directives on state change
+                # Interactive: directives are collected in _interactive_wait_and_process instead
+                if not self.interactive:
+                    made_progress |= self._apply_review_point()
 
                 terminate, success, reason = self._should_terminate()
                 if terminate:
@@ -166,6 +171,11 @@ class DynamicAnalysisRunner:
                     self._run_captain_turn()
                     made_progress = True
 
+                    # Interactive: after captain turn, wait for user input or results
+                    if self.interactive and self._interaction_channel is not None:
+                        self._interactive_wait_and_process()
+                        continue  # restart loop to drain/schedule/check
+
                 terminate, success, reason = self._should_terminate()
                 if terminate:
                     if not success:
@@ -173,7 +183,11 @@ class DynamicAnalysisRunner:
                     return PhaseResult(success=success, failure_context=reason if not success else "")
 
                 if not made_progress:
-                    time.sleep(_IDLE_SLEEP_SECONDS)
+                    # Interactive: wait for results or user input when idle
+                    if self.interactive and self._interaction_channel is not None:
+                        self._interactive_wait_and_process()
+                    else:
+                        time.sleep(_IDLE_SLEEP_SECONDS)
         finally:
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
@@ -220,12 +234,17 @@ class DynamicAnalysisRunner:
         prompt = self._build_captain_prompt(summary_only=summary_only)
         backend = self._get_backend(self.config.captain_backend)
         session_id = self.state.captain.session_id
+        callback = self._captain_display_callback if self.interactive else None
+
+        if self.interactive:
+            self.display.pause()
 
         if session_id:
             result = backend.resume_agent(
                 session_id,
                 prompt,
                 working_dir=str(self.working_dir),
+                display_callback=callback,
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
             )
@@ -233,6 +252,7 @@ class DynamicAnalysisRunner:
             result = backend.run_agent(
                 prompt,
                 working_dir=str(self.working_dir),
+                display_callback=callback,
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
             )
@@ -1820,6 +1840,61 @@ class DynamicAnalysisRunner:
                 backend = create_backend(name)
                 self._backend_by_name[name] = backend
             return backend
+
+    def _captain_display_callback(self, text: str) -> None:
+        """Stream captain output to terminal in interactive mode."""
+        print(text, end="", flush=True)
+
+    def _interactive_wait_and_process(self) -> None:
+        """Block until user types or worker/verifier results arrive (--interactive only)."""
+        message = self.state.captain.last_message_to_user.strip()
+        if message:
+            print(f"\n[captain] {message}", flush=True)
+
+        counts = self._review_target_counts()
+        print(
+            f"\n[targets: {counts['queued']}q {counts['running']}r {counts['verifying']}v] "
+            "Type a message, /command, or press Enter to continue > ",
+            end="",
+            flush=True,
+        )
+
+        while True:
+            lines = self._interaction_channel.poll(0.5)
+            if lines:
+                for line in lines:
+                    if not line.strip():
+                        return  # Empty enter = advance to next turn
+                    directive_id = self._next_directive_id()
+                    try:
+                        directive = parse_user_directive(line, directive_id=directive_id)
+                    except ValueError:
+                        # Free-form text that doesn't parse as a command — treat as note
+                        directive = UserDirective(
+                            directive_id=directive_id,
+                            kind="note",
+                            text=line.strip(),
+                            status="pending",
+                            created_at=time.time(),
+                            acknowledged_at=None,
+                        )
+                    self._persist_directive(directive)
+                return
+
+            # Check for completed worker/verifier futures
+            has_results = any(f.done() for f in self._worker_futures) or any(f.done() for f in self._verifier_futures)
+            if has_results:
+                print("", flush=True)
+                return
+
+            # Check if captain needs a turn (new delta arrived from background work)
+            if self._needs_captain_turn():
+                print("", flush=True)
+                return
+
+            terminate, _, _ = self._should_terminate()
+            if terminate:
+                return
 
     def _add_tokens(self, result: AgentResult) -> None:
         self.total_input_tokens += result.input_tokens

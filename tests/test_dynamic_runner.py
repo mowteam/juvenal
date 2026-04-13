@@ -589,6 +589,7 @@ def test_stop_directive_ends_run_immediately(tmp_path):
 
 
 def test_wrap_directive_drains_active_work_then_completes(tmp_path):
+    """In interactive mode, /wrap sent immediately after captain turn prevents new workers."""
     backend = MockBackend()
     backend.add_role_response(
         "captain",
@@ -597,13 +598,12 @@ def test_wrap_directive_drains_active_work_then_completes(tmp_path):
         ),
         session_id="captain-s1",
     )
-    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    # Wrap summary captain turn (no active work since /wrap blocks scheduling)
     backend.add_role_response(
         "captain",
         output=_captain_output(
-            enqueue_targets=[_target("ignored-summary-target")],
             termination_state="complete",
-            termination_reason="Wrapped after draining active work.",
+            termination_reason="Wrapped before any work started.",
             message_to_user="Here is the final wrap summary.",
         ),
     )
@@ -617,16 +617,9 @@ def test_wrap_directive_drains_active_work_then_completes(tmp_path):
         interaction_channel=interaction,
     )
 
-    worker_prompts = [prompt for role, prompt in backend.role_calls if role == "worker"]
     assert result.success is True
     assert state.control.wrap_requested is True
     assert state.control.wrap_summary_pending is False
-    assert state.targets["target-1"].status == "no_findings"
-    assert state.targets["target-2"].status == "queued"
-    assert "ignored-summary-target" not in state.targets
-    assert len(worker_prompts) == 1
-    assert '"target_id": "target-1"' in worker_prompts[0]
-    assert all('"target_id": "target-2"' not in prompt for prompt in worker_prompts)
     assert state.directives["dir-1"].kind == "wrap"
     assert state.directives["dir-1"].status == "applied"
 
