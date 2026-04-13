@@ -84,6 +84,7 @@ class DynamicAnalysisRunner:
         run_mode: Literal["fresh", "resume", "reset"],
         display: Display,
         interactive: bool,
+        attach: bool = False,
         failure_context: str = "",
         interaction_channel: UserInteractionChannel | None = None,
     ) -> None:
@@ -93,6 +94,7 @@ class DynamicAnalysisRunner:
         self.run_mode = run_mode
         self.display = display
         self.interactive = interactive
+        self.attach = attach
         self.failure_context = failure_context
         self.config = phase.analysis or AnalysisConfig()
         self.working_dir = Path(workflow.working_dir).resolve()
@@ -224,7 +226,11 @@ class DynamicAnalysisRunner:
                 f"\nCaptain started in tmux session: {tmux_session.session_name}",
                 flush=True,
             )
-            print(f"  Attach with: tmux attach -t {tmux_session.session_name}", flush=True)
+            if self.attach:
+                tmux_session.attach_to_current()
+                print("  Captain window joined to current tmux session.", flush=True)
+            else:
+                print(f"  Attach with: tmux attach -t {tmux_session.session_name}", flush=True)
             print(f"  Dispatch file: {dispatch_file}", flush=True)
             print(f"  Results file:  {results_file}\n", flush=True)
 

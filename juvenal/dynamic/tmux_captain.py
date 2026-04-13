@@ -92,6 +92,22 @@ class TmuxCaptainSession:
         )
         return result.returncode == 0
 
+    def attach_to_current(self) -> None:
+        """Move the captain window into the current tmux session (if inside tmux)."""
+        current_session = os.environ.get("TMUX")
+        if not current_session or not self.is_alive():
+            return
+        # link-window brings the captain window into the current session as a new window
+        subprocess.run(
+            ["tmux", "link-window", "-s", f"{self.session_name}:0", "-a"],
+            capture_output=True,
+        )
+        # Switch to the newly linked window
+        subprocess.run(
+            ["tmux", "select-window", "-t", ":.+"],
+            capture_output=True,
+        )
+
     def kill(self) -> None:
         """Kill the tmux session."""
         subprocess.run(

@@ -78,6 +78,7 @@ class Engine:
         clear_context_on_bounce: bool = False,
         serialize: bool = False,
         interactive: bool = False,
+        attach: bool = False,
         backend_instance: Backend | None = None,
     ):
         self.workflow = workflow
@@ -87,6 +88,7 @@ class Engine:
         self._max_depth = _max_depth
         self.dry_run = dry_run
         self.preserve_context_on_bounce = not clear_context_on_bounce
+        self.attach = attach
         self.serialize = serialize
         self.interactive = interactive
         self._run_intent: Literal["fresh", "resume", "rewind", "rewind-to", "start-phase"] = "fresh"
@@ -559,6 +561,7 @@ class Engine:
             run_mode=run_mode,
             display=self.display,
             interactive=self.interactive,
+            attach=self.attach,
             failure_context=failure_context,
         )
         self._active_dynamic_runner = runner
