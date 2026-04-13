@@ -857,9 +857,12 @@ class DynamicAnalysisRunner:
 
     def _build_verifier_prompt(self, target: TargetRecord, claim: ClaimRecord) -> str:
         packet = asdict(claim_to_verifier_packet(claim))
+        mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         return (
             f"{self._verifier_role_prompt}\n\n"
             f"Repository root: `{self.working_dir}`\n\n"
+            "Mission scope and context (from the analysis phase configuration):\n"
+            f"```text\n{mission}\n```\n\n"
             "Target context:\n"
             f"```text\n{json.dumps(self._target_prompt_summary(target), indent=2)}\n```\n\n"
             "Verified dependencies:\n"
