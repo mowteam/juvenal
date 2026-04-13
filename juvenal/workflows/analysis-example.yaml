@@ -1,5 +1,5 @@
 name: analysis-example
-backend: codex
+backend: claude
 
 phases:
   - id: analyze-repo
@@ -11,7 +11,7 @@ phases:
       Produce bounded targets, investigate them directly, and only advance claims that can be verified.
     analysis:
       captain_backend: claude      # Long-lived captain that discovers and reprioritizes analysis targets.
-      worker_backend: codex        # Fresh backend used for each bounded analysis task.
+      worker_backend: claude       # Fresh backend used for each bounded analysis task.
       verifier_backend: claude     # Independent verifier backend that checks each proposed claim.
       max_workers: 4               # Maximum concurrent worker attempts.
       max_verifiers: 8             # Maximum concurrent verification attempts.

@@ -98,15 +98,17 @@ phases:
       **Verification protocol:**
       1. Read the cited code locations yourself. Do not trust the worker's description of what the
          code does — read it and form your own understanding.
-      2. Check for guards, sanitizers, type constraints, or caller-side preconditions that would
+      2. Ensure the cited code location and bug triggers are within the scope defined at {{ BOUNTY_SCOPE }}.
+         If it is out of scope: REJECT
+      3. Check for guards, sanitizers, type constraints, or caller-side preconditions that would
          prevent the alleged bug from being reachable.
-      3. Locate the worker's PoC. Attempt to run it or, if the environment does not permit
+      4. Locate the worker's PoC. Attempt to run it or, if the environment does not permit
          execution, carefully trace the PoC through the code to determine whether it would trigger
          the alleged behavior.
-      4. If the PoC reproduces the bug (or you can confirm by code tracing that it would): PASS.
-      5. If the PoC does not reproduce, or you find a guard/sanitizer that blocks the path: REJECT
+      5. If the PoC reproduces the bug (or you can confirm by code tracing that it would): PASS.
+      6. If the PoC does not reproduce, or you find a guard/sanitizer that blocks the path: REJECT
          with the appropriate rejection class.
-      6. If no PoC was provided at all, reject with `insufficient-evidence` — a claim without a
+      7. If no PoC was provided at all, reject with `insufficient-evidence` — a claim without a
          PoC has not met the evidence bar.
 
       **Why PoC verification is critical:**
@@ -116,7 +118,9 @@ phases:
       almost certainly real. PoC reproduction is what separates verified bugs from false positives.
 
       Reject aggressively. A real bug will survive scrutiny. A false positive wastes everyone's time.
-
+      
+      **Output**
+      Output a **brief** description of the bug and the PoC into `output/<bug-name>.md` and `output/<bug-name>-poc`, respectively.
     analysis:
       captain_backend: claude
       worker_backend: codex

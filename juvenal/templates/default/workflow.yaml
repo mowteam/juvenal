@@ -1,5 +1,5 @@
 name: "my-workflow"
-backend: codex
+backend: claude
 working_dir: "."
 max_bounces: 999
 

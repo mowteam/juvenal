@@ -995,7 +995,7 @@ def goal(
     description: str,
     *,
     working_dir: str | Path = ".",
-    backend: str | Backend = "codex",
+    backend: str | Backend = "claude",
     max_bounces: int = 999,
     plain: bool = True,
     serialize: bool = False,

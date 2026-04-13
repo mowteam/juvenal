@@ -8,7 +8,7 @@ Guidelines:
 - If a checker should run tests, lint, build, or another command, put those commands in the checker instructions
 - Order phases from setup/scaffolding to implementation to polish
 - Keep prompts specific and actionable
-- Set `backend: codex` unless the user specifies otherwise
+- Set `backend: claude` unless the user specifies otherwise
 
 Output ONLY the workflow.yaml content, no explanation.
 

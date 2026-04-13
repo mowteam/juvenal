@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--rewind-to", metavar="PHASE_ID", help="Rewind to a specific phase by ID")
     run_p.add_argument("--phase", help="Start from a specific phase")
     run_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
-    run_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
+    run_p.add_argument("--backend", choices=["claude", "codex"], default="claude", help="AI backend to use")
     run_p.add_argument("--working-dir", help="Working directory for the agent")
     run_p.add_argument("--state-file", help="Path to state file (default: .juvenal-state.json)")
     run_p.add_argument(
@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p = sub.add_parser("plan", help="Generate a workflow from a goal description")
     plan_p.add_argument("goal", help="Goal description")
     plan_p.add_argument("-o", "--output", default="workflow.yaml", help="Output file (default: workflow.yaml)")
-    plan_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
+    plan_p.add_argument("--backend", choices=["claude", "codex"], default="claude", help="AI backend to use")
     plan_p.add_argument("--checker", action="append", default=[], help=CHECKER_HELP)
     plan_p.add_argument(
         "--standard-checkers",
@@ -97,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     # do
     do_p = sub.add_parser("do", help="Plan + immediately run a workflow")
     do_p.add_argument("goal", help="Goal description")
-    do_p.add_argument("--backend", choices=["claude", "codex"], default="codex", help="AI backend to use")
+    do_p.add_argument("--backend", choices=["claude", "codex"], default="claude", help="AI backend to use")
     do_p.add_argument("--max-bounces", type=int, default=999, help="Max bounces across all phases (default: 999)")
     do_p.add_argument("--checker", action="append", default=[], help=CHECKER_HELP)
     do_p.add_argument(
@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_p.add_argument("workflow", help="Path to workflow YAML, directory, or bare .md file")
     validate_p.add_argument("--max-bounces", type=int, default=999)
-    validate_p.add_argument("--backend", choices=["claude", "codex"], default="codex")
+    validate_p.add_argument("--backend", choices=["claude", "codex"], default="claude")
     validate_p.add_argument("--working-dir")
     validate_p.add_argument("--backoff", type=float, default=None)
     validate_p.add_argument("--notify", action="append", default=[])

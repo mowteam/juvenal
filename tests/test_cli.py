@@ -16,7 +16,7 @@ class TestArgumentParsing:
         args = parser.parse_args(["run", "workflow.yaml"])
         assert args.command == "run"
         assert args.workflow == "workflow.yaml"
-        assert args.backend == "codex"
+        assert args.backend == "claude"
         assert args.max_bounces == 999
         assert not args.resume
 
@@ -450,7 +450,7 @@ phases:
         assert cmd_run(args) == 0
         assert planned_calls == {
             "goal": "Build a multi-step feature",
-            "backend_name": "codex",
+            "backend_name": "claude",
             "interactive": True,
             "resume": False,
             "project_dir": str(project_dir),
