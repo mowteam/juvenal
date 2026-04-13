@@ -36,16 +36,12 @@ class TmuxCaptainSession:
         prompt_file.write_text(prompt, encoding="utf-8")
 
         import shutil
+        import time as _time
 
         claude_path = shutil.which("claude") or "claude"
-        # Use a short initial prompt that instructs claude to read the full prompt from the file.
-        # This avoids shell quoting issues with the potentially very long prompt text.
-        read_instruction = f"Read and follow the instructions in {prompt_file} — that is your mission."
-        claude_cmd = (
-            f"{claude_path} --session-id={self.session_id}"
-            f" --dangerously-skip-permissions --verbose"
-            f" '{read_instruction}'"
-        )
+        # Start claude in interactive TUI mode (no positional prompt arg).
+        # The initial message is sent via send-keys after the session starts.
+        claude_cmd = f"{claude_path} --session-id={self.session_id} --dangerously-skip-permissions --verbose"
 
         cmd = [
             "tmux",
@@ -72,6 +68,11 @@ class TmuxCaptainSession:
                 f"{result.stderr.strip() or result.stdout.strip() or f'exit code {result.returncode}'}"
             )
         self._started = True
+
+        # Wait for claude TUI to initialize, then send the initial prompt
+        _time.sleep(2.0)
+        read_instruction = f"Read and follow the instructions in {prompt_file} — that is your mission."
+        self.inject(read_instruction)
 
     def inject(self, text: str) -> None:
         """Send text into the tmux session as if the user typed it."""

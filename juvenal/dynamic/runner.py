@@ -234,10 +234,16 @@ class DynamicAnalysisRunner:
             print(f"  Dispatch file: {dispatch_file}", flush=True)
             print(f"  Results file:  {results_file}\n", flush=True)
 
+            # Grace period for captain to initialize
+            startup_deadline = time.time() + 10.0
+
             # Autonomous loop: no captain turns, no user waits
             while True:
-                # Check if captain is still alive
+                # Check if captain is still alive (with startup grace period)
                 if not tmux_session.is_alive():
+                    if time.time() < startup_deadline:
+                        time.sleep(1.0)
+                        continue
                     # Captain exited — check if all work is done
                     self._drain_completed_futures()
                     if self._has_active_runtime_work():
