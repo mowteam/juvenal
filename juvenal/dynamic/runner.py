@@ -156,10 +156,7 @@ class DynamicAnalysisRunner:
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
 
-                # Non-interactive: timed review point collects directives on state change
-                # Interactive: directives are collected in _interactive_wait_and_process instead
-                if not self.interactive:
-                    made_progress |= self._apply_review_point()
+                made_progress |= self._apply_review_point()
 
                 terminate, success, reason = self._should_terminate()
                 if terminate:
@@ -183,11 +180,7 @@ class DynamicAnalysisRunner:
                     return PhaseResult(success=success, failure_context=reason if not success else "")
 
                 if not made_progress:
-                    # Interactive: wait for results or user input when idle
-                    if self.interactive and self._interaction_channel is not None:
-                        self._interactive_wait_and_process()
-                    else:
-                        time.sleep(_IDLE_SLEEP_SECONDS)
+                    time.sleep(_IDLE_SLEEP_SECONDS)
         finally:
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
