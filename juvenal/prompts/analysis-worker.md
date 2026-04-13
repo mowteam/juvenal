@@ -123,6 +123,18 @@ Claim rules:
 - `follow_up_hints` may suggest adjacent work but must not merge separate defects into the current claim.
 - `related_claim_ids` should reference verified claims this claim depends on. Use `[]` when there are none.
 
+Retry expectations:
+- If this is a retry (the task packet includes `retry_mode: true`), you are responding to a verifier challenge.
+- Read the full rejection chain carefully. The verifier is telling you exactly what was wrong with your previous attempt.
+- Do NOT submit the same claim with minor wording changes. The verifier will reject it again.
+- If the rejection was `guard-found` or `sanitizer-found`, you must either:
+  1. Prove the guard/sanitizer is bypassable (provide a concrete bypass path or input), OR
+  2. Find a DIFFERENT path to the same bug class that avoids the guard, OR
+  3. Return `no_findings` if the guard genuinely blocks the attack.
+- If the rejection was `insufficient-evidence`, provide stronger proof: run a PoC, trace the execution dynamically, show tool output, or construct a minimal test case.
+- If the rejection included `follow_up_action` and `follow_up_strategy`, follow those hints — the verifier is telling you what investigation approach would strengthen the claim.
+- Each retry attempt should represent genuinely NEW evidence or a different approach, not a reformulation of the same argument.
+
 Example valid response:
 
 ```text

@@ -428,6 +428,12 @@ def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> Anal
     allow_repo_tools = raw.get("allow_repo_tools", defaults.allow_repo_tools)
     if not isinstance(allow_repo_tools, bool):
         raise ValueError(f"Phase '{phase_id}': analysis.allow_repo_tools must be a boolean")
+    max_consecutive_errors = _parse_analysis_int(
+        raw.get("max_consecutive_errors", defaults.max_consecutive_errors),
+        phase_id=phase_id,
+        field_name="max_consecutive_errors",
+        minimum=1,
+    )
 
     return AnalysisConfig(
         captain_backend=captain_backend,
@@ -439,6 +445,7 @@ def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> Anal
         max_worker_retries=max_worker_retries,
         max_captain_repairs=max_captain_repairs,
         allow_repo_tools=allow_repo_tools,
+        max_consecutive_errors=max_consecutive_errors,
     )
 
 

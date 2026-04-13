@@ -211,6 +211,8 @@ class VerificationRecord:
     started_at: float | None
     completed_at: float | None
     error: str = ""
+    follow_up_action: str | None = None
+    follow_up_strategy: str | None = None
 
 
 @dataclass

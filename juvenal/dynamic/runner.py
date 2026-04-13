@@ -1162,6 +1162,8 @@ class DynamicAnalysisRunner:
             verification.disposition = "verified"
             verification.reason = report.summary
             verification.rejection_class = None
+            verification.follow_up_action = report.follow_up_action
+            verification.follow_up_strategy = report.follow_up_strategy
             claim.status = "verified"
             claim.rejection_class = None
             claim.verified_at = verification.completed_at
@@ -1180,6 +1182,8 @@ class DynamicAnalysisRunner:
         verification.disposition = "rejected"
         verification.reason = report.summary or report.reason
         verification.rejection_class = report.rejection_class
+        verification.follow_up_action = report.follow_up_action
+        verification.follow_up_strategy = report.follow_up_strategy
         claim.status = "rejected"
         claim.rejection_class = report.rejection_class
         claim.rejected_at = verification.completed_at
@@ -1330,6 +1334,10 @@ class DynamicAnalysisRunner:
     def _build_claim_retry_prompt(self, target: TargetRecord, claim: ClaimRecord, attempt: WorkerAttempt) -> str:
         """Build a worker prompt scoped to re-investigating a single rejected claim."""
         rejection_reason = self._latest_rejection_reason(claim) or "No specific reason provided."
+        rejection_chain = self._get_rejection_chain(claim)
+        latest_verification = self._latest_rejection_verification(claim)
+        follow_up_action = latest_verification.follow_up_action if latest_verification else None
+        follow_up_strategy = latest_verification.follow_up_strategy if latest_verification else None
         verified_siblings = [
             self._claim_prompt_summary(c)
             for c in self._active_claims_for_target(target)
@@ -1338,6 +1346,8 @@ class DynamicAnalysisRunner:
         rejected_detail = self._claim_prompt_summary(claim)
         rejected_detail["rejection_reason"] = rejection_reason
         rejected_detail["rejection_class"] = claim.rejection_class
+        rejected_detail["follow_up_action"] = follow_up_action
+        rejected_detail["follow_up_strategy"] = follow_up_strategy
         task_packet = {
             "task_id": attempt.attempt_id,
             "target_id": target.target_id,
@@ -1350,13 +1360,21 @@ class DynamicAnalysisRunner:
         return (
             f"{self._worker_role_prompt}\n\n"
             f"Repository root: `{self.working_dir}`\n\n"
-            "## CLAIM RETRY MODE\n\n"
-            "You are re-investigating a SINGLE rejected claim. Do NOT re-report findings that\n"
-            "have already been verified. Focus exclusively on the rejected claim described below.\n\n"
+            "## CLAIM RETRY MODE — VERIFIER CHALLENGE\n\n"
+            "You are responding to a verifier challenge on a rejected claim. This is a dialog:\n"
+            "the verifier is pushing you toward stronger evidence. Read the full rejection chain\n"
+            "below to understand what has already been tried and what specific challenges the\n"
+            "verifier raised.\n\n"
+            "Do NOT repeat the same approach that was already rejected. Address the verifier's\n"
+            "specific feedback. If the verifier said a guard exists, either prove the guard is\n"
+            "bypassable or find a different path. If the verifier said evidence was insufficient,\n"
+            "provide concrete dynamic proof (PoC, test output, tool results).\n\n"
             "Task packet:\n"
             f"```text\n{json.dumps(task_packet, indent=2)}\n```\n\n"
-            "Rejected claim to re-investigate:\n"
+            "Rejected claim (your original submission):\n"
             f"```text\n{json.dumps(rejected_detail, indent=2)}\n```\n\n"
+            "Full rejection chain (all prior attempts and verifier feedback, oldest first):\n"
+            f"```text\n{json.dumps(rejection_chain, indent=2)}\n```\n\n"
             "Verified claims on this target (for context only — do NOT re-report these):\n"
             f"```text\n{json.dumps(verified_siblings, indent=2)}\n```\n\n"
             "Target context:\n"
@@ -1364,10 +1382,13 @@ class DynamicAnalysisRunner:
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n\n"
             "Instructions:\n"
-            "- Re-examine the rejected claim in light of the verifier's feedback\n"
-            "- If the issue is real but the original evidence was insufficient, gather stronger evidence\n"
-            "- If the verifier identified a guard/mitigation, determine if it fully addresses the issue\n"
-            '- If the claim was genuinely false, report outcome: "no_findings"\n'
+            "- Study the FULL rejection chain — do NOT repeat approaches that were already rejected\n"
+            "- Address the verifier's SPECIFIC challenge (rejection_reason and follow_up hints)\n"
+            "- If the verifier identified a guard/mitigation, either prove it is bypassable or find"
+            " a different attack path\n"
+            "- If the verifier said evidence was insufficient, provide a concrete PoC or dynamic proof\n"
+            "- Each retry must present genuinely NEW evidence or a different investigation approach\n"
+            '- If after honest re-examination the claim was genuinely false, report outcome: "no_findings"\n'
             "- Use the same WORKER_JSON_BEGIN/END output format\n"
         )
 
@@ -1661,6 +1682,41 @@ class DynamicAnalysisRunner:
             key=lambda verification: (verification.completed_at or 0.0, verification.verification_id),
         )
         return latest.reason
+
+    def _latest_rejection_verification(self, claim: ClaimRecord) -> VerificationRecord | None:
+        """Return the latest rejected VerificationRecord for a claim."""
+        candidates = [
+            v for v in self.state.verifications.values() if v.claim_id == claim.claim_id and v.disposition == "rejected"
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda v: (v.completed_at or 0.0, v.verification_id))
+
+    def _get_rejection_chain(self, claim: ClaimRecord) -> list[dict[str, Any]]:
+        """Walk the retry chain backwards to collect all prior rejection records, oldest first."""
+        chain: list[dict[str, Any]] = []
+        current: ClaimRecord | None = claim
+        while current is not None:
+            rejections = [
+                v
+                for v in self.state.verifications.values()
+                if v.claim_id == current.claim_id and v.disposition == "rejected"
+            ]
+            for v in sorted(rejections, key=lambda x: x.completed_at or 0.0):
+                chain.append(
+                    {
+                        "claim_id": v.claim_id,
+                        "attempt": current.retry_count,
+                        "rejection_class": v.rejection_class,
+                        "reason": v.reason,
+                        "follow_up_action": v.follow_up_action,
+                        "follow_up_strategy": v.follow_up_strategy,
+                    }
+                )
+            parent_id = current.retry_of_claim_id
+            current = self.state.claims.get(parent_id) if parent_id else None
+        chain.reverse()
+        return chain
 
     def _active_claims_for_target(self, target: TargetRecord) -> list[ClaimRecord]:
         """Return the leaf claims for a target (latest in each retry chain)."""

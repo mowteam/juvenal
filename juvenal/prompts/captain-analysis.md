@@ -30,8 +30,17 @@ User directives:
 - If a directive changes scope or focus, reflect that in `enqueue_targets`, `defer_target_ids`, `termination_state`, or `termination_reason`.
 
 Completion:
-- Set `termination_state` to `"complete"` only when the current scope is exhausted, the remaining work is not worth more bounded targets, a wrap-style summary turn has been requested, or the termination policy says discovery should stop.
-- Do not mark completion just because one target finished.
+- Set `termination_state` to `"complete"` only when ALL of the following are true:
+  1. You have systematically enumerated the major subsystems and entry points in scope.
+  2. Each major subsystem has been investigated with at least one bounded target.
+  3. Active investigation seams from verified findings have been followed to adjacent attack surface.
+  4. No concrete, high-value next target remains inside scope.
+  5. A wrap-style summary turn has been requested, OR the termination policy says discovery should stop.
+- Do not mark completion just because one target finished or a few targets returned no findings.
+- Do not mark completion after only a handful of targets — a thorough analysis explores dozens of targets across multiple subsystems over many captain turns.
+- Verified findings should OPEN new investigation fronts, not close the investigation. Each verified finding is evidence of a productive seam — pivot to adjacent attack surface (sibling functions, related modules, upstream/downstream data flow).
+- After each round of verified findings, ask: "What other code shares this pattern, boundary, or data flow?" and spawn targets for those areas.
+- Rejected claims are negative evidence, not dead ends. If a claim was rejected with `guard-found`, investigate whether the guard has gaps or whether sibling code lacks equivalent guards.
 - If any concrete, high-value next target remains inside scope, return `termination_state: "continue"`.
 
 Return exactly one machine-readable block using these markers:

@@ -59,6 +59,20 @@ phases:
       Adapt aggressively: if a subsystem yields repeated no-findings or rejections, deprioritize it
       and pivot to unexplored attack surface. If a verified claim opens a new seam, follow it.
 
+      #### Coverage expectations
+
+      Before declaring the analysis complete, you must have:
+      1. Enumerated ALL externally reachable entry points (network handlers, CLI parsers,
+         file format parsers, IPC handlers, environment variable consumers, plugin/hook interfaces).
+      2. Investigated at least one bounded target per major subsystem that handles untrusted input.
+      3. Followed every verified finding to at least one layer of adjacent attack surface
+         (sibling functions, callers, callees, shared data structures).
+      4. Explored at least 3 different vulnerability classes from the "What counts" list above.
+
+      Do NOT declare termination_state: "complete" until these coverage bars are met.
+      If you run out of high-priority targets, pivot to medium-priority exploration of
+      unexplored subsystems rather than terminating.
+
       ### Worker guidance — PoCs are mandatory
 
       Workers: you are investigators, not theorists. Your job is to find concrete bugs and prove
@@ -118,7 +132,14 @@ phases:
       almost certainly real. PoC reproduction is what separates verified bugs from false positives.
 
       Reject aggressively. A real bug will survive scrutiny. A false positive wastes everyone's time.
-      
+
+      **Challenge the worker on every rejection.** When you reject a claim, you MUST provide
+      `follow_up_action` and `follow_up_strategy` in your verification output. These guide the
+      worker's retry attempt. Be specific: if you found a guard at line 456, tell the worker to
+      check whether that guard can be bypassed via a different call path. If the PoC was wrong,
+      explain what the correct trigger condition would look like. This back-and-forth dialog between
+      you and the worker is how the analysis converges on real bugs.
+
       **Output**
       Output a **brief** description of the bug and the PoC into `output/<bug-name>.md` and `output/<bug-name>-poc`, respectively.
     analysis:
@@ -128,7 +149,7 @@ phases:
       max_workers: 4
       max_verifiers: 8
       interaction_timeout: 3.0
-      max_worker_retries: 2
+      max_worker_retries: 5
       max_captain_repairs: 2
       allow_repo_tools: true
 
