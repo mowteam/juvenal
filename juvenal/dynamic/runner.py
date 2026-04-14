@@ -117,6 +117,7 @@ class DynamicAnalysisRunner:
         self._terminal_failure = ""
         self._pending_claim_retries: list[tuple[str, str]] = []  # [(target_id, claim_id)]
         self._consecutive_errors = 0
+        self._backoff_count = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self._interaction_channel = interaction_channel if interactive else None
@@ -409,7 +410,9 @@ class DynamicAnalysisRunner:
 
         self._add_tokens(result)
         if result.exit_code != 0:
-            self._terminal_failure = f"captain exited with code {result.exit_code}: {result.output[-2000:]}"
+            # Captain crash — likely rate limit. Backoff and retry on next loop iteration.
+            self._consecutive_errors += 1
+            self._rate_limit_backoff()
             return
 
         try:
@@ -477,7 +480,9 @@ class DynamicAnalysisRunner:
                 self.state.save()
             self._add_tokens(result)
             if result.exit_code != 0:
-                self._terminal_failure = f"captain repair exited with code {result.exit_code}: {result.output[-2000:]}"
+                # Captain repair crash — likely rate limit
+                self._consecutive_errors += 1
+                self._rate_limit_backoff()
                 return None
             try:
                 return parse_captain_output(result.output)
@@ -2001,19 +2006,42 @@ class DynamicAnalysisRunner:
         """Track a worker/verifier infrastructure failure (crash, malformed output, non-zero exit).
 
         Does NOT count verifier rejections — those are normal operation.
-        When consecutive infrastructure errors hit the threshold, triggers a clean pause
-        so the run can be resumed later (e.g., after API rate limits reset).
+        When consecutive errors hit the threshold, saves state and sleeps with
+        exponential backoff (likely rate limit or API outage), then resets and continues.
         """
         self._consecutive_errors += 1
         if self._consecutive_errors >= self.config.max_consecutive_errors:
-            self._terminal_failure = (
-                f"Pausing: {self._consecutive_errors} consecutive infrastructure errors "
-                f"(likely rate limit or API outage). State saved — resume with --resume."
-            )
+            self._rate_limit_backoff()
+
+    def _rate_limit_backoff(self) -> None:
+        """Sleep with exponential backoff, save state, then reset error counter to continue.
+
+        Starts at 60s and doubles each consecutive backoff (60, 120, 240, ...) up to 1 hour.
+        Resets on the next successful operation. The user can Ctrl+C at any time during the
+        sleep — state is already saved so --resume will pick up where it left off.
+        """
+        self.state.save()
+        delay = min(60 * (2**self._backoff_count), 3600)
+        self._backoff_count += 1
+        minutes = delay / 60
+        print(
+            f"\n[juvenal] {self._consecutive_errors} consecutive errors — "
+            f"likely rate limit. Sleeping {minutes:.0f}m before retrying. "
+            f"State saved (Ctrl+C to exit, --resume to continue later).",
+            flush=True,
+        )
+        # Sleep in small increments so Ctrl+C is responsive
+        remaining = delay
+        while remaining > 0:
+            chunk = min(remaining, 5.0)
+            time.sleep(chunk)
+            remaining -= chunk
+        self._consecutive_errors = 0
 
     def _record_success(self) -> None:
         """Reset the consecutive error counter on any successful worker/verifier completion."""
         self._consecutive_errors = 0
+        self._backoff_count = 0
 
     def _dependencies_satisfied(self, target: TargetRecord) -> bool:
         return all(

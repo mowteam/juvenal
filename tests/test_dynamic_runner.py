@@ -696,30 +696,31 @@ def test_claim_retry_worker_produces_verified_replacement(tmp_path):
     assert retry_claim.retry_count == 1
 
 
-def test_consecutive_errors_pause_analysis(tmp_path):
-    """Consecutive infrastructure errors trigger a clean pause (not per-target exhaustion)."""
+def test_consecutive_errors_backoff_and_retry(tmp_path):
+    """Consecutive infrastructure errors trigger backoff sleep, then retry (not fatal exit)."""
     backend = MockBackend()
     backend.add_role_response(
         "captain",
-        output=_captain_output(enqueue_targets=[_target("target-1"), _target("target-2"), _target("target-3")]),
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
         session_id="captain-s1",
     )
-    # All workers crash — 3 initial + retries = at least 5 consecutive errors
-    for _ in range(10):
-        backend.add_role_response("worker", output="CRASH", exit_code=1)
-    # Captain that would normally be called (but won't be reached)
+    # 3 crashes trigger backoff, then worker succeeds on attempt 4
+    backend.add_role_response("worker", output="CRASH", exit_code=1)
+    backend.add_role_response("worker", output="CRASH", exit_code=1)
+    backend.add_role_response("worker", output="CRASH", exit_code=1)
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-4", "target-1"))
     backend.add_role_response(
         "captain",
         output=_captain_output(termination_state="complete", termination_reason="Done."),
     )
 
-    result, state, _ = _run_runner(
-        tmp_path,
-        backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=2, max_consecutive_errors=3),
-    )
+    # Mock time.sleep so the backoff doesn't actually wait.
+    with patch("juvenal.dynamic.runner.time.sleep"):
+        result, state, _ = _run_runner(
+            tmp_path,
+            backend,
+            config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=10, max_consecutive_errors=3),
+        )
 
-    assert result.success is False
-    assert "consecutive infrastructure errors" in result.failure_context
-    # State was saved — targets still exist for resume
-    assert len(state.targets) == 3
+    assert result.success is True
+    assert state.targets["target-1"].status == "no_findings"
