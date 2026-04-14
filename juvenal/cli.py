@@ -389,8 +389,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("\nAborted.")
             return 1
         if answer.strip().lower() not in ("yes", "y"):
-            print("Aborted. Use --resume to continue from saved state.")
-            return 1
+            print("Resuming from saved state.")
+            args.resume = True
 
     engine = Engine(
         workflow,
