@@ -377,6 +377,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         workflow.notify.extend(args.notify)
 
     state_file = getattr(args, "state_file", None)
+    sf_path = Path(state_file) if state_file else Path(".juvenal-state.json")
+    is_fresh = not args.resume and args.rewind is None and args.rewind_to is None
+    if is_fresh and sf_path.exists() and sys.stdin.isatty():
+        try:
+            answer = input(
+                f"Existing state found at {sf_path}. Start fresh and overwrite? "
+                "(yes to overwrite, or rerun with --resume) [yes/no]: "
+            )
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 1
+        if answer.strip().lower() not in ("yes", "y"):
+            print("Aborted. Use --resume to continue from saved state.")
+            return 1
+
     engine = Engine(
         workflow,
         resume=args.resume,
