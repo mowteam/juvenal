@@ -80,6 +80,14 @@ def _require_string_list(value: Any, field_name: str) -> list[str]:
     return items
 
 
+def _optional_string_list(value: Any, field_name: str) -> list[str]:
+    """Like _require_string_list, but treats null/missing as []. Used for
+    optional list fields where LLMs frequently substitute null for an empty list."""
+    if value is None:
+        return []
+    return _require_string_list(value, field_name)
+
+
 def _require_literal(value: Any, field_name: str, allowed: tuple[str, ...]) -> str:
     text = _require_string(value, field_name)
     if text not in allowed:
@@ -178,20 +186,22 @@ def parse_captain_output(output: str) -> CaptainTurn:
     """Parse a captain response into a structured turn."""
 
     payload = _extract_required_mapping(output, _CAPTAIN_BEGIN, _CAPTAIN_END, "CAPTAIN_JSON")
-    acknowledged_directive_ids = _require_string_list(
+    acknowledged_directive_ids = _optional_string_list(
         payload.get("acknowledged_directive_ids"),
         "CAPTAIN_JSON.acknowledged_directive_ids",
     )
     _validate_unique(acknowledged_directive_ids, "CAPTAIN_JSON.acknowledged_directive_ids")
     enqueue_targets_raw = payload.get("enqueue_targets")
-    if not isinstance(enqueue_targets_raw, list):
+    if enqueue_targets_raw is None:
+        enqueue_targets_raw = []
+    elif not isinstance(enqueue_targets_raw, list):
         raise ValueError("CAPTAIN_JSON.enqueue_targets must be a list")
     enqueue_targets = [
         _parse_target_proposal(item, f"CAPTAIN_JSON.enqueue_targets[{index}]")
         for index, item in enumerate(enqueue_targets_raw)
     ]
     _validate_unique([target.target_id for target in enqueue_targets], "CAPTAIN_JSON.enqueue_targets.target_id")
-    defer_target_ids = _require_string_list(payload.get("defer_target_ids"), "CAPTAIN_JSON.defer_target_ids")
+    defer_target_ids = _optional_string_list(payload.get("defer_target_ids"), "CAPTAIN_JSON.defer_target_ids")
     _validate_unique(defer_target_ids, "CAPTAIN_JSON.defer_target_ids")
     mental_model = payload.get("mental_model_summary", payload.get("mental_model"))
     if "termination_state" in payload or "termination_reason" in payload:
@@ -205,7 +215,7 @@ def parse_captain_output(output: str) -> CaptainTurn:
         message_to_user=_require_string(payload.get("message_to_user"), "CAPTAIN_JSON.message_to_user"),
         acknowledged_directive_ids=acknowledged_directive_ids,
         mental_model_summary=_require_string(mental_model, "CAPTAIN_JSON.mental_model_summary"),
-        open_questions=_require_string_list(payload.get("open_questions", []), "CAPTAIN_JSON.open_questions"),
+        open_questions=_optional_string_list(payload.get("open_questions"), "CAPTAIN_JSON.open_questions"),
         enqueue_targets=enqueue_targets,
         defer_target_ids=defer_target_ids,
         termination_state=_require_literal(

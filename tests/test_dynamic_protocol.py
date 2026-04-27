@@ -113,6 +113,68 @@ CAPTAIN_JSON_END
         with pytest.raises(ValueError, match="CAPTAIN_JSON block must contain valid JSON object"):
             parse_captain_output(output)
 
+    def test_null_optional_lists_treated_as_empty(self):
+        """LLMs frequently substitute null for empty list. Don't reject the whole turn over it."""
+        output = """
+CAPTAIN_JSON_BEGIN
+{
+  "message_to_user": "Holding position.",
+  "acknowledged_directive_ids": null,
+  "mental_model_summary": "No new events.",
+  "open_questions": null,
+  "enqueue_targets": null,
+  "defer_target_ids": null,
+  "termination_state": "continue",
+  "termination_reason": "Awaiting verifier results."
+}
+CAPTAIN_JSON_END
+"""
+        turn = parse_captain_output(output)
+
+        assert turn.acknowledged_directive_ids == []
+        assert turn.open_questions == []
+        assert turn.enqueue_targets == []
+        assert turn.defer_target_ids == []
+        assert turn.termination_state == "continue"
+
+    def test_missing_optional_lists_treated_as_empty(self):
+        """Same lenience for keys the LLM omits entirely."""
+        output = """
+CAPTAIN_JSON_BEGIN
+{
+  "message_to_user": "Holding position.",
+  "mental_model_summary": "No new events.",
+  "termination_state": "continue",
+  "termination_reason": "Awaiting verifier results."
+}
+CAPTAIN_JSON_END
+"""
+        turn = parse_captain_output(output)
+
+        assert turn.acknowledged_directive_ids == []
+        assert turn.open_questions == []
+        assert turn.enqueue_targets == []
+        assert turn.defer_target_ids == []
+
+    def test_string_in_list_field_still_rejected(self):
+        """Lenience is only for None/missing — non-list values still raise."""
+        output = """
+CAPTAIN_JSON_BEGIN
+{
+  "message_to_user": "",
+  "acknowledged_directive_ids": [],
+  "mental_model_summary": "x",
+  "open_questions": [],
+  "enqueue_targets": "should-be-a-list",
+  "defer_target_ids": [],
+  "termination_state": "continue",
+  "termination_reason": "ok"
+}
+CAPTAIN_JSON_END
+"""
+        with pytest.raises(ValueError, match="CAPTAIN_JSON.enqueue_targets must be a list"):
+            parse_captain_output(output)
+
 
 class TestParseWorkerOutput:
     def test_valid_worker_json(self):

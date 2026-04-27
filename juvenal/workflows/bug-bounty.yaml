@@ -161,7 +161,7 @@ phases:
       max_verifiers: 8
       interaction_timeout: 3.0
       max_worker_retries: 10
-      max_captain_repairs: 2
+      max_captain_repairs: 4
       allow_repo_tools: true
       verifiers:
         - name: poc
