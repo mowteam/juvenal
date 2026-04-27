@@ -798,3 +798,247 @@ def test_reporter_prompt_renders_template_vars(tmp_path):
             interactive=False,
         )
     assert "BUG-" in runner._rendered_reporter_prompt
+
+
+# --- Status printout coverage --------------------------------------------------
+
+
+def test_chain_progress_helper_phrases():
+    """Direct test of the formatter that drives the per-claim status suffix."""
+    from juvenal.dynamic.models import (
+        ClaimRecord,
+        CodeLocation,
+        VerificationRecord,
+    )
+    from juvenal.dynamic.state import DynamicSessionState
+    from juvenal.state import _format_claim_chain_progress
+
+    dss = DynamicSessionState(state_file=None)  # type: ignore[arg-type]
+    base_claim = dict(
+        worker_claim_id="c1",
+        target_id="t1",
+        attempt_id="a1",
+        generation=1,
+        kind="memory",
+        subcategory=None,
+        summary="x",
+        assertion="x",
+        severity="medium",
+        worker_confidence="medium",
+        primary_location=CodeLocation(path="x.c", line=1),
+        locations=[],
+        preconditions=[],
+        candidate_code_refs=[],
+        related_claim_ids=[],
+        audit_artifact_id="art",
+        rejection_class=None,
+        verified_at=None,
+        rejected_at=None,
+    )
+
+    def _verification(v_id: str, idx: int, name: str, *, status: str, disposition: str | None) -> VerificationRecord:
+        return VerificationRecord(
+            verification_id=v_id,
+            claim_id="c1",
+            target_id="t1",
+            generation=1,
+            backend="claude",
+            verifier_role="analysis-verifier",
+            session_id=None,
+            status=status,
+            disposition=disposition,
+            reason="",
+            rejection_class=None,
+            raw_output="",
+            started_at=None,
+            completed_at=None,
+            verifier_name=name,
+            verifier_index=idx,
+        )
+
+    # Verifying, mid-chain (poc passed, scope is running, novelty pending)
+    verifying_claim = ClaimRecord(claim_id="c1", status="verifying", verification_ids=["v0", "v1"], **base_claim)
+    dss.verifications = {
+        "v0": _verification("v0", 0, "poc", status="passed", disposition="verified"),
+        "v1": _verification("v1", 1, "scope", status="running", disposition=None),
+    }
+    assert _format_claim_chain_progress(verifying_claim, dss, reporter_configured=False) == "@ scope (step 2)"
+
+    # Rejected by named verifier
+    rejected_claim = ClaimRecord(
+        claim_id="c1",
+        status="rejected",
+        verification_ids=["v0"],
+        failing_verifier_name="poc",
+        **base_claim,
+    )
+    dss.verifications = {"v0": _verification("v0", 0, "poc", status="failed", disposition="rejected")}
+    assert _format_claim_chain_progress(rejected_claim, dss, reporter_configured=False) == "rejected by poc"
+
+    # Verified + reported
+    import time as _time
+
+    reported_claim = ClaimRecord(
+        claim_id="c1",
+        status="verified",
+        verification_ids=["v0"],
+        reported_at=_time.time(),
+        **base_claim,
+    )
+    assert _format_claim_chain_progress(reported_claim, dss, reporter_configured=True) == "reported"
+
+    # Verified, reporter configured, report not yet written
+    pending_claim = ClaimRecord(claim_id="c1", status="verified", verification_ids=["v0"], **base_claim)
+    assert _format_claim_chain_progress(pending_claim, dss, reporter_configured=True) == "report pending"
+
+    # Verified, no reporter configured
+    plain_claim = ClaimRecord(claim_id="c1", status="verified", verification_ids=["v0"], **base_claim)
+    assert _format_claim_chain_progress(plain_claim, dss, reporter_configured=False) == ""
+
+
+def test_validate_printout_lists_chain_and_reporter(tmp_path, capsys):
+    """`juvenal validate` should surface chain composition and reporter state."""
+    yaml_content = """\
+name: chain-test
+backend: claude
+phases:
+  - id: hunt
+    type: analysis
+    prompt: "Look for bugs."
+    analysis:
+      captain_backend: claude
+      worker_backend: claude
+      verifiers:
+        - name: poc
+          backend: claude
+          prompt: "PoC."
+        - name: scope
+          backend: codex
+          prompt: "Scope."
+      reporter:
+        backend: claude
+        prompt: "Write the report."
+"""
+    yaml_path = tmp_path / "wf.yaml"
+    yaml_path.write_text(yaml_content)
+
+    from juvenal.cli import build_parser, cmd_validate
+
+    parser = build_parser()
+    args = parser.parse_args(["validate", str(yaml_path)])
+    args.plain = True
+    cmd_validate(args)
+    out = capsys.readouterr().out
+    assert "verifier chain (2)" in out
+    assert "poc(claude)" in out
+    assert "scope(codex)" in out
+    assert "reporter: enabled" in out
+
+
+def test_print_status_renders_chain_and_reporter(tmp_path):
+    """Status table renders without error and includes the reporter summary."""
+    import io
+    import time as _time
+
+    from rich.console import Console as _RichConsole
+
+    from juvenal.dynamic.models import (
+        ClaimRecord,
+        CodeLocation,
+        TargetRecord,
+        VerificationRecord,
+    )
+    from juvenal.dynamic.state import DynamicSessionState
+    from juvenal.state import PipelineState
+
+    state_file = tmp_path / "state.json"
+    state = PipelineState(state_file=state_file)
+    ps = state._ensure_phase("analyze")
+    ps.phase_type = "analysis"
+    ps.analysis_state_file = ".juvenal-state-analyze-analysis.json"
+    ps.status = "running"
+    ps.started_at = _time.time() - 60
+    state.save()
+
+    dss = DynamicSessionState(state_file=tmp_path / ".juvenal-state-analyze-analysis.json")
+    now = _time.time()
+    dss.targets["t1"] = TargetRecord(
+        target_id="t1",
+        title="parser-overflow",
+        kind="module-level",
+        priority=90,
+        status="completed",
+        source="captain",
+        scope_paths=["src/p.c"],
+        scope_symbols=[],
+        instructions="",
+        depends_on_claim_ids=[],
+        spawn_reason="x",
+        generation=1,
+        active_generation=1,
+        active_attempt_id=None,
+        deferred_until_turn=None,
+        pending_verification_ids=[],
+        accepted_claim_ids=["c1"],
+        rejected_claim_ids=[],
+        created_at=now,
+        updated_at=now,
+    )
+    dss.claims["c1"] = ClaimRecord(
+        claim_id="c1",
+        worker_claim_id="wc1",
+        target_id="t1",
+        attempt_id="a1",
+        generation=1,
+        kind="memory",
+        subcategory=None,
+        summary="OOB write",
+        assertion="OOB",
+        severity="high",
+        worker_confidence="high",
+        primary_location=CodeLocation(path="src/p.c", line=10),
+        locations=[],
+        preconditions=[],
+        candidate_code_refs=[],
+        related_claim_ids=[],
+        audit_artifact_id="art1",
+        status="verified",
+        verification_ids=["v0"],
+        rejection_class=None,
+        verified_at=now,
+        rejected_at=None,
+        reported_at=now,
+    )
+    dss.verifications["v0"] = VerificationRecord(
+        verification_id="v0",
+        claim_id="c1",
+        target_id="t1",
+        generation=1,
+        backend="claude",
+        verifier_role="analysis-verifier",
+        session_id=None,
+        status="passed",
+        disposition="verified",
+        reason="ok",
+        rejection_class=None,
+        raw_output="",
+        started_at=now,
+        completed_at=now,
+        verifier_name="novelty",
+        verifier_index=2,
+    )
+    dss.save()
+
+    # Capture printed output via a Rich console pointed at a buffer.
+    from juvenal.state import _format_claim_chain_progress
+
+    # Sanity-check the helper directly using the persisted dss before rendering.
+    assert _format_claim_chain_progress(dss.claims["c1"], dss, reporter_configured=True) == "reported"
+
+    buf = io.StringIO()
+    console = _RichConsole(file=buf, force_terminal=False, width=240)
+    # Patch the module-level Console so print_status writes into our buffer.
+    with patch("juvenal.state.Console", return_value=console):
+        state.print_status()
+    rendered = buf.getvalue().replace("\n", " ")
+    assert "1 reported" in rendered

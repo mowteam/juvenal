@@ -14,6 +14,46 @@ from rich.panel import Panel
 from rich.table import Table
 
 
+def _format_claim_chain_progress(claim, dss, reporter_configured: bool) -> str:
+    """Compose a short suffix describing where a claim is in the verifier chain.
+
+    Returns text like ``@ scope (2/3)`` while verifying, ``rejected by poc``
+    when a verifier failed, ``reported`` once the reporter has written the
+    per-bug output, or ``report pending`` for verified claims awaiting it.
+    Empty string if there is nothing meaningful to add.
+    """
+    claim_verifications = [dss.verifications[v_id] for v_id in claim.verification_ids if v_id in dss.verifications]
+
+    if claim.status == "verifying":
+        active = next(
+            (v for v in claim_verifications if v.status in ("pending", "running")),
+            None,
+        )
+        if active is not None:
+            # Only show step number, not "n/N" — chain length isn't knowable
+            # from state alone (the next verifier may not have spawned yet).
+            name = active.verifier_name or "default"
+            return f"@ {name} (step {active.verifier_index + 1})"
+        passed_count = sum(1 for v in claim_verifications if v.disposition == "verified" and v.status == "passed")
+        if passed_count:
+            return f"{passed_count} chain step(s) passed"
+        return ""
+
+    if claim.status == "rejected":
+        if claim.failing_verifier_name:
+            return f"rejected by {claim.failing_verifier_name}"
+        return ""
+
+    if claim.status == "verified":
+        if claim.reported_at is not None:
+            return "reported"
+        if reporter_configured:
+            return "report pending"
+        return ""
+
+    return ""
+
+
 @dataclass
 class PhaseState:
     """State for a single phase."""
@@ -231,7 +271,7 @@ class PipelineState:
             console.print()
             title = f"[cyan]{pid}[/] Analysis Detail (captain turn {summary['captain_turns']})"
             console.print(Panel(detail_table, title=title, border_style="dim"))
-            console.print(
+            line = (
                 f"  {summary['total']} targets | "
                 f"{summary['completed']} completed | "
                 f"{summary['blocked']} blocked/exhausted | "
@@ -240,6 +280,13 @@ class PipelineState:
                 f"{summary['claims_verified']} claims verified | "
                 f"{summary['claims_rejected']} claims rejected"
             )
+            reported = summary.get("claims_reported", 0)
+            report_pending = summary.get("claims_report_pending", 0)
+            if reported or report_pending:
+                line += f" | {reported} reported"
+                if report_pending:
+                    line += f" ({report_pending} pending)"
+            console.print(line)
 
     def _render_analysis_detail(self, analysis_state_file: str) -> tuple[Table, dict[str, int]] | None:
         """Load analysis child state and render a nested detail table."""
@@ -288,8 +335,19 @@ class PipelineState:
             "running": 0,
             "claims_verified": 0,
             "claims_rejected": 0,
+            "claims_reported": 0,
+            "claims_report_pending": 0,
             "captain_turns": dss.captain.turn_index,
         }
+
+        # Heuristic: a reporter is configured if at least one claim has been
+        # reported in this run. Without the workflow config we cannot know for
+        # certain, but this lets the status view distinguish "verified, no
+        # reporter" from "verified, report pending" once the reporter has fired
+        # at least once.
+        reporter_configured = any(claim.reported_at is not None for claim in dss.claims.values()) or any(
+            event.event_type == "claim.reported" for event in dss.events
+        )
 
         if not sorted_targets:
             detail.add_row("[dim]No targets yet[/dim]", "", "", "")
@@ -331,11 +389,13 @@ class PipelineState:
             for claim in leaf_claims:
                 claim_style = _claim_styles.get(claim.status, "dim")
                 retry_text = f" retry {claim.retry_count}" if claim.retry_count > 0 else ""
+                chain_text = _format_claim_chain_progress(claim, dss, reporter_configured)
+                trailing = retry_text + (f" · {chain_text}" if chain_text else "")
                 detail.add_row(
                     f"  [dim]{claim.summary[:45]}[/dim]",
                     f"[{claim_style}]{claim.status}[/]",
                     "",
-                    f"[dim]{claim.severity}{retry_text}[/dim]",
+                    f"[dim]{claim.severity}{trailing}[/dim]",
                 )
 
             # Update summary counters
@@ -349,6 +409,13 @@ class PipelineState:
                 summary["running"] += 1
             summary["claims_verified"] += n_verified
             summary["claims_rejected"] += n_rejected
+            for claim in leaf_claims:
+                if claim.status != "verified":
+                    continue
+                if claim.reported_at is not None:
+                    summary["claims_reported"] += 1
+                elif reporter_configured:
+                    summary["claims_report_pending"] += 1
 
         return detail, summary
 

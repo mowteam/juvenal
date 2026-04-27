@@ -1080,7 +1080,11 @@ class Engine:
                 print("     analysis:")
                 print(f"       captain_backend: {config.captain_backend}")
                 print(f"       worker_backend: {config.worker_backend}")
-                print(f"       verifier_backend: {config.verifier_backend}")
+                if config.verifiers:
+                    chain_str = " → ".join(f"{spec.name}({spec.backend})" for spec in config.verifiers)
+                    print(f"       verifier chain ({len(config.verifiers)}): {chain_str}")
+                else:
+                    print(f"       verifier_backend: {config.verifier_backend} (single-verifier default)")
                 print(f"       max_workers: {config.max_workers}")
                 print(f"       max_verifiers: {config.max_verifiers}")
                 print(
@@ -1090,6 +1094,10 @@ class Engine:
                 print(f"       max_worker_retries: {config.max_worker_retries}")
                 print(f"       max_captain_repairs: {config.max_captain_repairs}")
                 print(f"       allow_repo_tools: {str(config.allow_repo_tools).lower()}")
+                if config.reporter is not None:
+                    print(f"       reporter: enabled (backend={config.reporter.backend})")
+                else:
+                    print("       reporter: disabled")
             print()
 
         if self.workflow.parallel_groups:
