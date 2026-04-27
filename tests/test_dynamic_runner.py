@@ -696,6 +696,125 @@ def test_claim_retry_worker_produces_verified_replacement(tmp_path):
     assert retry_claim.retry_count == 1
 
 
+def test_dependencies_satisfied_walks_retry_chain(tmp_path):
+    """A dep on a rejected claim must be satisfied if any descendant retry claim is verified.
+
+    Regression for: dependent targets enqueued against a claim_id that later got rejected and
+    re-verified via a retry claim with a different id were stuck queued forever, because
+    `_dependencies_satisfied` checked only the literal claim_id without walking retry_claim_ids.
+    """
+    from juvenal.dynamic.models import ClaimRecord, CodeLocation, TargetRecord
+
+    state_file = tmp_path / "analysis-state.json"
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(termination_state="complete"))
+
+    phase = Phase(
+        id="analyze",
+        type="analysis",
+        prompt="Analyze.",
+        analysis=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1),
+    )
+    workflow = Workflow(name="analysis", phases=[phase], working_dir=str(tmp_path))
+
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        runner = DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=False,
+            interaction_channel=None,
+        )
+
+    now = 1.0
+    loc = CodeLocation(path="src/app.py", line=1, symbol="app", role="sink")
+
+    def _make_claim(claim_id: str, *, status: str, retry_of: str | None, retry_ids: list[str]) -> ClaimRecord:
+        return ClaimRecord(
+            claim_id=claim_id,
+            worker_claim_id=claim_id.split("-")[-1],
+            target_id="target-1",
+            attempt_id="attempt-x",
+            generation=1,
+            kind="k",
+            subcategory=None,
+            summary="s",
+            assertion="a",
+            severity="medium",
+            worker_confidence="medium",
+            primary_location=loc,
+            locations=[loc],
+            preconditions=[],
+            candidate_code_refs=[],
+            related_claim_ids=[],
+            audit_artifact_id="art-1",
+            status=status,
+            verification_ids=[],
+            rejection_class=None,
+            verified_at=now if status == "verified" else None,
+            rejected_at=now if status == "rejected" else None,
+            retry_of_claim_id=retry_of,
+            retry_claim_ids=list(retry_ids),
+        )
+
+    # Original claim: rejected, links to retry claim.
+    runner.state.claims["target-1-g1-claim-c1"] = _make_claim(
+        "target-1-g1-claim-c1", status="rejected", retry_of=None, retry_ids=["target-1-g1-retry-c1"]
+    )
+    # Retry claim: verified.
+    runner.state.claims["target-1-g1-retry-c1"] = _make_claim(
+        "target-1-g1-retry-c1", status="verified", retry_of="target-1-g1-claim-c1", retry_ids=[]
+    )
+    # Dependent target with deps on the rejected claim id.
+    dep_target = TargetRecord(
+        target_id="target-2",
+        title="dep",
+        kind="module-level",
+        priority=90,
+        status="queued",
+        source="captain",
+        scope_paths=["src/app.py"],
+        scope_symbols=["app"],
+        instructions="x",
+        depends_on_claim_ids=["target-1-g1-claim-c1"],
+        spawn_reason="x",
+        generation=1,
+        active_generation=1,
+        active_attempt_id=None,
+        deferred_until_turn=None,
+        pending_verification_ids=[],
+        accepted_claim_ids=[],
+        rejected_claim_ids=[],
+        created_at=now,
+        updated_at=now,
+    )
+
+    # Bug case: rejected dep with verified retry → must be satisfied.
+    assert runner._dependencies_satisfied(dep_target) is True
+
+    # If the retry is also rejected and there is no further retry, the dep is NOT satisfied.
+    runner.state.claims["target-1-g1-retry-c1"].status = "rejected"
+    runner.state.claims["target-1-g1-retry-c1"].verified_at = None
+    assert runner._dependencies_satisfied(dep_target) is False
+
+    # Multi-level retry chain: rejected → rejected → verified should still satisfy.
+    runner.state.claims["target-1-g1-retry-c1"].retry_claim_ids = ["target-1-g1-retry-c2"]
+    runner.state.claims["target-1-g1-retry-c2"] = _make_claim(
+        "target-1-g1-retry-c2", status="verified", retry_of="target-1-g1-retry-c1", retry_ids=[]
+    )
+    assert runner._dependencies_satisfied(dep_target) is True
+
+    # Missing dep id (claim doesn't exist) → not satisfied.
+    dep_target.depends_on_claim_ids = ["does-not-exist"]
+    assert runner._dependencies_satisfied(dep_target) is False
+
+    # No deps → trivially satisfied.
+    dep_target.depends_on_claim_ids = []
+    assert runner._dependencies_satisfied(dep_target) is True
+
+
 def test_consecutive_errors_backoff_and_retry(tmp_path):
     """Consecutive infrastructure errors trigger backoff sleep, then retry (not fatal exit)."""
     backend = MockBackend()

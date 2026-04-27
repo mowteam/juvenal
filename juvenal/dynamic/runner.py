@@ -2474,10 +2474,18 @@ class DynamicAnalysisRunner:
         self._backoff_count = 0
 
     def _dependencies_satisfied(self, target: TargetRecord) -> bool:
-        return all(
-            dependency_id in self.state.claims and self.state.claims[dependency_id].status == "verified"
-            for dependency_id in target.depends_on_claim_ids
-        )
+        def verified_via_retries(claim_id: str, seen: set[str]) -> bool:
+            if claim_id in seen:
+                return False
+            seen.add(claim_id)
+            claim = self.state.claims.get(claim_id)
+            if claim is None:
+                return False
+            if claim.status == "verified":
+                return True
+            return any(verified_via_retries(rid, seen) for rid in claim.retry_claim_ids)
+
+        return all(verified_via_retries(dep_id, set()) for dep_id in target.depends_on_claim_ids)
 
     def _next_attempt_id(self, target_id: str, generation: int) -> str:
         existing = [
