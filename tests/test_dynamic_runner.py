@@ -403,6 +403,33 @@ def test_empty_frontier_and_captain_complete(tmp_path):
     assert [role for role, _prompt in backend.role_calls] == ["captain"]
 
 
+def test_all_terminal_targets_with_non_complete_captain_succeeds_gracefully(tmp_path):
+    """When every target reaches a terminal state but the captain refuses to declare 'complete',
+    treat the analysis as successful rather than burning an expensive run.
+    """
+    backend = MockBackend()
+    # Turn 1: enqueue a single target.
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+        session_id="captain-s1",
+    )
+    # Worker reports no findings → target reaches no_findings (terminal).
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    # Turn 2: captain sees no_findings event but does NOT request completion. With the frontier
+    # now empty and no further work, the runner should treat this as a graceful end.
+    for _ in range(5):
+        backend.add_role_response(
+            "captain",
+            output=_captain_output(termination_reason="More avenues remain (in the captain's mind)."),
+        )
+
+    result, state, _ = _run_runner(tmp_path, backend)
+
+    assert result.success is True
+    assert state.targets["target-1"].status == "no_findings"
+
+
 def test_ignore_path_directive_makes_matching_targets_ineligible(tmp_path):
     backend = MockBackend()
     backend.add_role_response(

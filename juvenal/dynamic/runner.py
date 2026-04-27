@@ -1069,6 +1069,17 @@ class DynamicAnalysisRunner:
                     and self._last_reviewed_turn_index < self.state.captain.turn_index
                 ):
                     return False, False, ""
+                # If every target reached a terminal state, the analysis itself is done — the
+                # captain just failed its protocol obligation to declare "complete". Don't burn
+                # a long-running analysis (often hours of compute and a usable set of verified
+                # findings) over a captain protocol slip. Log a warning and exit cleanly.
+                if all_terminal:
+                    print(
+                        "Captain did not request completion despite all targets reaching "
+                        "terminal states; treating analysis as complete.",
+                        flush=True,
+                    )
+                    return True, True, ""
                 return True, False, "captain left the frontier empty without requesting completion"
 
         return False, False, ""
