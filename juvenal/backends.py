@@ -82,8 +82,14 @@ class Backend(ABC):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> AgentResult:
-        """Run an agent with the given prompt. Returns AgentResult."""
+        """Run an agent with the given prompt. Returns AgentResult.
+
+        ``model`` is an opaque CLI model identifier (e.g. ``claude-opus-4-7[1m]``,
+        ``claude-sonnet-4-6``, or a Codex model name). When ``None`` the backend's
+        CLI default is used.
+        """
         ...
 
     def resume_agent(
@@ -94,15 +100,17 @@ class Backend(ABC):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> AgentResult:
         """Resume an existing agent session. Default falls back to run_agent."""
-        return self.run_agent(prompt, working_dir, display_callback, timeout, env)
+        return self.run_agent(prompt, working_dir, display_callback, timeout, env, model=model)
 
     def run_interactive(
         self,
         prompt: str,
         working_dir: str,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> InteractiveResult:
         """Run an interactive terminal session. Default raises NotImplementedError."""
         raise NotImplementedError(f"{self.name()} backend does not support interactive mode")
@@ -121,6 +129,7 @@ class ClaudeBackend(Backend):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> AgentResult:
         session_id = str(uuid.uuid4())
         cmd = [
@@ -132,8 +141,10 @@ class ClaudeBackend(Backend):
             "--verbose",
             "--session-id",
             session_id,
-            prompt,
         ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
         result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env)
         result.session_id = session_id
         return result
@@ -146,6 +157,7 @@ class ClaudeBackend(Backend):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> AgentResult:
         cmd = [
             "claude",
@@ -156,8 +168,10 @@ class ClaudeBackend(Backend):
             "--verbose",
             "--resume",
             session_id,
-            prompt,
         ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
         result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env)
         result.session_id = session_id
         return result
@@ -167,6 +181,7 @@ class ClaudeBackend(Backend):
         prompt: str,
         working_dir: str,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> InteractiveResult:
         import sys
 
@@ -177,8 +192,10 @@ class ClaudeBackend(Backend):
             session_id,
             "--dangerously-skip-permissions",
             "--verbose",
-            prompt,
         ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
         proc_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         if env:
             proc_env.update(env)
@@ -316,6 +333,7 @@ class CodexBackend(Backend):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> AgentResult:
         cmd = [
             "npx",
@@ -324,8 +342,10 @@ class CodexBackend(Backend):
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
-            "-",
         ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
         return self._run_codex_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
 
     def resume_agent(
@@ -336,6 +356,7 @@ class CodexBackend(Backend):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> AgentResult:
         cmd = [
             "npx",
@@ -346,8 +367,10 @@ class CodexBackend(Backend):
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
-            "-",
         ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
         result = self._run_codex_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
         result.session_id = session_id
         return result

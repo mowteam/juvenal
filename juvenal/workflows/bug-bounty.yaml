@@ -151,6 +151,10 @@ phases:
       **Output**
       Output a **brief** description of the bug and the PoC into `output/<bug-name>.md` and `output/<bug-name>-poc`, respectively.
     analysis:
+      # Models default per role: claude → opus 4.7 1M for captain/worker,
+      # sonnet 4.6 for verifier/reporter; codex → CLI default.
+      # Override with `captain_model`, `worker_model`, `verifier_model`, or a
+      # per-spec `model:` field if needed.
       captain_backend: claude
       worker_backend: codex
       max_workers: 4

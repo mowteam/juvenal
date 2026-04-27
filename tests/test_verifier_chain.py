@@ -930,9 +930,9 @@ phases:
     cmd_validate(args)
     out = capsys.readouterr().out
     assert "verifier chain (2)" in out
-    assert "poc(claude)" in out
-    assert "scope(codex)" in out
-    assert "reporter: enabled" in out
+    assert "1. poc: claude" in out
+    assert "2. scope: codex" in out
+    assert "reporter: claude" in out
 
 
 def test_print_status_renders_chain_and_reporter(tmp_path):
@@ -1042,3 +1042,150 @@ def test_print_status_renders_chain_and_reporter(tmp_path):
         state.print_status()
     rendered = buf.getvalue().replace("\n", " ")
     assert "1 reported" in rendered
+
+
+# --- Per-role model selection -------------------------------------------------
+
+
+def test_resolve_model_defaults():
+    """Claude gets opus 4.7 1M for captain/worker, sonnet 4.6 for verifier/reporter; Codex stays None."""
+    from juvenal.dynamic.runner import _resolve_model
+
+    assert _resolve_model("claude", "captain", None) == "claude-opus-4-7[1m]"
+    assert _resolve_model("claude", "worker", None) == "claude-opus-4-7[1m]"
+    assert _resolve_model("claude", "verifier", None) == "claude-sonnet-4-6"
+    assert _resolve_model("claude", "reporter", None) == "claude-sonnet-4-6"
+    assert _resolve_model("codex", "captain", None) is None
+    assert _resolve_model("codex", "verifier", None) is None
+    # Explicit override wins over defaults.
+    assert _resolve_model("claude", "captain", "claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
+    assert _resolve_model("codex", "worker", "gpt-5") == "gpt-5"
+
+
+def test_default_models_used_when_yaml_omits_them(tmp_path):
+    """A workflow that doesn't set any model fields gets juvenal's defaults at the call sites."""
+    backend = MockBackend()
+    claim_id = _queue_full_chain_pass(backend)
+
+    def _write_report(prompt: str, env: dict | None) -> None:
+        (tmp_path / "output" / claim_id).mkdir(parents=True, exist_ok=True)
+        (tmp_path / "output" / claim_id / "report.md").write_text("# r")
+
+    backend.add_role_side_effect("reporter", _write_report)
+    backend.add_role_response("reporter", output="done")
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    config = _three_verifier_with_reporter()
+    _run_runner(tmp_path, backend, config=config)
+
+    # Walk the recorded calls. Every captain/worker call should land on opus 4.7 1M;
+    # every verifier/reporter call should land on sonnet 4.6.
+    captain_models = [m for r, m in backend.model_calls if r == "captain"]
+    worker_models = [m for r, m in backend.model_calls if r == "worker"]
+    verifier_models = [m for r, m in backend.model_calls if r and r.startswith("verifier")]
+    reporter_models = [m for r, m in backend.model_calls if r == "reporter"]
+
+    assert captain_models and all(m == "claude-opus-4-7[1m]" for m in captain_models)
+    assert worker_models and all(m == "claude-opus-4-7[1m]" for m in worker_models)
+    assert verifier_models and all(m == "claude-sonnet-4-6" for m in verifier_models)
+    assert reporter_models and all(m == "claude-sonnet-4-6" for m in reporter_models)
+
+
+def test_yaml_overrides_take_precedence(tmp_path):
+    """Per-role and per-spec model overrides beat defaults."""
+    backend = MockBackend()
+    claim_id = _queue_full_chain_pass(backend)
+
+    def _write_report(prompt: str, env: dict | None) -> None:
+        (tmp_path / "output" / claim_id).mkdir(parents=True, exist_ok=True)
+        (tmp_path / "output" / claim_id / "report.md").write_text("# r")
+
+    backend.add_role_side_effect("reporter", _write_report)
+    backend.add_role_response("reporter", output="done")
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    # Override at every layer.
+    config = AnalysisConfig(
+        max_workers=1,
+        max_verifiers=1,
+        max_worker_retries=1,
+        captain_model="claude-opus-4-7",  # captain override
+        worker_model="claude-opus-4-7",  # worker override
+        verifier_model="claude-sonnet-4-6",  # default for verifiers
+        verifiers=[
+            VerifierSpec(name="poc", backend="claude", prompt="x"),  # inherits verifier_model
+            VerifierSpec(name="scope", backend="claude", model="claude-haiku-4-5-20251001", prompt="x"),
+            VerifierSpec(name="novelty", backend="claude", prompt="x"),
+        ],
+        reporter=ReporterSpec(backend="claude", model="claude-haiku-4-5-20251001", prompt="x"),
+    )
+    _run_runner(tmp_path, backend, config=config)
+
+    captain = [m for r, m in backend.model_calls if r == "captain"]
+    worker = [m for r, m in backend.model_calls if r == "worker"]
+    poc = [m for r, m in backend.model_calls if r == "verifier:poc"]
+    scope = [m for r, m in backend.model_calls if r == "verifier:scope"]
+    novelty = [m for r, m in backend.model_calls if r == "verifier:novelty"]
+    reporter = [m for r, m in backend.model_calls if r == "reporter"]
+
+    assert all(m == "claude-opus-4-7" for m in captain)
+    assert all(m == "claude-opus-4-7" for m in worker)
+    assert all(m == "claude-sonnet-4-6" for m in poc)  # inherits verifier_model
+    assert all(m == "claude-haiku-4-5-20251001" for m in scope)  # per-spec override
+    assert all(m == "claude-sonnet-4-6" for m in novelty)
+    assert all(m == "claude-haiku-4-5-20251001" for m in reporter)
+
+
+def test_codex_backend_passes_no_model_by_default(tmp_path):
+    """Codex backend on captain/worker gets None model — runner trusts CLI default."""
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(enqueue_targets=[_target("target-1")]))
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    config = AnalysisConfig(
+        captain_backend="codex",
+        worker_backend="codex",
+        max_workers=1,
+        max_verifiers=1,
+    )
+    _run_runner(tmp_path, backend, config=config)
+
+    assert all(m is None for r, m in backend.model_calls if r in ("captain", "worker"))
+
+
+def test_yaml_parser_accepts_model_fields(tmp_path):
+    raw = {
+        "captain_model": "claude-opus-4-7[1m]",
+        "worker_model": "claude-opus-4-7[1m]",
+        "verifier_model": "claude-sonnet-4-6",
+        "verifiers": [
+            {"name": "poc", "prompt": "x"},
+            {"name": "scope", "prompt": "x", "model": "claude-haiku-4-5-20251001"},
+        ],
+        "reporter": {"prompt": "x"},
+    }
+    cfg = _parse_analysis_config(raw, phase_id="p")
+    assert cfg is not None
+    assert cfg.captain_model == "claude-opus-4-7[1m]"
+    assert cfg.worker_model == "claude-opus-4-7[1m]"
+    assert cfg.verifier_model == "claude-sonnet-4-6"
+    assert cfg.verifiers[0].model == "claude-sonnet-4-6"  # inherits verifier_model
+    assert cfg.verifiers[1].model == "claude-haiku-4-5-20251001"  # per-spec override
+    assert cfg.reporter is not None
+    assert cfg.reporter.model == "claude-sonnet-4-6"  # inherits verifier_model
+
+
+def test_yaml_parser_rejects_empty_model_string():
+    raw = {"captain_model": "", "verifiers": [{"name": "poc", "prompt": "x"}]}
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        _parse_analysis_config(raw, phase_id="p")

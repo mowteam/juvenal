@@ -1077,12 +1077,32 @@ class Engine:
                 prompt_preview = prompt_preview[:80].replace("\n", " ")
                 print(f"{prefix} [{phase.type}] {phase.id}{extra_str}")
                 print(f"     prompt: {prompt_preview}...")
+                from juvenal.dynamic.runner import _resolve_model
+
+                def _model_str(backend: str, role: str, configured: str | None) -> str:
+                    resolved = _resolve_model(backend, role, configured)
+                    if configured is not None:
+                        return f"{resolved} (override)"
+                    if resolved is not None:
+                        return f"{resolved} (default)"
+                    return "(CLI default)"
+
                 print("     analysis:")
-                print(f"       captain_backend: {config.captain_backend}")
-                print(f"       worker_backend: {config.worker_backend}")
+                print(
+                    f"       captain: {config.captain_backend} / "
+                    f"{_model_str(config.captain_backend, 'captain', config.captain_model)}"
+                )
+                print(
+                    f"       worker:  {config.worker_backend} / "
+                    f"{_model_str(config.worker_backend, 'worker', config.worker_model)}"
+                )
                 if config.verifiers:
-                    chain_str = " → ".join(f"{spec.name}({spec.backend})" for spec in config.verifiers)
-                    print(f"       verifier chain ({len(config.verifiers)}): {chain_str}")
+                    print(f"       verifier chain ({len(config.verifiers)}):")
+                    for i, spec in enumerate(config.verifiers, start=1):
+                        print(
+                            f"         {i}. {spec.name}: {spec.backend} / "
+                            f"{_model_str(spec.backend, 'verifier', spec.model)}"
+                        )
                 else:
                     print(f"       verifier_backend: {config.verifier_backend} (single-verifier default)")
                 print(f"       max_workers: {config.max_workers}")
@@ -1095,7 +1115,10 @@ class Engine:
                 print(f"       max_captain_repairs: {config.max_captain_repairs}")
                 print(f"       allow_repo_tools: {str(config.allow_repo_tools).lower()}")
                 if config.reporter is not None:
-                    print(f"       reporter: enabled (backend={config.reporter.backend})")
+                    print(
+                        f"       reporter: {config.reporter.backend} / "
+                        f"{_model_str(config.reporter.backend, 'reporter', config.reporter.model)}"
+                    )
                 else:
                     print("       reporter: disabled")
             print()

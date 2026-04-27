@@ -321,6 +321,7 @@ class VerifierSpec:
 
     name: str
     backend: str = "claude"
+    model: str | None = None
     prompt: str = ""
 
 
@@ -335,6 +336,7 @@ class ReporterSpec:
     """
 
     backend: str = "claude"
+    model: str | None = None
     prompt: str = ""
 
 
@@ -343,8 +345,11 @@ class AnalysisConfig:
     """Configuration for a dynamic analysis phase."""
 
     captain_backend: str = "claude"
+    captain_model: str | None = None
     worker_backend: str = "claude"
+    worker_model: str | None = None
     verifier_backend: str = "claude"
+    verifier_model: str | None = None
     max_workers: int = 4
     max_verifiers: int = 8
     interaction_timeout: float = 3.0
@@ -359,8 +364,11 @@ class AnalysisConfig:
 _ANALYSIS_BACKENDS = {"claude", "codex"}
 _ANALYSIS_CONFIG_KEYS = {
     "captain_backend",
+    "captain_model",
     "worker_backend",
+    "worker_model",
     "verifier_backend",
+    "verifier_model",
     "max_workers",
     "max_verifiers",
     "interaction_timeout",
@@ -371,9 +379,9 @@ _ANALYSIS_CONFIG_KEYS = {
     "verifiers",
     "reporter",
 }
-_VERIFIER_SPEC_KEYS = {"name", "backend", "prompt", "prompt_file"}
+_VERIFIER_SPEC_KEYS = {"name", "backend", "model", "prompt", "prompt_file"}
 _VERIFIER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-_REPORTER_SPEC_KEYS = {"backend", "prompt", "prompt_file"}
+_REPORTER_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
 
 
 def _parse_analysis_backend(value: Any, *, phase_id: str, field_name: str) -> str:
@@ -406,11 +414,21 @@ def _parse_analysis_float(value: Any, *, phase_id: str, field_name: str, minimum
     return value
 
 
+def _parse_optional_model(value: Any, *, phase_id: str, field_name: str) -> str | None:
+    """Validate an optional model identifier. ``None`` = use CLI default."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Phase '{phase_id}': analysis.{field_name} must be a non-empty string when set")
+    return value
+
+
 def _parse_verifier_specs(
     raw: Any,
     *,
     phase_id: str,
     default_backend: str,
+    default_model: str | None,
     yaml_path: Path | None,
 ) -> list[VerifierSpec]:
     """Validate and load the analysis.verifiers list."""
@@ -445,6 +463,12 @@ def _parse_verifier_specs(
         backend = entry.get("backend", default_backend)
         backend = _parse_analysis_backend(backend, phase_id=phase_id, field_name=f"verifiers[{index}].backend")
 
+        model = _parse_optional_model(
+            entry.get("model", default_model),
+            phase_id=phase_id,
+            field_name=f"verifiers[{index}].model",
+        )
+
         has_prompt = "prompt" in entry
         has_prompt_file = "prompt_file" in entry
         if has_prompt and has_prompt_file:
@@ -468,7 +492,7 @@ def _parse_verifier_specs(
             if not isinstance(prompt, str):
                 raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}].prompt must be a string")
 
-        specs.append(VerifierSpec(name=name, backend=backend, prompt=prompt))
+        specs.append(VerifierSpec(name=name, backend=backend, model=model, prompt=prompt))
 
     return specs
 
@@ -478,6 +502,7 @@ def _parse_reporter_spec(
     *,
     phase_id: str,
     default_backend: str,
+    default_model: str | None,
     yaml_path: Path | None,
 ) -> ReporterSpec:
     """Validate and load the analysis.reporter block."""
@@ -489,6 +514,12 @@ def _parse_reporter_spec(
 
     backend = raw.get("backend", default_backend)
     backend = _parse_analysis_backend(backend, phase_id=phase_id, field_name="reporter.backend")
+
+    model = _parse_optional_model(
+        raw.get("model", default_model),
+        phase_id=phase_id,
+        field_name="reporter.model",
+    )
 
     has_prompt = "prompt" in raw
     has_prompt_file = "prompt_file" in raw
@@ -509,7 +540,7 @@ def _parse_reporter_spec(
         if not isinstance(prompt, str):
             raise ValueError(f"Phase '{phase_id}': analysis.reporter.prompt must be a string")
 
-    return ReporterSpec(backend=backend, prompt=prompt)
+    return ReporterSpec(backend=backend, model=model, prompt=prompt)
 
 
 def _parse_analysis_config(
@@ -546,6 +577,9 @@ def _parse_analysis_config(
         phase_id=phase_id,
         field_name="verifier_backend",
     )
+    captain_model = _parse_optional_model(raw.get("captain_model"), phase_id=phase_id, field_name="captain_model")
+    worker_model = _parse_optional_model(raw.get("worker_model"), phase_id=phase_id, field_name="worker_model")
+    verifier_model = _parse_optional_model(raw.get("verifier_model"), phase_id=phase_id, field_name="verifier_model")
     max_workers = _parse_analysis_int(
         raw.get("max_workers", defaults.max_workers), phase_id=phase_id, field_name="max_workers", minimum=1
     )
@@ -585,6 +619,7 @@ def _parse_analysis_config(
             raw["verifiers"],
             phase_id=phase_id,
             default_backend=verifier_backend,
+            default_model=verifier_model,
             yaml_path=yaml_path,
         )
 
@@ -594,6 +629,7 @@ def _parse_analysis_config(
             raw["reporter"],
             phase_id=phase_id,
             default_backend=verifier_backend,
+            default_model=verifier_model,
             yaml_path=yaml_path,
         )
 
@@ -601,6 +637,9 @@ def _parse_analysis_config(
         captain_backend=captain_backend,
         worker_backend=worker_backend,
         verifier_backend=verifier_backend,
+        captain_model=captain_model,
+        worker_model=worker_model,
+        verifier_model=verifier_model,
         max_workers=max_workers,
         max_verifiers=max_verifiers,
         interaction_timeout=interaction_timeout,

@@ -52,6 +52,37 @@ _IDLE_SLEEP_SECONDS = 0.05
 _MAX_SINGLE_BACKOFF_SECONDS = 3600  # 1 hour per wait
 _MAX_TOTAL_BACKOFF_SECONDS = 5 * 3600  # 5 hours cumulative across all waits in a run
 
+# Per-backend, per-role default model. When the YAML does not specify a model
+# (and no role-level override is set), this picks the right tier so users
+# don't have to write model identifiers in every workflow. Captain and worker
+# get the strongest tier (long context, high reasoning); verifier and reporter
+# get a faster/cheaper tier since their tasks are more bounded. Codex uses
+# whatever the CLI defaults to — we don't pick a model on its behalf.
+_DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
+    "claude": {
+        "captain": "claude-opus-4-7[1m]",
+        "worker": "claude-opus-4-7[1m]",
+        "verifier": "claude-sonnet-4-6",
+        "reporter": "claude-sonnet-4-6",
+    },
+    "codex": {
+        "captain": None,
+        "worker": None,
+        "verifier": None,
+        "reporter": None,
+    },
+}
+
+
+def _resolve_model(backend: str, role: str, configured: str | None) -> str | None:
+    """Resolve the effective model for a (backend, role).
+
+    Priority: explicit YAML override > backend/role default > CLI default (None).
+    """
+    if configured is not None:
+        return configured
+    return _DEFAULT_MODELS_BY_BACKEND_AND_ROLE.get(backend, {}).get(role)
+
 
 @dataclass
 class _WorkerExecutionResult:
@@ -431,6 +462,7 @@ class DynamicAnalysisRunner:
         backend = self._get_backend(self.config.captain_backend)
         session_id = self.state.captain.session_id
 
+        captain_model = _resolve_model(self.config.captain_backend, "captain", self.config.captain_model)
         if session_id:
             result = backend.resume_agent(
                 session_id,
@@ -438,6 +470,7 @@ class DynamicAnalysisRunner:
                 working_dir=str(self.working_dir),
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
+                model=captain_model,
             )
         else:
             result = backend.run_agent(
@@ -445,6 +478,7 @@ class DynamicAnalysisRunner:
                 working_dir=str(self.working_dir),
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
+                model=captain_model,
             )
 
         if result.session_id:
@@ -517,6 +551,7 @@ class DynamicAnalysisRunner:
                 working_dir=str(self.working_dir),
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
+                model=_resolve_model(self.config.captain_backend, "captain", self.config.captain_model),
             )
             if result.session_id:
                 self.state.captain.session_id = result.session_id
@@ -1213,6 +1248,7 @@ class DynamicAnalysisRunner:
             working_dir=str(self.working_dir),
             timeout=self.phase.timeout,
             env=self._role_env("worker"),
+            model=_resolve_model(self.config.worker_backend, "worker", self.config.worker_model),
         )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -1245,11 +1281,13 @@ class DynamicAnalysisRunner:
 
     def _execute_verifier(self, verification: VerificationRecord, prompt: str) -> _VerifierExecutionResult:
         backend = self._get_backend(verification.backend)
+        spec = self._verifier_chain[verification.verifier_index]
         result = backend.run_agent(
             prompt,
             working_dir=str(self.working_dir),
             timeout=self.phase.timeout,
             env=self._role_env("verifier", verifier_name=verification.verifier_name),
+            model=_resolve_model(spec.backend, "verifier", spec.model),
         )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -1399,12 +1437,15 @@ class DynamicAnalysisRunner:
         return scheduled
 
     def _execute_reporter(self, claim: ClaimRecord, prompt: str) -> _ReporterExecutionResult:
-        backend = self._get_backend(self._reporter_spec.backend if self._reporter_spec else "claude")
+        spec_backend = self._reporter_spec.backend if self._reporter_spec else "claude"
+        spec_model = self._reporter_spec.model if self._reporter_spec else None
+        backend = self._get_backend(spec_backend)
         result = backend.run_agent(
             prompt,
             working_dir=str(self.working_dir),
             timeout=self.phase.timeout,
             env=self._role_env("reporter"),
+            model=_resolve_model(spec_backend, "reporter", spec_model),
         )
         if result.exit_code != 0:
             return _ReporterExecutionResult(

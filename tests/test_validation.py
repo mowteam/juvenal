@@ -247,8 +247,8 @@ class TestValidateWorkflow:
         assert "[analysis] analyze" in captured.out
         assert "Analyze repo." in captured.out
         assert "analysis:" in captured.out
-        assert "captain_backend: claude" in captured.out
-        assert "worker_backend: claude" in captured.out
+        assert "captain: claude" in captured.out
+        assert "worker:  claude" in captured.out
         assert "verifier_backend: claude" in captured.out
         assert "max_workers: 6" in captured.out
         assert "max_verifiers: 9" in captured.out
@@ -757,8 +757,8 @@ phases:
         assert cmd_validate(args) == 0
         captured = capsys.readouterr()
         assert "[analysis] analyze" in captured.out
-        assert "captain_backend: claude" in captured.out
-        assert "worker_backend: claude" in captured.out
+        assert "captain: claude" in captured.out
+        assert "worker:  claude" in captured.out
         assert "verifier_backend: claude" in captured.out
         assert "max_workers: 2" in captured.out
         assert "max_verifiers: 3" in captured.out

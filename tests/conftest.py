@@ -103,6 +103,9 @@ class MockBackend(Backend):
         self.resume_calls: list[tuple[str, str]] = []
         self.interactive_calls: list[str] = []
         self.role_calls: list[tuple[str | None, str]] = []
+        # Each agent call records (role, model) for assertion in tests of model
+        # selection. `model` is None when the runner falls back to the CLI default.
+        self.model_calls: list[tuple[str | None, str | None]] = []
 
     def add_role_side_effect(self, role: str, side_effect) -> None:
         """Register a callable invoked the next time `role` is dispatched.
@@ -210,24 +213,26 @@ class MockBackend(Backend):
             side_effect = queue.pop(0)
         side_effect(prompt, env)
 
-    def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None):
+    def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
         self.role_calls.append((role, prompt))
+        self.model_calls.append((role, model))
         self._consume_side_effect(role, prompt, env)
         return self._next_result(role)
 
-    def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None):
+    def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
         role = self._detect_role(prompt, env)
         self.resume_calls.append((session_id, prompt))
         self.role_calls.append((role, prompt))
+        self.model_calls.append((role, model))
         self._consume_side_effect(role, prompt, env)
         return self._next_result(role)
 
     def add_interactive_response(self, exit_code: int = 0, session_id: str = "mock-session"):
         self._interactive_responses.append(InteractiveResult(session_id=session_id, exit_code=exit_code))
 
-    def run_interactive(self, prompt, working_dir, env=None):
+    def run_interactive(self, prompt, working_dir, env=None, model=None):
         self.interactive_calls.append(prompt)
         if self._interactive_responses:
             return self._interactive_responses.pop(0)
