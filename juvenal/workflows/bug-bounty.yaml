@@ -1,5 +1,5 @@
 name: bug-bounty
-backend: codex
+backend: claude
 
 vars:
   REPO: ""               # Repository name or clone URL (e.g. "curl/curl" or "https://github.com/curl/curl")
@@ -156,7 +156,7 @@ phases:
       # Override with `captain_model`, `worker_model`, `verifier_model`, or a
       # per-spec `model:` field if needed.
       captain_backend: claude
-      worker_backend: codex
+      worker_backend: claude
       max_workers: 4
       max_verifiers: 8
       interaction_timeout: 3.0
