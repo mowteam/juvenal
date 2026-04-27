@@ -183,8 +183,13 @@ class DynamicSessionState:
                 os.fsync(handle.fileno())
             os.replace(tmp_path, self.state_file)
 
-    def normalize_for_resume(self) -> None:
-        """Rewrite interrupted in-flight work into deterministic schedulable state."""
+    def normalize_for_resume(self, *, verifier_chain_length: int | None = None) -> None:
+        """Rewrite interrupted in-flight work into deterministic schedulable state.
+
+        If ``verifier_chain_length`` is provided, claims are only promoted to ``verified``
+        when their highest-passed verifier index equals ``verifier_chain_length - 1``.
+        Mid-chain passes leave the claim in ``verifying`` so the next chain step runs.
+        """
 
         with self._lock:
             now = time.time()
@@ -239,18 +244,32 @@ class DynamicSessionState:
                 rejected = self._latest_terminal_verification(relevant, status="failed", disposition="rejected")
                 verified = self._latest_terminal_verification(relevant, status="passed", disposition="verified")
                 has_pending = any(verification.status == "pending" for verification in relevant)
+                passed_indices = {
+                    verification.verifier_index
+                    for verification in relevant
+                    if verification.status == "passed" and verification.disposition == "verified"
+                }
+                if verifier_chain_length is None:
+                    chain_complete = verified is not None
+                else:
+                    chain_complete = bool(passed_indices) and max(passed_indices) == verifier_chain_length - 1
 
                 if rejected is not None:
                     claim.status = "rejected"
                     claim.rejection_class = rejected.rejection_class
                     claim.rejected_at = rejected.completed_at
                     claim.verified_at = None
-                elif verified is not None:
+                    if rejected.verifier_name:
+                        claim.failing_verifier_name = rejected.verifier_name
+                elif verified is not None and chain_complete:
                     claim.status = "verified"
                     claim.rejection_class = None
                     claim.verified_at = verified.completed_at
                     claim.rejected_at = None
-                elif has_pending:
+                elif verified is not None or has_pending:
+                    # Mid-chain: at least one verifier passed but the chain isn't complete,
+                    # or a verification is still pending. Keep the claim in verifying so
+                    # the runner schedules the next chain step.
                     claim.status = "verifying"
                     claim.rejection_class = None
                     claim.verified_at = None

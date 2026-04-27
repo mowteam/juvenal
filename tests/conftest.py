@@ -89,7 +89,13 @@ class MockBackend(Backend):
     def __init__(self, responses: list[AgentResult] | None = None):
         super().__init__()
         self._responses = list(responses or [])
-        self._role_responses: dict[str, list[AgentResult]] = {"captain": [], "worker": [], "verifier": []}
+        self._role_responses: dict[str, list[AgentResult]] = {
+            "captain": [],
+            "worker": [],
+            "verifier": [],
+            "reporter": [],
+        }
+        self._role_side_effects: dict[str, list] = {}
         self._interactive_responses: list[InteractiveResult] = []
         self._call_count = 0
         self._queue_lock = Lock()
@@ -97,6 +103,15 @@ class MockBackend(Backend):
         self.resume_calls: list[tuple[str, str]] = []
         self.interactive_calls: list[str] = []
         self.role_calls: list[tuple[str | None, str]] = []
+
+    def add_role_side_effect(self, role: str, side_effect) -> None:
+        """Register a callable invoked the next time `role` is dispatched.
+
+        Side effects are FIFO per role and consumed once. The callable receives
+        `(prompt, env)`. Used by tests to simulate filesystem effects (e.g., a
+        reporter creating its output file) at the moment the agent runs.
+        """
+        self._role_side_effects.setdefault(role, []).append(side_effect)
 
     def name(self) -> str:
         return "mock"
@@ -123,9 +138,9 @@ class MockBackend(Backend):
         if role is None:
             self._responses.append(result)
             return
-        if role not in self._role_responses:
+        if role not in self._role_responses and not role.startswith("verifier:"):
             raise ValueError(f"Unknown mock backend role: {role!r}")
-        self._role_responses[role].append(result)
+        self._role_responses.setdefault(role, []).append(result)
 
     def add_role_response(
         self,
@@ -151,6 +166,13 @@ class MockBackend(Backend):
     def _detect_role(self, prompt: str, env: dict[str, str] | None) -> str | None:
         if env is not None:
             role = env.get("JUVENAL_ANALYSIS_ROLE")
+            if role == "verifier":
+                verifier_name = env.get("JUVENAL_ANALYSIS_VERIFIER_NAME")
+                if verifier_name:
+                    keyed = f"verifier:{verifier_name}"
+                    if self._role_responses.get(keyed):
+                        return keyed
+                return "verifier"
             if role in self._role_responses:
                 return role
         if "You are the captain for Juvenal's dynamic `analysis` phase." in prompt:
@@ -159,28 +181,47 @@ class MockBackend(Backend):
             return "worker"
         if "You are an independent verifier for Juvenal's dynamic `analysis` phase." in prompt:
             return "verifier"
+        if "You are the reporter agent for Juvenal's dynamic `analysis` phase." in prompt:
+            return "reporter"
         return None
 
     def _next_result(self, role: str | None) -> AgentResult:
         with self._queue_lock:
-            if role is not None and self._role_responses[role]:
+            if role is not None and self._role_responses.get(role):
                 self._call_count += 1
                 return self._role_responses[role].pop(0)
+            # Fallback for keyed verifier roles: if no per-verifier response is queued,
+            # fall back to the generic "verifier" queue.
+            if role is not None and role.startswith("verifier:") and self._role_responses.get("verifier"):
+                self._call_count += 1
+                return self._role_responses["verifier"].pop(0)
             if self._responses:
                 self._call_count += 1
                 return self._responses.pop(0)
         return AgentResult(exit_code=0, output="VERDICT: PASS", transcript="", duration=0.1)
 
+    def _consume_side_effect(self, role: str | None, prompt: str, env: dict[str, str] | None) -> None:
+        if role is None:
+            return
+        with self._queue_lock:
+            queue = self._role_side_effects.get(role)
+            if not queue:
+                return
+            side_effect = queue.pop(0)
+        side_effect(prompt, env)
+
     def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
         self.role_calls.append((role, prompt))
+        self._consume_side_effect(role, prompt, env)
         return self._next_result(role)
 
     def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None):
         role = self._detect_role(prompt, env)
         self.resume_calls.append((session_id, prompt))
         self.role_calls.append((role, prompt))
+        self._consume_side_effect(role, prompt, env)
         return self._next_result(role)
 
     def add_interactive_response(self, exit_code: int = 0, session_id: str = "mock-session"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -315,6 +316,29 @@ def _describe_template_render_error(phase_id: str, field_name: str, exc: Excepti
 
 
 @dataclass
+class VerifierSpec:
+    """One verifier in an analysis verifier chain."""
+
+    name: str
+    backend: str = "claude"
+    prompt: str = ""
+
+
+@dataclass
+class ReporterSpec:
+    """Optional reporter agent that runs once per fully-verified claim.
+
+    The reporter writes a per-bug directory (typically `output/<claim-id>/`)
+    containing a human-readable report and any PoC artifacts. It is invoked
+    by the runner immediately after the final verifier in the chain passes,
+    and is skipped on resume if the claim was already reported.
+    """
+
+    backend: str = "claude"
+    prompt: str = ""
+
+
+@dataclass
 class AnalysisConfig:
     """Configuration for a dynamic analysis phase."""
 
@@ -328,6 +352,8 @@ class AnalysisConfig:
     max_captain_repairs: int = 2
     allow_repo_tools: bool = True
     max_consecutive_errors: int = 5
+    verifiers: list[VerifierSpec] = field(default_factory=list)
+    reporter: ReporterSpec | None = None
 
 
 _ANALYSIS_BACKENDS = {"claude", "codex"}
@@ -342,7 +368,12 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_captain_repairs",
     "allow_repo_tools",
     "max_consecutive_errors",
+    "verifiers",
+    "reporter",
 }
+_VERIFIER_SPEC_KEYS = {"name", "backend", "prompt", "prompt_file"}
+_VERIFIER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_REPORTER_SPEC_KEYS = {"backend", "prompt", "prompt_file"}
 
 
 def _parse_analysis_backend(value: Any, *, phase_id: str, field_name: str) -> str:
@@ -375,7 +406,115 @@ def _parse_analysis_float(value: Any, *, phase_id: str, field_name: str, minimum
     return value
 
 
-def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> AnalysisConfig | None:
+def _parse_verifier_specs(
+    raw: Any,
+    *,
+    phase_id: str,
+    default_backend: str,
+    yaml_path: Path | None,
+) -> list[VerifierSpec]:
+    """Validate and load the analysis.verifiers list."""
+    if not isinstance(raw, list):
+        raise ValueError(f"Phase '{phase_id}': analysis.verifiers must be a list")
+    if not raw:
+        raise ValueError(
+            f"Phase '{phase_id}': analysis.verifiers cannot be empty; "
+            "omit the key to use the default single-verifier behavior"
+        )
+
+    specs: list[VerifierSpec] = []
+    seen_names: set[str] = set()
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}] must be a mapping")
+        unknown = set(entry.keys()) - _VERIFIER_SPEC_KEYS
+        if unknown:
+            raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}] has unknown keys {sorted(unknown)}")
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}].name must be a non-empty string")
+        if not _VERIFIER_NAME_PATTERN.match(name):
+            raise ValueError(
+                f"Phase '{phase_id}': analysis.verifiers[{index}].name {name!r} must match [A-Za-z0-9][A-Za-z0-9_-]*"
+            )
+        if name in seen_names:
+            raise ValueError(f"Phase '{phase_id}': analysis.verifiers has duplicate name {name!r}")
+        seen_names.add(name)
+
+        backend = entry.get("backend", default_backend)
+        backend = _parse_analysis_backend(backend, phase_id=phase_id, field_name=f"verifiers[{index}].backend")
+
+        has_prompt = "prompt" in entry
+        has_prompt_file = "prompt_file" in entry
+        if has_prompt and has_prompt_file:
+            raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}] cannot set both prompt and prompt_file")
+        if not has_prompt and not has_prompt_file:
+            raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}] must set prompt or prompt_file")
+
+        if has_prompt_file:
+            prompt_file = entry["prompt_file"]
+            if not isinstance(prompt_file, str) or not prompt_file:
+                raise ValueError(
+                    f"Phase '{phase_id}': analysis.verifiers[{index}].prompt_file must be a non-empty string"
+                )
+            if yaml_path is None:
+                raise ValueError(
+                    f"Phase '{phase_id}': analysis.verifiers[{index}].prompt_file is unsupported in this context"
+                )
+            prompt = (yaml_path / prompt_file).read_text()
+        else:
+            prompt = entry.get("prompt", "")
+            if not isinstance(prompt, str):
+                raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}].prompt must be a string")
+
+        specs.append(VerifierSpec(name=name, backend=backend, prompt=prompt))
+
+    return specs
+
+
+def _parse_reporter_spec(
+    raw: Any,
+    *,
+    phase_id: str,
+    default_backend: str,
+    yaml_path: Path | None,
+) -> ReporterSpec:
+    """Validate and load the analysis.reporter block."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Phase '{phase_id}': analysis.reporter must be a mapping")
+    unknown = set(raw.keys()) - _REPORTER_SPEC_KEYS
+    if unknown:
+        raise ValueError(f"Phase '{phase_id}': analysis.reporter has unknown keys {sorted(unknown)}")
+
+    backend = raw.get("backend", default_backend)
+    backend = _parse_analysis_backend(backend, phase_id=phase_id, field_name="reporter.backend")
+
+    has_prompt = "prompt" in raw
+    has_prompt_file = "prompt_file" in raw
+    if has_prompt and has_prompt_file:
+        raise ValueError(f"Phase '{phase_id}': analysis.reporter cannot set both prompt and prompt_file")
+    if not has_prompt and not has_prompt_file:
+        raise ValueError(f"Phase '{phase_id}': analysis.reporter must set prompt or prompt_file")
+
+    if has_prompt_file:
+        prompt_file = raw["prompt_file"]
+        if not isinstance(prompt_file, str) or not prompt_file:
+            raise ValueError(f"Phase '{phase_id}': analysis.reporter.prompt_file must be a non-empty string")
+        if yaml_path is None:
+            raise ValueError(f"Phase '{phase_id}': analysis.reporter.prompt_file is unsupported in this context")
+        prompt = (yaml_path / prompt_file).read_text()
+    else:
+        prompt = raw.get("prompt", "")
+        if not isinstance(prompt, str):
+            raise ValueError(f"Phase '{phase_id}': analysis.reporter.prompt must be a string")
+
+    return ReporterSpec(backend=backend, prompt=prompt)
+
+
+def _parse_analysis_config(
+    raw: dict[str, Any] | None, *, phase_id: str, yaml_path: Path | None = None
+) -> AnalysisConfig | None:
     """Parse the nested analysis config from YAML."""
     if raw is None:
         return None
@@ -385,6 +524,11 @@ def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> Anal
     unknown = set(raw.keys()) - _ANALYSIS_CONFIG_KEYS
     if unknown:
         raise ValueError(f"Phase '{phase_id}': analysis has unknown keys {sorted(unknown)}")
+
+    if "verifiers" in raw and "verifier_backend" in raw:
+        raise ValueError(
+            f"Phase '{phase_id}': specify either analysis.verifier_backend or analysis.verifiers, not both"
+        )
 
     defaults = AnalysisConfig()
     captain_backend = _parse_analysis_backend(
@@ -435,6 +579,24 @@ def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> Anal
         minimum=1,
     )
 
+    verifiers: list[VerifierSpec] = []
+    if "verifiers" in raw:
+        verifiers = _parse_verifier_specs(
+            raw["verifiers"],
+            phase_id=phase_id,
+            default_backend=verifier_backend,
+            yaml_path=yaml_path,
+        )
+
+    reporter: ReporterSpec | None = None
+    if "reporter" in raw:
+        reporter = _parse_reporter_spec(
+            raw["reporter"],
+            phase_id=phase_id,
+            default_backend=verifier_backend,
+            yaml_path=yaml_path,
+        )
+
     return AnalysisConfig(
         captain_backend=captain_backend,
         worker_backend=worker_backend,
@@ -446,6 +608,8 @@ def _parse_analysis_config(raw: dict[str, Any] | None, *, phase_id: str) -> Anal
         max_captain_repairs=max_captain_repairs,
         allow_repo_tools=allow_repo_tools,
         max_consecutive_errors=max_consecutive_errors,
+        verifiers=verifiers,
+        reporter=reporter,
     )
 
 
@@ -677,7 +841,9 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         if phase_type == "analysis" and "checks" in phase_data:
             raise ValueError(f"Phase '{phase_data['id']}': analysis phases do not support 'checks'")
 
-        analysis_config = _parse_analysis_config(phase_data.get("analysis"), phase_id=phase_data["id"])
+        analysis_config = _parse_analysis_config(
+            phase_data.get("analysis"), phase_id=phase_data["id"], yaml_path=path.parent
+        )
         if phase_type == "analysis" and analysis_config is None:
             analysis_config = AnalysisConfig()
 

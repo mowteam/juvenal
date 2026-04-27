@@ -33,7 +33,7 @@ from juvenal.dynamic.protocol import (
 )
 from juvenal.dynamic.state import DynamicSessionState
 from juvenal.execution import PhaseResult
-from juvenal.workflow import AnalysisConfig, Phase, Workflow
+from juvenal.workflow import AnalysisConfig, Phase, ReporterSpec, VerifierSpec, Workflow, apply_vars
 
 _CAPTAIN_EVENT_TYPES = frozenset(
     {
@@ -49,6 +49,8 @@ _CAPTAIN_EVENT_TYPES = frozenset(
 _NON_TERMINAL_STATUSES = frozenset({"queued", "running", "verifying", "deferred", "requeue_pending"})
 _RUNNING_STATUSES = frozenset({"running", "verifying"})
 _IDLE_SLEEP_SECONDS = 0.05
+_MAX_SINGLE_BACKOFF_SECONDS = 3600  # 1 hour per wait
+_MAX_TOTAL_BACKOFF_SECONDS = 5 * 3600  # 5 hours cumulative across all waits in a run
 
 
 @dataclass
@@ -70,6 +72,18 @@ class _VerifierExecutionResult:
     agent_result: AgentResult
     report: VerificationReport | None
     error: str | None
+
+
+@dataclass
+class _ReporterExecutionResult:
+    claim_id: str
+    target_id: str
+    generation: int
+    agent_result: AgentResult
+    error: str | None
+
+
+_MAX_REPORTER_ATTEMPTS = 3
 
 
 class DynamicAnalysisRunner:
@@ -106,8 +120,12 @@ class DynamicAnalysisRunner:
         self._backend_lock = Lock()
         self._worker_executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
         self._verifier_executor = ThreadPoolExecutor(max_workers=self.config.max_verifiers)
+        self._reporter_executor = ThreadPoolExecutor(max_workers=max(1, self.config.max_workers))
         self._worker_futures: dict[Future[_WorkerExecutionResult], str] = {}
         self._verifier_futures: dict[Future[_VerifierExecutionResult], str] = {}
+        self._reporter_futures: dict[Future[_ReporterExecutionResult], str] = {}
+        self._pending_reporter_claim_ids: list[str] = []
+        self._reporter_attempts: dict[str, int] = {}
         self._captain_termination_state: Literal["continue", "complete"] = "continue"
         self._captain_termination_reason = ""
         self._last_captain_snapshot: tuple[Any, ...] | None = None
@@ -118,6 +136,7 @@ class DynamicAnalysisRunner:
         self._pending_claim_retries: list[tuple[str, str]] = []  # [(target_id, claim_id)]
         self._consecutive_errors = 0
         self._backoff_count = 0
+        self._total_backoff_seconds = 0.0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self._interaction_channel = interaction_channel if interactive else None
@@ -130,16 +149,36 @@ class DynamicAnalysisRunner:
         self._worker_role_prompt = (prompts_dir / "analysis-worker.md").read_text(encoding="utf-8")
         self._verifier_role_prompt = (prompts_dir / "analysis-verifier.md").read_text(encoding="utf-8")
 
+        if self.config.verifiers:
+            self._verifier_chain: list[VerifierSpec] = list(self.config.verifiers)
+        else:
+            self._verifier_chain = [VerifierSpec(name="default", backend=self.config.verifier_backend, prompt="")]
+        seen_names: set[str] = set()
+        for spec in self._verifier_chain:
+            if spec.name in seen_names:
+                raise ValueError(f"Phase '{self.phase.id}': verifier chain has duplicate name {spec.name!r}")
+            seen_names.add(spec.name)
+        self._rendered_verifier_prompts: dict[str, str] = {
+            spec.name: apply_vars(spec.prompt, self.workflow.vars) if spec.prompt else ""
+            for spec in self._verifier_chain
+        }
+
+        self._reporter_spec: ReporterSpec | None = self.config.reporter
+        self._rendered_reporter_prompt: str = ""
+        if self._reporter_spec is not None and self._reporter_spec.prompt:
+            self._rendered_reporter_prompt = apply_vars(self._reporter_spec.prompt, self.workflow.vars)
+
     def run(self) -> PhaseResult:
         """Run the dynamic analysis loop to completion or deterministic failure."""
 
         if self.run_mode == "resume":
-            self.state.normalize_for_resume()
+            self.state.normalize_for_resume(verifier_chain_length=len(self._verifier_chain))
         else:
             self.state = DynamicSessionState(self.state_file)
             self.state.save()
 
         self._rebuild_pending_claim_retries()
+        self._rebuild_pending_reporter_claim_ids()
 
         # Interactive tmux captain: only when --interactive without an injected test channel
         if self.interactive and not self._injected_interaction_channel:
@@ -167,6 +206,7 @@ class DynamicAnalysisRunner:
                 made_progress |= self._drain_completed_futures()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
+                made_progress |= self._schedule_reporters()
                 made_progress |= self._apply_review_point()
 
                 terminate, success, reason = self._should_terminate()
@@ -192,6 +232,7 @@ class DynamicAnalysisRunner:
                 self._interaction_channel.stop()
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
+            self._reporter_executor.shutdown(wait=False, cancel_futures=True)
 
     def _run_interactive(self) -> PhaseResult:
         """Interactive execution: captain is a Claude Code session in tmux."""
@@ -260,6 +301,7 @@ class DynamicAnalysisRunner:
                 self._drain_completed_futures()
                 self._schedule_verifiers()
                 self._schedule_workers()
+                self._schedule_reporters()
 
                 # Check stop signal
                 if (juvenal_dir / "stop").exists():
@@ -272,6 +314,7 @@ class DynamicAnalysisRunner:
                 tmux_session.kill()
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
+            self._reporter_executor.shutdown(wait=False, cancel_futures=True)
 
     def _handle_dispatch(self, data: dict[str, Any]) -> None:
         """Callback from FileWatcher when a new target dispatch is found."""
@@ -559,20 +602,35 @@ class DynamicAnalysisRunner:
 
         changed = False
         now = time.time()
+        chain_length = len(self._verifier_chain)
         for claim in self.state.claims.values():
             target = self.state.targets.get(claim.target_id)
-            if target is None or claim.status != "proposed":
+            if target is None:
+                continue
+            if claim.status not in {"proposed", "verifying"}:
                 continue
             if target.active_generation != claim.generation:
                 continue
-            if claim.verification_ids:
+
+            claim_verifications = [
+                self.state.verifications[v_id] for v_id in claim.verification_ids if v_id in self.state.verifications
+            ]
+            if any(v.status in {"pending", "running"} for v in claim_verifications):
                 continue
+            passed_indices = {
+                v.verifier_index for v in claim_verifications if v.disposition == "verified" and v.status == "passed"
+            }
+            next_index = max(passed_indices) + 1 if passed_indices else 0
+            if next_index >= chain_length:
+                continue
+
+            spec = self._verifier_chain[next_index]
             verification = VerificationRecord(
                 verification_id=self._next_verification_id(claim.claim_id),
                 claim_id=claim.claim_id,
                 target_id=claim.target_id,
                 generation=claim.generation,
-                backend=self.config.verifier_backend,
+                backend=spec.backend,
                 verifier_role="analysis-verifier",
                 session_id=None,
                 status="pending",
@@ -582,6 +640,8 @@ class DynamicAnalysisRunner:
                 raw_output="",
                 started_at=None,
                 completed_at=None,
+                verifier_name=spec.name,
+                verifier_index=next_index,
             )
             self.state.verifications[verification.verification_id] = verification
             claim.verification_ids.append(verification.verification_id)
@@ -623,7 +683,7 @@ class DynamicAnalysisRunner:
             verification.status = "running"
             verification.started_at = time.time()
             self.state.save()
-            prompt = self._build_verifier_prompt(target, claim)
+            prompt = self._build_verifier_prompt(target, claim, verification)
             future = self._verifier_executor.submit(self._execute_verifier, verification, prompt)
             self._verifier_futures[future] = verification.verification_id
             scheduled = True
@@ -676,6 +736,29 @@ class DynamicAnalysisRunner:
                         self._handle_verifier_error(verification, claim, target)
                 continue
             self._apply_verifier_result(result)
+
+        for future, claim_id in list(self._reporter_futures.items()):
+            if not future.done():
+                continue
+            progressed = True
+            self._reporter_futures.pop(future, None)
+            try:
+                result = future.result()
+            except Exception as exc:  # pragma: no cover - defensive, reporter wrapper catches normally
+                claim = self.state.claims.get(claim_id)
+                if claim is not None:
+                    fake = _ReporterExecutionResult(
+                        claim_id=claim.claim_id,
+                        target_id=claim.target_id,
+                        generation=claim.generation,
+                        agent_result=AgentResult(
+                            exit_code=1, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0
+                        ),
+                        error=f"future crashed: {exc}",
+                    )
+                    self._apply_reporter_result(fake)
+                continue
+            self._apply_reporter_result(result)
 
         return progressed
 
@@ -1077,12 +1160,40 @@ class DynamicAnalysisRunner:
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
         )
 
-    def _build_verifier_prompt(self, target: TargetRecord, claim: ClaimRecord) -> str:
+    def _build_verifier_prompt(self, target: TargetRecord, claim: ClaimRecord, verification: VerificationRecord) -> str:
         packet = asdict(claim_to_verifier_packet(claim))
         mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
+        chain_length = len(self._verifier_chain)
+        spec = self._verifier_chain[verification.verifier_index]
+        rendered_scope = self._rendered_verifier_prompts.get(spec.name, "")
+        scope_block = ""
+        if rendered_scope:
+            scope_block = f"Specialized verifier scope:\n```text\n{rendered_scope}\n```\n\n"
+
+        passed_names: list[str] = []
+        for v_id in claim.verification_ids:
+            v = self.state.verifications.get(v_id)
+            if v is None or v.verification_id == verification.verification_id:
+                continue
+            if v.disposition == "verified" and v.status == "passed":
+                passed_names.append(v.verifier_name or "default")
+        next_name = (
+            self._verifier_chain[verification.verifier_index + 1].name
+            if verification.verifier_index + 1 < chain_length
+            else None
+        )
+        chain_context = {
+            "you_are": f"verifier {verification.verifier_index + 1} of {chain_length}",
+            "your_name": verification.verifier_name or "default",
+            "earlier_verifiers_passed": passed_names,
+            "next_verifier": next_name if next_name else "(none — final verifier)",
+        }
         return (
             f"{self._verifier_role_prompt}\n\n"
+            f"{scope_block}"
             f"Repository root: `{self.working_dir}`\n\n"
+            "Chain context:\n"
+            f"```text\n{json.dumps(chain_context, indent=2)}\n```\n\n"
             "Mission scope and context (from the analysis phase configuration):\n"
             f"```text\n{mission}\n```\n\n"
             "Target context:\n"
@@ -1133,12 +1244,12 @@ class DynamicAnalysisRunner:
         )
 
     def _execute_verifier(self, verification: VerificationRecord, prompt: str) -> _VerifierExecutionResult:
-        backend = self._get_backend(self.config.verifier_backend)
+        backend = self._get_backend(verification.backend)
         result = backend.run_agent(
             prompt,
             working_dir=str(self.working_dir),
             timeout=self.phase.timeout,
-            env=self._role_env("verifier"),
+            env=self._role_env("verifier", verifier_name=verification.verifier_name),
         )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -1171,6 +1282,181 @@ class DynamicAnalysisRunner:
             report=report,
             error=None,
         )
+
+    # --- Reporter (post-verification per-claim report writer) ----------------
+
+    def _bug_id_for_claim(self, claim: ClaimRecord) -> str:
+        """Stable directory name for a verified claim's report output."""
+        return claim.claim_id
+
+    def _report_dir_for_claim(self, claim: ClaimRecord) -> Path:
+        return self.working_dir / "output" / self._bug_id_for_claim(claim)
+
+    def _build_reporter_prompt(self, claim: ClaimRecord, target: TargetRecord) -> str:
+        bug_id = self._bug_id_for_claim(claim)
+        report_dir = self._report_dir_for_claim(claim)
+        # Collect every passing verifier's structured output for the agent's reference.
+        verifier_summaries: list[dict[str, Any]] = []
+        for v_id in claim.verification_ids:
+            v = self.state.verifications.get(v_id)
+            if v is None:
+                continue
+            if v.disposition != "verified" or v.status != "passed":
+                continue
+            verifier_summaries.append(
+                {
+                    "verifier_name": v.verifier_name or "default",
+                    "verifier_index": v.verifier_index,
+                    "summary": v.reason,
+                    "follow_up_action": v.follow_up_action,
+                    "follow_up_strategy": v.follow_up_strategy,
+                }
+            )
+        packet = asdict(claim_to_verifier_packet(claim))
+        worker_artifact = self.state.worker_artifacts.get(claim.audit_artifact_id)
+        artifact_payload = asdict(worker_artifact) if worker_artifact is not None else None
+        scope_block = ""
+        if self._rendered_reporter_prompt:
+            scope_block = f"Specialized reporter scope:\n```text\n{self._rendered_reporter_prompt}\n```\n\n"
+        return (
+            "You are the reporter agent for Juvenal's dynamic `analysis` phase.\n"
+            "A claim has passed every verifier in the chain. Your job is to write a "
+            "human-readable per-bug report and copy/include any PoC artifacts so the "
+            "finding is durably captured on disk.\n\n"
+            f"{scope_block}"
+            f"Repository root: `{self.working_dir}`\n"
+            f"Report directory (you MUST create this and write into it): `{report_dir}`\n"
+            f"Bug id: `{bug_id}`\n\n"
+            "Required output:\n"
+            f"- Create the directory `{report_dir}` if it does not already exist.\n"
+            f"- Write a Markdown file at `{report_dir}/report.md` that includes:\n"
+            "  - Title (one line)\n"
+            "  - Severity (critical / high / medium / low) with one-sentence justification\n"
+            "  - Primary location (file:line) and any secondary locations\n"
+            "  - Description: what the bug is and why it matters\n"
+            "  - Proof of Concept: the exact reproduction steps, input, or script. "
+            "Include any sanitizer/crash output verbatim if present in the claim packet.\n"
+            "  - Impact: what an attacker can achieve\n"
+            "  - Verifier consensus: a brief note that each verifier passed (poc, scope, novelty, etc.)\n"
+            f"- Place any concrete PoC artifacts (input files, scripts, payloads) into `{report_dir}/`. "
+            f"At minimum, write a `{report_dir}/poc` file (or `poc.<ext>`) capturing the trigger.\n"
+            "- Overwriting an existing report at this path is acceptable — this step is idempotent.\n\n"
+            "Do NOT write outside the report directory except for transient working files. "
+            "Do NOT modify project source. After writing, exit cleanly. No structured-output "
+            "block is expected from you — the runner verifies success by checking that "
+            f"`{report_dir}/report.md` exists.\n\n"
+            "Claim packet:\n"
+            f"```text\n{json.dumps(packet, indent=2)}\n```\n\n"
+            "Worker artifact (reasoning, trace, commands):\n"
+            f"```text\n{json.dumps(artifact_payload, indent=2, default=str)}\n```\n\n"
+            "Target context:\n"
+            f"```text\n{json.dumps(self._target_prompt_summary(target), indent=2)}\n```\n\n"
+            "Verifier consensus (all of these PASSED):\n"
+            f"```text\n{json.dumps(verifier_summaries, indent=2)}\n```\n\n"
+            "Code context pack:\n"
+            f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
+        )
+
+    def _schedule_reporters(self) -> bool:
+        """Submit reporter agent runs for any verified-but-not-reported claims."""
+        if self._reporter_spec is None:
+            return False
+        if self._terminal_failure or self.state.control.stop_requested:
+            return False
+        if not self._pending_reporter_claim_ids:
+            return False
+        # Bound reporter parallelism by the executor's worker count.
+        available = max(1, self.config.max_workers) - len(self._reporter_futures)
+        if available <= 0:
+            return False
+
+        scheduled = False
+        remaining: list[str] = []
+        for claim_id in self._pending_reporter_claim_ids:
+            if available <= 0:
+                remaining.append(claim_id)
+                continue
+            if claim_id in self._reporter_futures.values():
+                continue
+            claim = self.state.claims.get(claim_id)
+            if claim is None or claim.status != "verified" or claim.reported_at is not None:
+                continue
+            target = self.state.targets.get(claim.target_id)
+            if target is None:
+                continue
+            attempts = self._reporter_attempts.get(claim_id, 0)
+            if attempts >= _MAX_REPORTER_ATTEMPTS:
+                # Give up for this run; leave reported_at unset so resume can try again.
+                continue
+            prompt = self._build_reporter_prompt(claim, target)
+            future = self._reporter_executor.submit(self._execute_reporter, claim, prompt)
+            self._reporter_futures[future] = claim_id
+            self._reporter_attempts[claim_id] = attempts + 1
+            available -= 1
+            scheduled = True
+
+        self._pending_reporter_claim_ids = remaining
+        return scheduled
+
+    def _execute_reporter(self, claim: ClaimRecord, prompt: str) -> _ReporterExecutionResult:
+        backend = self._get_backend(self._reporter_spec.backend if self._reporter_spec else "claude")
+        result = backend.run_agent(
+            prompt,
+            working_dir=str(self.working_dir),
+            timeout=self.phase.timeout,
+            env=self._role_env("reporter"),
+        )
+        if result.exit_code != 0:
+            return _ReporterExecutionResult(
+                claim_id=claim.claim_id,
+                target_id=claim.target_id,
+                generation=claim.generation,
+                agent_result=result,
+                error=f"reporter exited with code {result.exit_code}: {result.output[-2000:]}",
+            )
+        report_md = self._report_dir_for_claim(claim) / "report.md"
+        if not report_md.is_file():
+            return _ReporterExecutionResult(
+                claim_id=claim.claim_id,
+                target_id=claim.target_id,
+                generation=claim.generation,
+                agent_result=result,
+                error=f"reporter completed but {report_md} does not exist",
+            )
+        return _ReporterExecutionResult(
+            claim_id=claim.claim_id,
+            target_id=claim.target_id,
+            generation=claim.generation,
+            agent_result=result,
+            error=None,
+        )
+
+    def _apply_reporter_result(self, result: _ReporterExecutionResult) -> None:
+        self._add_tokens(result.agent_result)
+        claim = self.state.claims.get(result.claim_id)
+        if claim is None:
+            return
+        if result.error:
+            # Leave reported_at unset; _schedule_reporters will retry up to _MAX_REPORTER_ATTEMPTS.
+            attempts = self._reporter_attempts.get(claim.claim_id, 0)
+            if attempts < _MAX_REPORTER_ATTEMPTS:
+                if claim.claim_id not in self._pending_reporter_claim_ids:
+                    self._pending_reporter_claim_ids.append(claim.claim_id)
+            else:
+                print(
+                    f"\n[juvenal] reporter for claim {claim.claim_id} failed after "
+                    f"{_MAX_REPORTER_ATTEMPTS} attempts: {result.error}",
+                    flush=True,
+                )
+            return
+        claim.reported_at = time.time()
+        self.state.append_event(
+            "claim.reported",
+            target_id=claim.target_id,
+            claim_id=claim.claim_id,
+            generation=claim.generation,
+        )
+        self.state.save()
 
     def _apply_worker_result(self, result: _WorkerExecutionResult) -> None:
         self._add_tokens(result.agent_result)
@@ -1390,8 +1676,19 @@ class DynamicAnalysisRunner:
             verification.rejection_class = None
             verification.follow_up_action = report.follow_up_action
             verification.follow_up_strategy = report.follow_up_strategy
+
+            is_final = verification.verifier_index == len(self._verifier_chain) - 1
+            if not is_final:
+                # More verifiers in the chain. Keep the claim in `verifying`; the next
+                # _schedule_verifiers tick will create the next chain step. Do NOT call
+                # _refresh_target_after_verification here — the target is not done yet.
+                claim.status = "verifying"
+                self.state.save()
+                return
+
             claim.status = "verified"
             claim.rejection_class = None
+            claim.failing_verifier_name = None
             claim.verified_at = verification.completed_at
             claim.rejected_at = None
             self.state.append_event(
@@ -1401,6 +1698,13 @@ class DynamicAnalysisRunner:
                 generation=verification.generation,
             )
             self._refresh_target_after_verification(target)
+            if (
+                self._reporter_spec is not None
+                and claim.reported_at is None
+                and claim.claim_id not in self._pending_reporter_claim_ids
+                and claim.claim_id not in self._reporter_futures.values()
+            ):
+                self._pending_reporter_claim_ids.append(claim.claim_id)
             self.state.save()
             return
 
@@ -1412,6 +1716,7 @@ class DynamicAnalysisRunner:
         verification.follow_up_strategy = report.follow_up_strategy
         claim.status = "rejected"
         claim.rejection_class = report.rejection_class
+        claim.failing_verifier_name = verification.verifier_name
         claim.rejected_at = verification.completed_at
         claim.verified_at = None
         self.state.append_event(
@@ -1564,6 +1869,13 @@ class DynamicAnalysisRunner:
         latest_verification = self._latest_rejection_verification(claim)
         follow_up_action = latest_verification.follow_up_action if latest_verification else None
         follow_up_strategy = latest_verification.follow_up_strategy if latest_verification else None
+        failing_verifier_name = (
+            claim.failing_verifier_name
+            or (latest_verification.verifier_name if latest_verification else "")
+            or "default"
+        )
+        failing_verifier_index = latest_verification.verifier_index if latest_verification else 0
+        chain_length = len(self._verifier_chain)
         verified_siblings = [
             self._claim_prompt_summary(c)
             for c in self._active_claims_for_target(target)
@@ -1572,6 +1884,7 @@ class DynamicAnalysisRunner:
         rejected_detail = self._claim_prompt_summary(claim)
         rejected_detail["rejection_reason"] = rejection_reason
         rejected_detail["rejection_class"] = claim.rejection_class
+        rejected_detail["failing_verifier_name"] = failing_verifier_name
         rejected_detail["follow_up_action"] = follow_up_action
         rejected_detail["follow_up_strategy"] = follow_up_strategy
         task_packet = {
@@ -1587,6 +1900,10 @@ class DynamicAnalysisRunner:
             f"{self._worker_role_prompt}\n\n"
             f"Repository root: `{self.working_dir}`\n\n"
             "## CLAIM RETRY MODE — VERIFIER CHALLENGE\n\n"
+            f"Your previous claim was REJECTED by the **{failing_verifier_name}** verifier "
+            f"(verifier {failing_verifier_index + 1} of {chain_length} in this analysis chain). "
+            "Address that verifier's specific scope. If you push past their concern, the next "
+            "verifier in the chain will then run.\n\n"
             "You are responding to a verifier challenge on a rejected claim. This is a dialog:\n"
             "the verifier is pushing you toward stronger evidence. Read the full rejection chain\n"
             "below to understand what has already been tried and what specific challenges the\n"
@@ -1608,6 +1925,8 @@ class DynamicAnalysisRunner:
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n\n"
             "Instructions:\n"
+            f"- The rejecting verifier was the **{failing_verifier_name}** verifier;"
+            " address their specific scope, not the other verifiers' scopes\n"
             "- Study the FULL rejection chain — do NOT repeat approaches that were already rejected\n"
             "- Address the verifier's SPECIFIC challenge (rejection_reason and follow_up hints)\n"
             "- If the verifier identified a guard/mitigation, either prove it is bypassable or find"
@@ -1671,9 +1990,9 @@ class DynamicAnalysisRunner:
         return targets
 
     def _has_active_runtime_work(self) -> bool:
-        if self._worker_futures or self._verifier_futures:
+        if self._worker_futures or self._verifier_futures or self._reporter_futures:
             return True
-        if self._pending_claim_retries:
+        if self._pending_claim_retries or self._pending_reporter_claim_ids:
             return True
         for verification in self.state.verifications.values():
             if verification.status not in {"pending", "running"}:
@@ -1867,8 +2186,8 @@ class DynamicAnalysisRunner:
                 claim_id=claim.claim_id,
                 target_id=claim.target_id,
                 generation=verification.generation,
-                backend=self.config.verifier_backend,
-                verifier_role="analysis-verifier",
+                backend=verification.backend,
+                verifier_role=verification.verifier_role,
                 session_id=None,
                 status="pending",
                 disposition=None,
@@ -1877,6 +2196,8 @@ class DynamicAnalysisRunner:
                 raw_output="",
                 started_at=None,
                 completed_at=None,
+                verifier_name=verification.verifier_name,
+                verifier_index=verification.verifier_index,
             )
             self.state.verifications[new_verification.verification_id] = new_verification
             claim.verification_ids.append(new_verification.verification_id)
@@ -1885,6 +2206,7 @@ class DynamicAnalysisRunner:
         else:
             claim.status = "rejected"
             claim.rejection_class = "verification-error"
+            claim.failing_verifier_name = verification.verifier_name
             claim.rejected_at = time.time()
             self.state.append_event(
                 "claim.rejected",
@@ -1935,6 +2257,8 @@ class DynamicAnalysisRunner:
                     {
                         "claim_id": v.claim_id,
                         "attempt": current.retry_count,
+                        "verifier_name": v.verifier_name or "default",
+                        "verifier_index": v.verifier_index,
                         "rejection_class": v.rejection_class,
                         "reason": v.reason,
                         "follow_up_action": v.follow_up_action,
@@ -1990,6 +2314,26 @@ class DynamicAnalysisRunner:
                 ):
                     self._pending_claim_retries.append((target.target_id, claim.claim_id))
 
+    def _rebuild_pending_reporter_claim_ids(self) -> None:
+        """Re-queue verified-but-not-reported claims after resume.
+
+        No-op if no reporter is configured. Idempotent: a claim already in the
+        queue or with an in-flight reporter future is not requeued.
+        """
+        self._pending_reporter_claim_ids = []
+        if self._reporter_spec is None:
+            return
+        in_flight = set(self._reporter_futures.values())
+        queued = set(self._pending_reporter_claim_ids)
+        for claim in self.state.claims.values():
+            if claim.status != "verified":
+                continue
+            if claim.reported_at is not None:
+                continue
+            if claim.claim_id in in_flight or claim.claim_id in queued:
+                continue
+            self._pending_reporter_claim_ids.append(claim.claim_id)
+
     def _is_terminal_target(self, target: TargetRecord) -> bool:
         return target.status not in _NON_TERMINAL_STATUSES
 
@@ -2016,18 +2360,34 @@ class DynamicAnalysisRunner:
     def _rate_limit_backoff(self) -> None:
         """Sleep with exponential backoff, save state, then reset error counter to continue.
 
-        Starts at 60s and doubles each consecutive backoff (60, 120, 240, ...) up to 1 hour.
+        Starts at 60s and doubles each consecutive backoff (60, 120, 240, ...) up to 1 hour
+        per wait. Cumulative wait time across the run is capped at 5 hours; once that budget
+        is exhausted the run gives up rather than waiting longer (the upstream rate limit
+        resets at most every 5 hours, so further sleeping is wasted time).
         Resets on the next successful operation. The user can Ctrl+C at any time during the
         sleep — state is already saved so --resume will pick up where it left off.
         """
         self.state.save()
-        delay = min(60 * (2**self._backoff_count), 3600)
+        remaining_budget = _MAX_TOTAL_BACKOFF_SECONDS - self._total_backoff_seconds
+        if remaining_budget <= 0:
+            self._terminal_failure = (
+                f"rate-limit backoff budget exhausted: slept "
+                f"{self._total_backoff_seconds / 3600:.1f}h cumulatively "
+                f"(cap: {_MAX_TOTAL_BACKOFF_SECONDS / 3600:.0f}h). State saved; resume later."
+            )
+            print(f"\n[juvenal] {self._terminal_failure}", flush=True)
+            return
+
+        delay = min(60 * (2**self._backoff_count), _MAX_SINGLE_BACKOFF_SECONDS)
+        delay = min(delay, remaining_budget)
         self._backoff_count += 1
         minutes = delay / 60
+        cumulative_minutes = (self._total_backoff_seconds + delay) / 60
         print(
             f"\n[juvenal] {self._consecutive_errors} consecutive errors — "
-            f"likely rate limit. Sleeping {minutes:.0f}m before retrying. "
-            f"State saved (Ctrl+C to exit, --resume to continue later).",
+            f"likely rate limit. Sleeping {minutes:.0f}m before retrying "
+            f"(cumulative: {cumulative_minutes:.0f}m of {_MAX_TOTAL_BACKOFF_SECONDS / 60:.0f}m cap). "
+            "State saved (Ctrl+C to exit, --resume to continue later).",
             flush=True,
         )
         # Sleep in small increments so Ctrl+C is responsive
@@ -2036,6 +2396,7 @@ class DynamicAnalysisRunner:
             chunk = min(remaining, 5.0)
             time.sleep(chunk)
             remaining -= chunk
+        self._total_backoff_seconds += delay
         self._consecutive_errors = 0
 
     def _record_success(self) -> None:
@@ -2073,7 +2434,9 @@ class DynamicAnalysisRunner:
         self.total_input_tokens += result.input_tokens
         self.total_output_tokens += result.output_tokens
 
-    def _role_env(self, role: str) -> dict[str, str] | None:
+    def _role_env(self, role: str, *, verifier_name: str = "") -> dict[str, str] | None:
         env = dict(self.phase.env)
         env["JUVENAL_ANALYSIS_ROLE"] = role
+        if role == "verifier" and verifier_name:
+            env["JUVENAL_ANALYSIS_VERIFIER_NAME"] = verifier_name
         return env

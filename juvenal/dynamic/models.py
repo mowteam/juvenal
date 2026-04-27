@@ -166,6 +166,8 @@ class ClaimRecord:
     retry_count: int = 0
     retry_of_claim_id: str | None = None
     retry_claim_ids: list[str] = field(default_factory=list)
+    failing_verifier_name: str | None = None
+    reported_at: float | None = None
 
 
 @dataclass
@@ -213,6 +215,8 @@ class VerificationRecord:
     error: str = ""
     follow_up_action: str | None = None
     follow_up_strategy: str | None = None
+    verifier_name: str = ""
+    verifier_index: int = 0
 
 
 @dataclass
@@ -240,6 +244,7 @@ class DynamicEvent:
         "claim.verified",
         "claim.rejected",
         "claim.retry_scheduled",
+        "claim.reported",
         "directive.received",
         "directive.acknowledged",
     ]
