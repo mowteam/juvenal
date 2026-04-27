@@ -1243,13 +1243,28 @@ class DynamicAnalysisRunner:
 
     def _execute_worker_attempt(self, attempt: WorkerAttempt, prompt: str) -> _WorkerExecutionResult:
         backend = self._get_backend(self.config.worker_backend)
-        result = backend.run_agent(
-            prompt,
-            working_dir=str(self.working_dir),
-            timeout=self.phase.timeout,
-            env=self._role_env("worker"),
-            model=_resolve_model(self.config.worker_backend, "worker", self.config.worker_model),
-        )
+        worker_model = _resolve_model(self.config.worker_backend, "worker", self.config.worker_model)
+        if attempt.parent_session_id:
+            # Claim retry: resume the prior worker's session so its context
+            # (codebase reading, build state, prior reasoning) carries over
+            # and the rejection feedback arrives as a continuation rather
+            # than a cold restart.
+            result = backend.resume_agent(
+                attempt.parent_session_id,
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("worker"),
+                model=worker_model,
+            )
+        else:
+            result = backend.run_agent(
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("worker"),
+                model=worker_model,
+            )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
                 attempt_id=attempt.attempt_id,
@@ -1885,6 +1900,18 @@ class DynamicAnalysisRunner:
             for a in self.state.worker_attempts.values()
             if a.target_id == target.target_id and a.retry_claim_id == claim.claim_id
         ]
+        # Resume from the most recent ancestor session so the worker keeps its
+        # context (codebase mental model, build state, prior reasoning).
+        # Priority: latest direct retry of this claim → original attempt that
+        # produced the claim → no resume (cold start).
+        parent_session_id: str | None = None
+        if existing:
+            most_recent = max(existing, key=lambda a: a.started_at or 0.0)
+            parent_session_id = most_recent.session_id
+        if parent_session_id is None:
+            origin = self.state.worker_attempts.get(claim.attempt_id)
+            if origin is not None:
+                parent_session_id = origin.session_id
         attempt = WorkerAttempt(
             attempt_id=f"{target.target_id}-g{generation}-retry-{claim.claim_id}-{len(existing) + 1}",
             target_id=target.target_id,
@@ -1895,6 +1922,7 @@ class DynamicAnalysisRunner:
             started_at=time.time(),
             completed_at=None,
             retry_claim_id=claim.claim_id,
+            parent_session_id=parent_session_id,
         )
         target.status = "running"
         target.active_attempt_id = attempt.attempt_id

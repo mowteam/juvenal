@@ -160,7 +160,7 @@ phases:
       max_workers: 4
       max_verifiers: 8
       interaction_timeout: 3.0
-      max_worker_retries: 5
+      max_worker_retries: 10
       max_captain_repairs: 2
       allow_repo_tools: true
       verifiers:

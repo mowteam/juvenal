@@ -1189,3 +1189,76 @@ def test_yaml_parser_rejects_empty_model_string():
     raw = {"captain_model": "", "verifiers": [{"name": "poc", "prompt": "x"}]}
     with pytest.raises(ValueError, match="must be a non-empty string"):
         _parse_analysis_config(raw, phase_id="p")
+
+
+# --- Session-resume on claim retry --------------------------------------------
+
+
+def test_claim_retry_resumes_worker_session(tmp_path):
+    """A retry worker must resume the original worker's Claude session, not start fresh."""
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(enqueue_targets=[_target("target-1")]))
+    # Initial worker produces a claim and returns session_id "worker-session-1".
+    backend.add_role_response(
+        "worker",
+        output=_claim_output("target-1-g1-attempt-1", "target-1"),
+        session_id="worker-session-1",
+    )
+    # First verifier rejects; runner should queue a claim retry.
+    backend.add_role_response(
+        "verifier:poc",
+        output=_verification_output(
+            "target-1-g1-claim-c1",
+            "target-1",
+            disposition="rejected",
+            rejection_class="insufficient-evidence",
+        ),
+    )
+    backend.add_role_response("captain", output=_captain_output(termination_reason="Retry pending."))
+    # Retry worker returns no_findings, terminating the chain.
+    retry_attempt_id = "target-1-g1-retry-target-1-g1-claim-c1-1"
+    backend.add_role_response(
+        "worker",
+        output=_no_findings_output(retry_attempt_id, "target-1"),
+        session_id="worker-session-1",
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    result, state, _ = _run_runner(tmp_path, backend, config=_three_verifier_config())
+
+    assert result.success is True
+    # The retry worker call landed on resume_agent with the parent session_id.
+    assert any(session_id == "worker-session-1" for session_id, _prompt in backend.resume_calls)
+    # And the retry attempt's parent_session_id was persisted.
+    retry_attempts = [a for a in state.worker_attempts.values() if a.retry_claim_id is not None]
+    assert retry_attempts, "expected a retry attempt to have been recorded"
+    assert retry_attempts[0].parent_session_id == "worker-session-1"
+
+
+def test_initial_worker_attempt_does_not_resume(tmp_path):
+    """The first worker attempt for a target uses run_agent, not resume_agent."""
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(enqueue_targets=[_target("target-1")]))
+    backend.add_role_response(
+        "worker",
+        output=_no_findings_output("target-1-g1-attempt-1", "target-1"),
+        session_id="worker-session-1",
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    result, state, _ = _run_runner(tmp_path, backend, config=_three_verifier_config())
+
+    assert result.success is True
+    # Only captain calls (which use resume_agent across turns) should be in resume_calls;
+    # no worker resume occurred.
+    assert backend.resume_calls == [] or all(
+        "scoped analysis worker" not in prompt for _sid, prompt in backend.resume_calls
+    )
+    initial_attempts = [a for a in state.worker_attempts.values() if a.retry_claim_id is None]
+    assert initial_attempts and initial_attempts[0].parent_session_id is None

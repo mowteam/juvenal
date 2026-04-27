@@ -104,6 +104,7 @@ class WorkerAttempt:
     completed_at: float | None
     error: str = ""
     retry_claim_id: str | None = None
+    parent_session_id: str | None = None  # if set, runner resumes this session instead of starting fresh
 
 
 @dataclass
