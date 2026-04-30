@@ -84,6 +84,9 @@ juvenal init my-project
 # Run a workflow
 juvenal run workflow.yaml
 
+# Run an analysis workflow with the interactive chat dashboard (talk to the captain mid-run)
+juvenal run juvenal/workflows/bug-bounty.yaml -D REPO=curl/curl -D BOUNTY_SCOPE="..." --interactive
+
 # Decompose a complex goal into linear implement phases, then run your fixed checker stack
 juvenal run --standard-checkers --phased-implementer 'software-engineer:add authentication to the Flask app'
 
@@ -258,11 +261,18 @@ In v1, `analysis` phases may not appear inside `parallel_groups`.
 
 ### Analysis Chat Dashboard
 
-Run analysis workflows with `--interactive` to open a Rich Live chat dashboard. The captain runs as a background `claude --resume <uuid>` session, the dashboard renders its turn-by-turn `message_to_user` and structured `mental_model_summary`, the event stream surfaces worker/verifier/claim activity, and the user can type directives at any moment:
+Run any analysis workflow with `-i` / `--interactive` to open a Rich Live chat dashboard:
 
 ```bash
+juvenal run <workflow.yaml> --interactive
+# e.g.
 juvenal run juvenal/workflows/analysis-example.yaml --interactive
+juvenal run juvenal/workflows/bug-bounty.yaml -D REPO=curl/curl -D BOUNTY_SCOPE="..." --interactive
 ```
+
+The captain runs as a background `claude --resume <uuid>` session, the dashboard renders its turn-by-turn `message_to_user` and structured `mental_model_summary`, the event stream surfaces worker/verifier/claim activity, and the user can type directives at any moment.
+
+You'll see three panels: a captain panel (current turn, mental model, open questions), a rolling event stream (worker / verifier / claim / directive events), and a chat input prompt (`>>> `). The Rich Live layout requires the global `--rich` flag (e.g. `juvenal --rich run … --interactive`) AND a tty; without either, the dashboard falls back to plain-text mode automatically — same hooks fire, just no live layout.
 
 Each input line is persisted as a directive. Supported commands:
 
