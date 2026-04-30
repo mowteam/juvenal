@@ -66,6 +66,50 @@ def test_show_captain_full_prints_full_state(capsys):
     assert "2. Q2" in captured
 
 
+def test_render_captain_chunk_suppresses_captain_json_block(capsys):
+    """The CAPTAIN_JSON block is the runner's structured input — surface a
+    single placeholder so the user can read the captain's reasoning without
+    pages of structured output drowning it out."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()  # discard banner
+    dashboard.render_captain_chunk("I will read the parser source.")
+    dashboard.render_captain_chunk("[tool: Read]")
+    dashboard.render_captain_chunk(
+        'CAPTAIN_JSON_BEGIN\n{"message_to_user":"long","enqueue_targets":[]}\nCAPTAIN_JSON_END'
+    )
+    dashboard.render_captain_chunk("Trailing text after the block.")
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert "I will read the parser source." in captured
+    assert "[tool: Read]" in captured
+    assert "[captain → emitting CAPTAIN_JSON …]" in captured
+    assert "enqueue_targets" not in captured
+    assert "message_to_user" not in captured
+    assert "CAPTAIN_JSON_BEGIN" not in captured
+    assert "CAPTAIN_JSON_END" not in captured
+    assert "Trailing text after the block." in captured
+
+
+def test_render_captain_chunk_suppresses_captain_json_split_across_chunks(capsys):
+    """The BEGIN/END markers can land in different stream chunks; suppression
+    must persist across chunks until END is seen."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()
+    dashboard.render_captain_chunk("CAPTAIN_JSON_BEGIN\n{")
+    dashboard.render_captain_chunk('  "termination_state": "continue",')
+    dashboard.render_captain_chunk('  "enqueue_targets": []')
+    dashboard.render_captain_chunk("}\nCAPTAIN_JSON_END")
+    dashboard.render_captain_chunk("post-block text")
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert "termination_state" not in captured
+    assert "enqueue_targets" not in captured
+    assert "post-block text" in captured
+    assert captured.count("[captain → emitting CAPTAIN_JSON …]") == 1
+
+
 def test_dashboard_render_frontier_is_a_no_op(capsys):
     dashboard = ChatDashboard()
     dashboard.start()

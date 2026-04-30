@@ -23,6 +23,10 @@ class ChatDashboard:
         self._captain_turn_index = 0
         self._lock = Lock()
         self._running = False
+        # State for filtering CAPTAIN_JSON blocks out of streamed chunks: the
+        # structured output is for the runner, not for human eyes. We render
+        # one placeholder line per block instead of the full JSON.
+        self._suppressing_captain_json = False
 
     def start(self) -> None:
         with self._lock:
@@ -71,11 +75,23 @@ class ChatDashboard:
         Backends emit one chunk per stream-json event. The text is already
         formatted by the backend's _process_*_event helper (assistant messages
         as-is; tool calls as `[tool: name]`). We indent so chunks visually
-        nest under the most recent `[captain turn N]` header.
+        nest under the most recent `[captain turn N]` header. Lines that
+        belong to a CAPTAIN_JSON block are suppressed and replaced with a
+        single placeholder — the structured output is what the runner parses,
+        not what the user wants to read.
         """
         if not text:
             return
         for line in text.splitlines():
+            if "CAPTAIN_JSON_BEGIN" in line:
+                self._suppressing_captain_json = True
+                print("  [captain → emitting CAPTAIN_JSON …]", flush=True)
+                continue
+            if "CAPTAIN_JSON_END" in line:
+                self._suppressing_captain_json = False
+                continue
+            if self._suppressing_captain_json:
+                continue
             print(f"  {line}", flush=True)
 
     def render_frontier(self, counts: dict[str, int], active_targets: Iterable[tuple[str, str]]) -> None:

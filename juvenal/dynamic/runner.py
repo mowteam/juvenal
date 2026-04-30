@@ -1082,6 +1082,12 @@ class DynamicAnalysisRunner:
         self.state.directives[directive.directive_id] = directive
         self.state.save()
         self._chat_pending = True
+        if self._dashboard is not None:
+            if self._captain_future is not None:
+                msg = "/chat queued — will hand off to native TUI when current captain turn finishes"
+            else:
+                msg = "/chat queued — handing off to native TUI on next loop tick"
+            self._dashboard.render_event(kind="info", text=msg)
         return True
 
     def _enter_chat_mode(self) -> None:
