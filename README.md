@@ -261,7 +261,7 @@ In v1, `analysis` phases may not appear inside `parallel_groups`.
 
 ### Analysis Chat Dashboard
 
-Run any analysis workflow with `-i` / `--interactive` to open a Rich Live chat dashboard:
+Run any analysis workflow with `-i` / `--interactive` to open the line-scrolling chat dashboard:
 
 ```bash
 juvenal run <workflow.yaml> --interactive
@@ -270,9 +270,7 @@ juvenal run juvenal/workflows/analysis-example.yaml --interactive
 juvenal run juvenal/workflows/bug-bounty.yaml -D REPO=curl/curl -D BOUNTY_SCOPE="..." --interactive
 ```
 
-The captain runs as a background `claude --resume <uuid>` session, the dashboard renders its turn-by-turn `message_to_user` and structured `mental_model_summary`, the event stream surfaces worker/verifier/claim activity, and the user can type directives at any moment.
-
-You'll see three panels: a captain panel (current turn, mental model, open questions), a rolling event stream (worker / verifier / claim / directive events), and a chat input prompt (`>>> `). The Rich Live layout requires the global `--rich` flag (e.g. `juvenal --rich run … --interactive`) AND a tty; without either, the dashboard falls back to plain-text mode automatically — same hooks fire, just no live layout.
+The captain runs as a background `claude --resume <uuid>` session and the dashboard prints its turn-by-turn `message_to_user`, worker / verifier / claim events, and acknowledged directives to stdout as they happen. Type directives any moment — the dashboard does not redraw, so your typed line stays put while events scroll past.
 
 Each input line is persisted as a directive. Supported commands:
 
