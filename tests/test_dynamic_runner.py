@@ -161,6 +161,82 @@ class ScriptedInteractionChannel:
         return []
 
 
+class FakeChatDashboard:
+    """Captures every render-hook call for assertions."""
+
+    def __init__(self):
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.captain_renders: list[dict] = []
+        self.events: list[tuple[str, str]] = []
+        self.frontier_calls: list[dict] = []
+        self.chat_input_calls: list[list[str]] = []
+        self.show_captain_calls: list[dict] = []
+        self._running = False
+
+    def start(self) -> None:
+        self.start_calls += 1
+        self._running = True
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._running = False
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def render_captain(self, *, message_to_user, mental_model_summary, open_questions, turn_index) -> None:
+        self.captain_renders.append(
+            {
+                "message_to_user": message_to_user,
+                "mental_model_summary": mental_model_summary,
+                "open_questions": list(open_questions),
+                "turn_index": turn_index,
+            }
+        )
+
+    def render_event(self, *, kind, text, ts=None) -> None:
+        self.events.append((kind, text))
+
+    def render_frontier(self, counts, active_targets) -> None:
+        self.frontier_calls.append({"counts": dict(counts), "active": list(active_targets)})
+
+    def render_chat_input(self, history) -> None:
+        self.chat_input_calls.append(list(history))
+
+    def show_captain_full(self, *, message_to_user, mental_model_summary, open_questions) -> None:
+        self.show_captain_calls.append(
+            {
+                "message_to_user": message_to_user,
+                "mental_model_summary": mental_model_summary,
+                "open_questions": list(open_questions),
+            }
+        )
+
+
+class ChatScriptedChannel:
+    """Like ScriptedInteractionChannel but for chat mode: yields one batch of
+    lines per poll() call, even when poll is repeatedly called with timeout=0."""
+
+    def __init__(self, batches: list[list[str]] | None = None):
+        self._batches = list(batches or [])
+        self.started = False
+        self.stopped = False
+        self.poll_calls = 0
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def poll(self, timeout: float) -> list[str]:
+        self.poll_calls += 1
+        if self._batches:
+            return self._batches.pop(0)
+        return []
+
+
 def _run_runner(
     tmp_path,
     backend: MockBackend,
@@ -191,6 +267,44 @@ def _run_runner(
         )
         result = runner.run()
     return result, DynamicSessionState.load(state_file), backend
+
+
+def _run_chat_runner(
+    tmp_path,
+    backend: MockBackend,
+    *,
+    chat_channel: ChatScriptedChannel,
+    dashboard: FakeChatDashboard | None = None,
+    config: AnalysisConfig | None = None,
+):
+    """Run a real DynamicAnalysisRunner through the _run_chat() branch.
+
+    The runner sees `interactive=True` and no injected interaction channel
+    (its constructor builds one), but we then swap our ChatScriptedChannel in
+    and inject a fake dashboard. This routes through _run_chat()."""
+    phase = Phase(
+        id="analyze",
+        type="analysis",
+        prompt="Analyze the repository for security issues.",
+        analysis=config or AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1),
+    )
+    workflow = Workflow(name="analysis", phases=[phase], working_dir=str(tmp_path))
+    state_file = tmp_path / "analysis-state.json"
+
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        runner = DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=True,
+            chat_dashboard=dashboard,
+        )
+        # Replace the auto-created stdin channel with our scripted one.
+        runner._interaction_channel = chat_channel
+        result = runner.run()
+    return result, DynamicSessionState.load(state_file), backend, runner
 
 
 def test_bootstrap_worker_verifier_pass_and_complete(tmp_path):
@@ -993,3 +1107,161 @@ def test_continue_nudge_counter_resets_when_captain_returns_continue(tmp_path):
     assert result.success is True
     assert state.captain.turn_index == 3
     assert state.targets["target-1"].status == "no_findings"
+
+
+def test_chat_mode_dashboard_starts_and_stops_around_run(tmp_path):
+    """The chat dashboard's start() and stop() hooks fire exactly once each."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel()
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, _state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert dashboard.start_calls == 1
+    assert dashboard.stop_calls == 1
+    assert chat.started is True
+    assert chat.stopped is True
+
+
+def test_chat_mode_renders_captain_turn_and_emits_events(tmp_path):
+    """After a captain turn finishes, the dashboard sees render_captain plus
+    a captain.turn event with the new turn index."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            enqueue_targets=[_target("target-1")],
+            message_to_user="Pivoting to parsers.",
+        ),
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel()
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert state.captain.turn_index == 2
+    assert any(call["turn_index"] == 1 for call in dashboard.captain_renders)
+    assert any(kind == "captain.turn" for kind, _ in dashboard.events)
+    assert any(kind == "captain.starting" for kind, _ in dashboard.events)
+
+
+def test_chat_mode_now_directive_forces_captain_turn(tmp_path):
+    """A `/now` directive forces a captain turn even if no event delta has fired."""
+    backend = MockBackend()
+    # Turn 1: enqueue, but say continue with no work for the second turn.
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    # Turn 2: triggered by event delta from no_findings.
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_reason="no_findings absorbed"),
+    )
+    # Turn 3: must be /now-forced (no new event delta otherwise).
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="user demanded"),
+    )
+
+    dashboard = FakeChatDashboard()
+    # /now arrives between turns 2 and 3. Use enough empty batches so the
+    # second turn's "starting" event has time to fire before /now.
+    chat = ChatScriptedChannel(batches=[[], [], [], [], [], [], [], [], ["/now"]])
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert state.captain.turn_index == 3
+    # Confirm /now was applied as a directive.
+    now_directives = [d for d in state.directives.values() if d.kind == "now"]
+    assert len(now_directives) == 1
+    assert now_directives[0].status == "applied"
+
+
+def test_chat_mode_show_captain_invokes_dashboard_hook(tmp_path):
+    """A `/show captain` directive calls dashboard.show_captain_full and
+    persists the directive as applied."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(
+            enqueue_targets=[_target("target-1")],
+            message_to_user="Halfway through the parser audit.",
+        ),
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel(batches=[[], [], [], [], ["/show captain"]])
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert len(dashboard.show_captain_calls) == 1
+    show_directives = [d for d in state.directives.values() if d.kind == "show"]
+    assert len(show_directives) == 1
+    assert show_directives[0].status == "applied"
+
+
+def test_chat_mode_continuous_directive_ingestion(tmp_path):
+    """Multiple directives streamed across iterations are all parsed and applied
+    without a bounded review window."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel(
+        batches=[
+            [
+                "/focus parser entry points",
+                "take a look at the tls handshake",
+                "/ignore path:vendor/",
+            ],
+        ]
+    )
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    kinds = sorted(d.kind for d in state.directives.values())
+    assert kinds == ["focus", "ignore", "note"]
+    # Dashboard saw a directive.applied event for each.
+    applied_events = [text for kind, text in dashboard.events if kind == "directive.applied"]
+    assert len(applied_events) == 3

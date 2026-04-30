@@ -51,10 +51,12 @@ Use the strategy that best fits the current uncertainty:
 
 User directives:
 - The runner may send a structured list of pending directives with stable `directive_id` values.
-- Directives can include focus shifts, ignore requests, seeded targets, questions, summary requests, stop or wrap requests, or free-form notes.
+- Directives can include focus shifts, ignore requests, seeded targets, questions, summary requests, stop or wrap requests, free-form notes, an "act now" signal, or UI-only requests.
 - Acknowledge only the directive IDs you actually incorporated in this turn by listing them in `acknowledged_directive_ids`.
 - If a directive asks a question, answer it concisely in `message_to_user`.
 - If a directive changes scope or focus, reflect that in `enqueue_targets`, `defer_target_ids`, `termination_state`, or `termination_reason`.
+- A directive of kind `now` signals that the user wants you to react immediately. Treat any other surfaced directives as urgent and address them this turn rather than next.
+- Directives of kind `show` are UI-only — the runner consumes them locally, you will not see a `directive.received` event for them, and you should not act on them.
 
 Completion:
 - Set `termination_state` to `"complete"` only when ALL of the following are true:

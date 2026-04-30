@@ -49,6 +49,21 @@ _CAPTAIN_EVENT_TYPES = frozenset(
 _NON_TERMINAL_STATUSES = frozenset({"queued", "running", "verifying", "deferred", "requeue_pending"})
 _TERMINAL_TARGET_STATUSES = frozenset({"completed", "no_findings", "blocked", "exhausted"})
 _RUNNING_STATUSES = frozenset({"running", "verifying"})
+_DASHBOARD_EVENT_KINDS = frozenset(
+    {
+        "claim.verified",
+        "claim.rejected",
+        "claim.retry_scheduled",
+        "target.discovered",
+        "target.completed",
+        "target.no_findings",
+        "target.blocked",
+        "target.exhausted",
+        "target.deferred",
+        "directive.received",
+        "directive.acknowledged",
+    }
+)
 _IDLE_SLEEP_SECONDS = 0.05
 _MAX_SINGLE_BACKOFF_SECONDS = 3600  # 1 hour per wait
 _MAX_TOTAL_BACKOFF_SECONDS = 5 * 3600  # 5 hours cumulative across all waits in a run
@@ -163,6 +178,7 @@ class DynamicAnalysisRunner:
         attach: bool = False,
         failure_context: str = "",
         interaction_channel: UserInteractionChannel | None = None,
+        chat_dashboard: Any = None,
     ) -> None:
         self.phase = phase
         self.workflow = workflow
@@ -174,6 +190,7 @@ class DynamicAnalysisRunner:
         self.failure_context = failure_context
         self.config = phase.analysis or AnalysisConfig()
         self.working_dir = Path(workflow.working_dir).resolve()
+        self._injected_chat_dashboard: Any = chat_dashboard
 
         self.state = (
             DynamicSessionState.load(self.state_file) if run_mode == "resume" else DynamicSessionState(self.state_file)
@@ -207,6 +224,13 @@ class DynamicAnalysisRunner:
         self._injected_interaction_channel = interaction_channel is not None and interactive
         if self._interaction_channel is None and interactive:
             self._interaction_channel = UserInteractionChannel()
+
+        self._dashboard: Any = None
+        self._captain_executor: ThreadPoolExecutor | None = None
+        self._captain_future: Future[None] | None = None
+        self._chat_history: list[str] = []
+        self._force_captain_turn: bool = False
+        self._last_dashboard_event_seq: int = 0
 
         prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
         self._captain_role_prompt = (prompts_dir / "captain-analysis.md").read_text(encoding="utf-8")
@@ -244,9 +268,11 @@ class DynamicAnalysisRunner:
         self._rebuild_pending_claim_retries()
         self._rebuild_pending_reporter_claim_ids()
 
-        # Interactive tmux captain: only when --interactive without an injected test channel
+        # Chat dashboard: --interactive without an injected test channel.
+        # Tests inject a ScriptedInteractionChannel and route through _run_batch
+        # to keep deterministic-ordering semantics.
         if self.interactive and not self._injected_interaction_channel:
-            return self._run_interactive()
+            return self._run_chat()
         return self._run_batch()
 
     def _run_batch(self) -> PhaseResult:
@@ -297,6 +323,171 @@ class DynamicAnalysisRunner:
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _run_chat(self) -> PhaseResult:
+        """Chat-dashboard execution: captain runs on a background thread; the user
+        types directives at any moment via a Rich Live dashboard."""
+
+        from juvenal.dynamic.chat_display import make_chat_dashboard
+
+        self.display.pause()
+        if self._injected_chat_dashboard is not None:
+            self._dashboard = self._injected_chat_dashboard
+        else:
+            plain = getattr(self.display, "_plain", False)
+            self._dashboard = make_chat_dashboard(plain=plain)
+        self._captain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-captain")
+        self._last_dashboard_event_seq = max((event.seq for event in self.state.events), default=0)
+
+        try:
+            if self._interaction_channel is not None:
+                self._interaction_channel.start()
+            self._dashboard.start()
+            self._paint_dashboard()
+
+            while True:
+                terminate, success, reason = self._should_terminate()
+                if terminate:
+                    if not success:
+                        self.kill_active()
+                    return PhaseResult(success=success, failure_context=reason if not success else "")
+
+                made_progress = False
+                made_progress |= self._drain_completed_futures()
+                made_progress |= self._schedule_verifiers()
+                made_progress |= self._schedule_workers()
+                made_progress |= self._schedule_reporters()
+                made_progress |= self._apply_continuous_directives()
+                made_progress |= self._drain_captain_future()
+
+                terminate, success, reason = self._should_terminate()
+                if terminate:
+                    if not success:
+                        self.kill_active()
+                    return PhaseResult(success=success, failure_context=reason if not success else "")
+
+                if self._captain_future is None and (self._force_captain_turn or self._needs_captain_turn()):
+                    self._dispatch_captain_turn()
+                    self._force_captain_turn = False
+                    made_progress = True
+
+                self._emit_pending_dashboard_events()
+                self._paint_dashboard()
+
+                if not made_progress:
+                    time.sleep(_IDLE_SLEEP_SECONDS)
+        finally:
+            if self._captain_executor is not None:
+                self._captain_executor.shutdown(wait=False, cancel_futures=True)
+            if self._dashboard is not None:
+                self._dashboard.stop()
+            if self._interaction_channel is not None:
+                self._interaction_channel.stop()
+            self._worker_executor.shutdown(wait=False, cancel_futures=True)
+            self._verifier_executor.shutdown(wait=False, cancel_futures=True)
+            self._reporter_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _apply_continuous_directives(self) -> bool:
+        if self._interaction_channel is None or self.state.control.stop_requested:
+            return False
+        lines = self._interaction_channel.poll(0.0)
+        if not lines:
+            return False
+        changed = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            self._chat_history.append(stripped)
+            directive_id = self._next_directive_id()
+            try:
+                directive = parse_user_directive(stripped, directive_id=directive_id)
+            except ValueError as exc:
+                if self._dashboard is not None:
+                    self._dashboard.render_event(
+                        kind="info",
+                        text=f"ignored {stripped!r}: {exc}",
+                    )
+                continue
+            applied = self._persist_directive(directive)
+            changed |= applied
+            if self._dashboard is not None and applied:
+                self._dashboard.render_event(
+                    kind="directive.applied",
+                    text=f"{directive.kind} {directive.text}".strip(),
+                )
+        if self._dashboard is not None:
+            self._dashboard.render_chat_input(self._chat_history[-8:])
+        return changed
+
+    def _dispatch_captain_turn(self) -> None:
+        if self._captain_executor is None or self._captain_future is not None:
+            return
+        if self._dashboard is not None:
+            self._dashboard.render_event(
+                kind="captain.starting",
+                text=f"turn #{self.state.captain.turn_index + 1}",
+            )
+        self._captain_future = self._captain_executor.submit(self._run_captain_turn)
+
+    def _drain_captain_future(self) -> bool:
+        if self._captain_future is None:
+            return False
+        if not self._captain_future.done():
+            return False
+        future = self._captain_future
+        self._captain_future = None
+        try:
+            future.result()
+        except Exception as exc:
+            if self._dashboard is not None:
+                self._dashboard.render_event(kind="captain.error", text=str(exc))
+            self._terminal_failure = f"captain turn raised: {exc}"
+            return True
+        if self._dashboard is not None:
+            self._dashboard.render_captain(
+                message_to_user=self.state.captain.last_message_to_user,
+                mental_model_summary=self.state.captain.mental_model_summary,
+                open_questions=list(self.state.captain.open_questions),
+                turn_index=self.state.captain.turn_index,
+            )
+            self._dashboard.render_event(
+                kind="captain.turn",
+                text=f"turn #{self.state.captain.turn_index} finished",
+            )
+        return True
+
+    def _emit_pending_dashboard_events(self) -> None:
+        if self._dashboard is None:
+            return
+        for event in self.state.events:
+            if event.seq <= self._last_dashboard_event_seq:
+                continue
+            if event.event_type not in _DASHBOARD_EVENT_KINDS:
+                self._last_dashboard_event_seq = event.seq
+                continue
+            text = self._format_event_for_dashboard(event)
+            self._dashboard.render_event(kind=event.event_type, text=text)
+            self._last_dashboard_event_seq = event.seq
+
+    def _format_event_for_dashboard(self, event: Any) -> str:
+        parts: list[str] = []
+        if event.target_id:
+            parts.append(f"target={event.target_id}")
+        if event.claim_id:
+            parts.append(f"claim={event.claim_id}")
+        if event.directive_id:
+            parts.append(f"directive={event.directive_id}")
+        return " ".join(parts) or event.event_type
+
+    def _paint_dashboard(self) -> None:
+        if self._dashboard is None:
+            return
+        counts: dict[str, int] = {}
+        for target in self._frontier_targets():
+            counts[target.status] = counts.get(target.status, 0) + 1
+        active = [(target.target_id, target.status) for target in self._frontier_targets()]
+        self._dashboard.render_frontier(counts, active)
 
     def _run_interactive(self) -> PhaseResult:
         """Interactive execution: captain is a Claude Code session in tmux."""
@@ -977,7 +1168,31 @@ class DynamicAnalysisRunner:
             return self._apply_stop_directive(directive)
         if directive.kind == "wrap":
             return self._apply_wrap_directive(directive)
+        if directive.kind == "now":
+            return self._apply_now_directive(directive)
+        if directive.kind == "show":
+            return self._apply_show_directive(directive)
         return self._queue_captain_directive(directive)
+
+    def _apply_now_directive(self, directive: UserDirective) -> bool:
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        self.state.save()
+        self._force_captain_turn = True
+        return True
+
+    def _apply_show_directive(self, directive: UserDirective) -> bool:
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        self.state.save()
+        topic = directive.text.strip()
+        if topic == "captain" and self._dashboard is not None:
+            self._dashboard.show_captain_full(
+                message_to_user=self.state.captain.last_message_to_user,
+                mental_model_summary=self.state.captain.mental_model_summary,
+                open_questions=list(self.state.captain.open_questions),
+            )
+        return True
 
     def _apply_ignore_directive(self, directive: UserDirective) -> bool:
         now = time.time()
