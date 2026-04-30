@@ -313,11 +313,13 @@ class DynamicAnalysisRunner:
             dispatch_file.write_text("", encoding="utf-8")
             results_file.write_text("", encoding="utf-8")
 
+        captain_model = _resolve_model(self.config.captain_backend, "captain", self.config.captain_model)
         tmux_session = TmuxCaptainSession(
             session_name=f"juvenal-{self.phase.id}",
             working_dir=self.working_dir,
             dispatch_file=dispatch_file,
             results_file=results_file,
+            model=captain_model,
         )
         watcher = FileWatcher(dispatch_file, self._handle_dispatch)
         self._tmux_session = tmux_session
@@ -341,7 +343,8 @@ class DynamicAnalysisRunner:
             print(f"  Results file:  {results_file}\n", flush=True)
 
             # Grace period for captain to initialize
-            startup_deadline = time.time() + 10.0
+            session_start = time.time()
+            startup_deadline = session_start + 10.0
 
             # Autonomous loop: no captain turns, no user waits
             while True:
@@ -350,12 +353,26 @@ class DynamicAnalysisRunner:
                     if time.time() < startup_deadline:
                         time.sleep(1.0)
                         continue
-                    # Captain exited — check if all work is done
+                    # Captain exited. Drain any in-flight work first; then fail loudly —
+                    # the captain has no juvenal-mediated "done" signal other than
+                    # `.juvenal/stop` (handled below), so an unexpected exit is a real
+                    # failure (commonly: invalid CLI flag, auth error, OOM in claude).
                     self._drain_completed_futures()
                     if self._has_active_runtime_work():
                         time.sleep(1.0)
                         continue
-                    return PhaseResult(success=True, failure_context="")
+                    elapsed = time.time() - session_start
+                    if elapsed < 30.0:
+                        message = (
+                            f"captain tmux session ended {elapsed:.1f}s after launch — "
+                            "likely a startup failure (check claude CLI flags, auth, model name)"
+                        )
+                    else:
+                        message = (
+                            f"captain tmux session ended unexpectedly after {elapsed:.0f}s "
+                            "without creating `.juvenal/stop`"
+                        )
+                    return PhaseResult(success=False, failure_context=message)
 
                 # Check for terminal failure
                 if self._terminal_failure:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -20,27 +22,38 @@ class TmuxCaptainSession:
         working_dir: Path,
         dispatch_file: Path,
         results_file: Path,
+        *,
+        model: str | None = None,
+        claude_path: str | None = None,
     ) -> None:
         self.session_name = session_name
         self.working_dir = working_dir
         self.dispatch_file = dispatch_file
         self.results_file = results_file
-        self.session_id = f"juvenal-captain-{uuid.uuid4().hex[:12]}"
+        self.model = model
+        self.claude_path = claude_path or shutil.which("claude") or "claude"
+        # Claude Code requires a UUID for --session-id.
+        self.session_id = str(uuid.uuid4())
         self._started = False
+
+    def _build_claude_cmd(self) -> str:
+        parts = [
+            shlex.quote(self.claude_path),
+            f"--session-id={self.session_id}",
+            "--dangerously-skip-permissions",
+            "--verbose",
+        ]
+        if self.model:
+            parts.extend(["--model", shlex.quote(self.model)])
+        return " ".join(parts)
 
     def start(self, prompt: str, *, env: dict[str, str] | None = None) -> None:
         """Start the captain as a Claude Code session inside a detached tmux session."""
-        # Write prompt to a temp file so it can be arbitrarily long
         prompt_file = self.working_dir / ".juvenal" / "captain-prompt.md"
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt, encoding="utf-8")
 
-        import shutil
-
-        claude_path = shutil.which("claude") or "claude"
-        # Start claude in interactive TUI mode (no positional prompt arg).
-        # The initial message is sent via send-keys after the session starts.
-        claude_cmd = f"{claude_path} --session-id={self.session_id} --dangerously-skip-permissions --verbose"
+        claude_cmd = self._build_claude_cmd()
 
         cmd = [
             "tmux",
