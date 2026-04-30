@@ -350,6 +350,17 @@ class AnalysisConfig:
     worker_model: str | None = None
     verifier_backend: str = "claude"
     verifier_model: str | None = None
+    # Parallel-agent budget.
+    # When `shared_agent_budget` is True (default), worker and verifier
+    # dispatch share a single budget of `max_agents` total slots. Verifier
+    # work is scheduled first in the loop, so newly-proposed claims preempt
+    # queued targets — claims clear quickly instead of sitting on a backlog
+    # while workers keep producing more.
+    # When False, the runner uses two independent thread pools sized at
+    # `max_workers` and `max_verifiers` (the legacy behavior). Total
+    # parallelism in legacy mode is `max_workers + max_verifiers`.
+    shared_agent_budget: bool = True
+    max_agents: int = 12
     max_workers: int = 4
     max_verifiers: int = 8
     interaction_timeout: float = 3.0
@@ -381,6 +392,8 @@ _ANALYSIS_CONFIG_KEYS = {
     "worker_model",
     "verifier_backend",
     "verifier_model",
+    "shared_agent_budget",
+    "max_agents",
     "max_workers",
     "max_verifiers",
     "interaction_timeout",
@@ -598,6 +611,12 @@ def _parse_analysis_config(
     captain_model = _parse_optional_model(raw.get("captain_model"), phase_id=phase_id, field_name="captain_model")
     worker_model = _parse_optional_model(raw.get("worker_model"), phase_id=phase_id, field_name="worker_model")
     verifier_model = _parse_optional_model(raw.get("verifier_model"), phase_id=phase_id, field_name="verifier_model")
+    shared_agent_budget = raw.get("shared_agent_budget", defaults.shared_agent_budget)
+    if not isinstance(shared_agent_budget, bool):
+        raise ValueError(f"Phase '{phase_id}': analysis.shared_agent_budget must be a boolean")
+    max_agents = _parse_analysis_int(
+        raw.get("max_agents", defaults.max_agents), phase_id=phase_id, field_name="max_agents", minimum=1
+    )
     max_workers = _parse_analysis_int(
         raw.get("max_workers", defaults.max_workers), phase_id=phase_id, field_name="max_workers", minimum=1
     )
@@ -692,6 +711,8 @@ def _parse_analysis_config(
         captain_model=captain_model,
         worker_model=worker_model,
         verifier_model=verifier_model,
+        shared_agent_budget=shared_agent_budget,
+        max_agents=max_agents,
         max_workers=max_workers,
         max_verifiers=max_verifiers,
         interaction_timeout=interaction_timeout,

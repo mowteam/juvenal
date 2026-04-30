@@ -429,6 +429,44 @@ def test_yaml_parses_three_verifiers(tmp_path):
     assert cfg.verifiers[2].prompt == "from-file"
 
 
+def test_yaml_parses_shared_agent_budget_and_max_agents():
+    raw = {"shared_agent_budget": True, "max_agents": 6}
+    cfg = _parse_analysis_config(raw, phase_id="p")
+    assert cfg is not None
+    assert cfg.shared_agent_budget is True
+    assert cfg.max_agents == 6
+
+
+def test_yaml_parses_legacy_independent_pools():
+    raw = {"shared_agent_budget": False, "max_workers": 2, "max_verifiers": 4}
+    cfg = _parse_analysis_config(raw, phase_id="p")
+    assert cfg is not None
+    assert cfg.shared_agent_budget is False
+    assert cfg.max_workers == 2
+    assert cfg.max_verifiers == 4
+
+
+def test_yaml_default_shared_agent_budget_is_true():
+    cfg = _parse_analysis_config({}, phase_id="p")
+    assert cfg is not None
+    assert cfg.shared_agent_budget is True
+
+
+def test_yaml_rejects_max_agents_zero():
+    with pytest.raises(ValueError, match="max_agents must be >= 1"):
+        _parse_analysis_config({"max_agents": 0}, phase_id="p")
+
+
+def test_yaml_rejects_max_agents_non_int():
+    with pytest.raises(ValueError, match="max_agents must be an integer"):
+        _parse_analysis_config({"max_agents": "twelve"}, phase_id="p")
+
+
+def test_yaml_rejects_shared_agent_budget_non_bool():
+    with pytest.raises(ValueError, match="shared_agent_budget must be a boolean"):
+        _parse_analysis_config({"shared_agent_budget": "yes"}, phase_id="p")
+
+
 def test_yaml_rejects_both_verifiers_and_verifier_backend():
     raw = {
         "verifier_backend": "claude",

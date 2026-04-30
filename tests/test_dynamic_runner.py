@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import Future
 from unittest.mock import patch
 
 from juvenal.display import Display
@@ -254,7 +255,18 @@ def _run_runner(
         id="analyze",
         type="analysis",
         prompt="Analyze the repository for security issues.",
-        analysis=config or AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1),
+        analysis=config
+        or AnalysisConfig(
+            # Default test config opts into legacy independent-pool mode so
+            # max_workers=1 forces strict serial dispatch (which most existing
+            # tests rely on for predictable response-queue ordering). Tests
+            # that exercise the shared-budget path opt in explicitly via
+            # AnalysisConfig(shared_agent_budget=True, max_agents=N).
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+        ),
     )
     workflow = Workflow(name="analysis", phases=[phase], working_dir=str(tmp_path))
     state_file = tmp_path / "analysis-state.json"
@@ -290,7 +302,18 @@ def _run_chat_runner(
         id="analyze",
         type="analysis",
         prompt="Analyze the repository for security issues.",
-        analysis=config or AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1),
+        analysis=config
+        or AnalysisConfig(
+            # Default test config opts into legacy independent-pool mode so
+            # max_workers=1 forces strict serial dispatch (which most existing
+            # tests rely on for predictable response-queue ordering). Tests
+            # that exercise the shared-budget path opt in explicitly via
+            # AnalysisConfig(shared_agent_budget=True, max_agents=N).
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+        ),
     )
     workflow = Workflow(name="analysis", phases=[phase], working_dir=str(tmp_path))
     state_file = tmp_path / "analysis-state.json"
@@ -573,7 +596,13 @@ def test_ignore_path_directive_makes_matching_targets_ineligible(tmp_path):
     result, state, backend = _run_runner(
         tmp_path,
         backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        config=AnalysisConfig(
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+            interaction_timeout=0.01,
+        ),
         interactive=True,
         interaction_channel=interaction,
     )
@@ -611,7 +640,13 @@ def test_ignore_symbol_directive_makes_matching_targets_ineligible(tmp_path):
     result, state, backend = _run_runner(
         tmp_path,
         backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        config=AnalysisConfig(
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+            interaction_timeout=0.01,
+        ),
         interactive=True,
         interaction_channel=interaction,
     )
@@ -651,7 +686,13 @@ def test_target_directive_creates_user_sourced_target(tmp_path):
     result, state, backend = _run_runner(
         tmp_path,
         backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        config=AnalysisConfig(
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+            interaction_timeout=0.01,
+        ),
         interactive=True,
         interaction_channel=interaction,
     )
@@ -694,7 +735,13 @@ def test_summary_directive_triggers_captain_turn(tmp_path):
     result, state, backend = _run_runner(
         tmp_path,
         backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        config=AnalysisConfig(
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+            interaction_timeout=0.01,
+        ),
         interactive=True,
         interaction_channel=interaction,
     )
@@ -720,7 +767,13 @@ def test_stop_directive_ends_run_immediately(tmp_path):
     result, state, backend = _run_runner(
         tmp_path,
         backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        config=AnalysisConfig(
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+            interaction_timeout=0.01,
+        ),
         interactive=True,
         interaction_channel=interaction,
     )
@@ -757,7 +810,13 @@ def test_wrap_directive_drains_active_work_then_completes(tmp_path):
     result, state, backend = _run_runner(
         tmp_path,
         backend,
-        config=AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1, interaction_timeout=0.01),
+        config=AnalysisConfig(
+            shared_agent_budget=False,
+            max_workers=1,
+            max_verifiers=1,
+            max_worker_retries=1,
+            interaction_timeout=0.01,
+        ),
         interactive=True,
         interaction_channel=interaction,
     )
@@ -1576,3 +1635,98 @@ def test_batch_mode_does_not_stream_chunks(tmp_path):
     assert result.success is True
     captain_chunks = [text for role, text in backend.chunk_calls if role == "captain"]
     assert captain_chunks == []
+
+
+def _make_unstarted_runner(tmp_path, config: AnalysisConfig) -> DynamicAnalysisRunner:
+    """Build a runner without invoking .run(); used for direct-method tests
+    that poke at the scheduler without orchestrating a full mocked loop."""
+    phase = Phase(id="analyze", type="analysis", prompt="x", analysis=config)
+    workflow = Workflow(name="x", phases=[phase], working_dir=str(tmp_path))
+    state_file = tmp_path / "analysis-state.json"
+    backend = MockBackend()
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        return DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=False,
+        )
+
+
+def test_shared_budget_caps_combined_dispatch(tmp_path):
+    """Under shared_agent_budget the available worker slots are reduced by
+    in-flight verifier futures: a saturated verifier pool means workers
+    cannot dispatch."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=3)
+    runner = _make_unstarted_runner(tmp_path, config)
+    # Pre-seed 3 sentinel verifier futures (saturate the combined budget).
+    for _ in range(3):
+        runner._verifier_futures[Future()] = "v"
+
+    assert runner._available_worker_slots() == 0
+    assert runner._available_verifier_slots() == 0
+
+    # Free one verifier slot — workers can fill it.
+    finished = next(iter(runner._verifier_futures))
+    runner._verifier_futures.pop(finished)
+    assert runner._available_worker_slots() == 1
+    assert runner._available_verifier_slots() == 1
+
+
+def test_shared_budget_verifier_priority(tmp_path):
+    """When shared budget is on and both schedulers run in the loop,
+    verifier dispatch happens first (its scheduler is invoked first), so a
+    proposed claim consumes the next slot before a queued target."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+    # 1 in-flight worker; 1 slot free.
+    runner._worker_futures[Future()] = "w"
+
+    # In shared mode: both schedulers see 1 slot available.
+    assert runner._available_worker_slots() == 1
+    assert runner._available_verifier_slots() == 1
+
+    # If a verifier dispatch consumes that slot, worker dispatch sees 0.
+    runner._verifier_futures[Future()] = "v"
+    assert runner._available_worker_slots() == 0
+
+
+def test_legacy_mode_pools_remain_independent(tmp_path):
+    """With shared_agent_budget=False, workers and verifiers do not compete
+    for the same budget — each pool has its own independent cap."""
+    config = AnalysisConfig(shared_agent_budget=False, max_workers=2, max_verifiers=3)
+    runner = _make_unstarted_runner(tmp_path, config)
+    # Fully saturate the verifier pool — workers must still have full headroom.
+    for _ in range(3):
+        runner._verifier_futures[Future()] = "v"
+    assert runner._available_worker_slots() == 2
+    assert runner._available_verifier_slots() == 0
+
+
+def test_shared_mode_reporters_do_not_consume_agent_budget(tmp_path):
+    """Reporters are on a separate pool by design and must not be counted
+    against the worker+verifier shared budget."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+    # Saturate the agent budget with verifiers + workers.
+    runner._worker_futures[Future()] = "w"
+    runner._verifier_futures[Future()] = "v"
+    assert runner._available_worker_slots() == 0
+    # Reporter scheduler still has a separate pool; pre-seed a reporter
+    # future and confirm the agent counters are unchanged.
+    runner._reporter_futures[Future()] = "r"
+    assert runner._available_worker_slots() == 0
+    assert runner._available_verifier_slots() == 0
+
+
+def test_shared_mode_default_is_on(tmp_path):
+    """The default AnalysisConfig has shared_agent_budget=True so new
+    workflows get the verifier-priority behavior without explicit opt-in."""
+    config = AnalysisConfig()
+    assert config.shared_agent_budget is True
+    runner = _make_unstarted_runner(tmp_path, config)
+    assert runner._max_agents == config.max_agents
+    assert runner._max_worker_cap == config.max_agents
+    assert runner._max_verifier_cap == config.max_agents

@@ -213,8 +213,21 @@ class DynamicAnalysisRunner:
         )
         self._backend_by_name: dict[str, Backend] = {}
         self._backend_lock = Lock()
-        self._worker_executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
-        self._verifier_executor = ThreadPoolExecutor(max_workers=self.config.max_verifiers)
+        # Resolve effective parallel-agent capacity. In shared mode, both
+        # pools are sized at max_agents so either role can use the full
+        # budget; the actual cap is enforced at scheduling time. In legacy
+        # mode, pools are sized at the per-role limits and enforced
+        # independently.
+        if self.config.shared_agent_budget:
+            self._max_agents = self.config.max_agents
+            self._max_worker_cap = self.config.max_agents
+            self._max_verifier_cap = self.config.max_agents
+        else:
+            self._max_agents = self.config.max_workers + self.config.max_verifiers
+            self._max_worker_cap = self.config.max_workers
+            self._max_verifier_cap = self.config.max_verifiers
+        self._worker_executor = ThreadPoolExecutor(max_workers=self._max_worker_cap)
+        self._verifier_executor = ThreadPoolExecutor(max_workers=self._max_verifier_cap)
         self._reporter_executor = ThreadPoolExecutor(max_workers=max(1, self.config.max_workers))
         self._worker_futures: dict[Future[_WorkerExecutionResult], str] = {}
         self._verifier_futures: dict[Future[_VerifierExecutionResult], str] = {}
@@ -593,6 +606,10 @@ class DynamicAnalysisRunner:
         if not frontier:
             return current_snapshot != self._last_captain_snapshot
 
+        # Heuristic threshold for "ask captain for more targets" — keep this
+        # tied to max_workers (a pacing knob) regardless of the shared/legacy
+        # mode, so behavior stays predictable and the test fixtures that
+        # set max_workers=1 to force serial dispatch still work.
         return len(frontier) < self.config.max_workers and current_snapshot != self._last_captain_snapshot
 
     def _run_captain_turn(self) -> None:
@@ -715,6 +732,37 @@ class DynamicAnalysisRunner:
         self._terminal_failure = f"captain output remained malformed after repair: {last_error}"
         return None
 
+    def _available_worker_slots(self) -> int:
+        """Slots available for new worker dispatch.
+
+        In shared mode: limited by both the combined budget (max_agents minus
+        all in-flight worker+verifier futures) and the per-role pool cap (which
+        equals max_agents in shared mode, so this is effectively just the
+        combined budget).
+        In legacy mode: per-role budget independent of verifier dispatch.
+        """
+        worker_role_avail = self._max_worker_cap - len(self._worker_futures)
+        if not self.config.shared_agent_budget:
+            return max(0, worker_role_avail)
+        in_flight = len(self._worker_futures) + len(self._verifier_futures)
+        combined_avail = self._max_agents - in_flight
+        return max(0, min(worker_role_avail, combined_avail))
+
+    def _available_verifier_slots(self) -> int:
+        """Slots available for new verifier dispatch.
+
+        Verifier scheduling runs before worker scheduling in the main loop, so
+        in shared mode verifiers naturally preempt workers — newly proposed
+        claims get dispatched ahead of newly enqueued targets within the same
+        budget.
+        """
+        verifier_role_avail = self._max_verifier_cap - len(self._verifier_futures)
+        if not self.config.shared_agent_budget:
+            return max(0, verifier_role_avail)
+        in_flight = len(self._worker_futures) + len(self._verifier_futures)
+        combined_avail = self._max_agents - in_flight
+        return max(0, min(verifier_role_avail, combined_avail))
+
     def _schedule_workers(self) -> bool:
         if self._terminal_failure or self.state.control.stop_requested or self.state.control.wrap_requested:
             return False
@@ -732,7 +780,7 @@ class DynamicAnalysisRunner:
         if changed:
             self.state.save()
 
-        available = self.config.max_workers - len(self._worker_futures)
+        available = self._available_worker_slots()
         if available <= 0:
             return changed
 
@@ -757,7 +805,7 @@ class DynamicAnalysisRunner:
             scheduled = True
 
         # Process pending claim retries within remaining budget
-        available = self.config.max_workers - len(self._worker_futures)
+        available = self._available_worker_slots()
         if available > 0 and self._pending_claim_retries:
             retries = self._pending_claim_retries[:available]
             self._pending_claim_retries = self._pending_claim_retries[available:]
@@ -835,7 +883,7 @@ class DynamicAnalysisRunner:
         if changed:
             self.state.save()
 
-        available = self.config.max_verifiers - len(self._verifier_futures)
+        available = self._available_verifier_slots()
         if available <= 0:
             return changed
 

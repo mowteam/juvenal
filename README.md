@@ -235,8 +235,8 @@ can inspect the verified findings or audit trail if they need to summarize resul
     captain_backend: claude
     worker_backend: codex
     verifier_backend: claude
-    max_workers: 4
-    max_verifiers: 8
+    shared_agent_budget: true
+    max_agents: 12
     interaction_timeout: 3.0
     max_worker_retries: 2
     max_captain_repairs: 2
@@ -250,8 +250,10 @@ can inspect the verified findings or audit trail if they need to summarize resul
 | `captain_backend` | `claude` | Backend for the long-lived captain session that discovers and reprioritizes targets |
 | `worker_backend` | `codex` | Backend for fresh worker attempts on bounded targets |
 | `verifier_backend` | `claude` | Backend for fresh independent claim verification attempts |
-| `max_workers` | `4` | Maximum concurrent worker attempts |
-| `max_verifiers` | `8` | Maximum concurrent verifier attempts |
+| `shared_agent_budget` | `true` | When `true`, workers and verifiers draw from a single budget of `max_agents` slots and verifier dispatch preempts worker dispatch (claims clear before more workers spin up). When `false`, falls back to legacy independent pools (`max_workers` + `max_verifiers`). |
+| `max_agents` | `12` | Combined parallel-agent cap when `shared_agent_budget: true`. Ignored in legacy mode. |
+| `max_workers` | `4` | Worker pool size in legacy mode (`shared_agent_budget: false`). Ignored when shared. |
+| `max_verifiers` | `8` | Verifier pool size in legacy mode (`shared_agent_budget: false`). Ignored when shared. |
 | `interaction_timeout` | `3.0` | Review window in seconds when `juvenal run --interactive` is enabled |
 | `max_worker_retries` | `2` | Retry budget per target after rejected claims or interrupted work |
 | `max_captain_repairs` | `2` | Repair attempts when the captain emits malformed structured output |
