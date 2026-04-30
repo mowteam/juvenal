@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -68,6 +69,24 @@ _DASHBOARD_EVENT_KINDS = frozenset(
 _IDLE_SLEEP_SECONDS = 0.05
 _MAX_SINGLE_BACKOFF_SECONDS = 3600  # 1 hour per wait
 _MAX_TOTAL_BACKOFF_SECONDS = 5 * 3600  # 5 hours cumulative across all waits in a run
+
+
+def _flush_stdin_buffer() -> None:
+    """Drop any buffered-but-unread input on stdin. Called on Ctrl-C / phase
+    exit so partially-typed lines from the chat reader don't bleed into the
+    parent shell's prompt."""
+
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except (ImportError, OSError):
+        pass
+    except Exception:
+        pass
+
 
 _DEFAULT_CONTINUE_NUDGE = (
     "## Continue nudge — engine override\n\n"
@@ -318,9 +337,15 @@ class DynamicAnalysisRunner:
 
                 if not made_progress:
                     time.sleep(_IDLE_SLEEP_SECONDS)
+        except KeyboardInterrupt:
+            print("\nInterrupted (Ctrl-C). Killing active subprocesses…", flush=True)
+            self.kill_active()
+            return PhaseResult(success=False, failure_context="interrupted by user (Ctrl-C)")
         finally:
+            self.kill_active()
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
+            _flush_stdin_buffer()
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
@@ -381,13 +406,28 @@ class DynamicAnalysisRunner:
 
                 if not made_progress:
                     time.sleep(_IDLE_SLEEP_SECONDS)
+        except KeyboardInterrupt:
+            print("\n[chat] interrupted (Ctrl-C). Killing active subprocesses…", flush=True)
+            self.kill_active()
+            return PhaseResult(success=False, failure_context="interrupted by user (Ctrl-C)")
         finally:
+            # Always kill subprocesses first so their wait() calls return and
+            # the executor threads (which are non-daemon) can exit. Without
+            # this, Ctrl-C requires multiple presses because Python won't
+            # exit while a thread is blocked in subprocess.Popen.wait().
+            self.kill_active()
             if self._captain_executor is not None:
                 self._captain_executor.shutdown(wait=False, cancel_futures=True)
             if self._dashboard is not None:
-                self._dashboard.stop()
+                try:
+                    self._dashboard.stop()
+                except Exception:
+                    pass
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
+            # Flush any partial input the user typed before Ctrl-C — otherwise
+            # it gets fed to the parent shell when juvenal exits.
+            _flush_stdin_buffer()
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)

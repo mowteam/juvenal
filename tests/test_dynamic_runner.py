@@ -1340,6 +1340,52 @@ def test_chat_directive_pauses_for_native_resume_interactive(tmp_path):
     assert any("Resuming from free-form chat" in prompt for prompt in captain_prompts)
 
 
+def test_chat_mode_keyboard_interrupt_kills_active_and_returns_failure(tmp_path, monkeypatch):
+    """A Ctrl-C during the chat loop must call kill_active so subprocess
+    threads can exit, return success=False with an `interrupted` context, and not
+    leave the user pressing Ctrl-C repeatedly waiting for executor threads."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    from juvenal.dynamic.runner import DynamicAnalysisRunner
+
+    kill_calls: list[int] = []
+    original_kill = DynamicAnalysisRunner.kill_active
+
+    def spy_kill(self):
+        kill_calls.append(1)
+        original_kill(self)
+
+    monkeypatch.setattr(DynamicAnalysisRunner, "kill_active", spy_kill)
+
+    raised: list[bool] = [False]
+
+    def boom(_self):
+        if raised[0]:
+            return False
+        raised[0] = True
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(DynamicAnalysisRunner, "_drain_completed_futures", boom)
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel()
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, _state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is False
+    assert "interrupted" in result.failure_context.lower()
+    # kill_active is called both in the except-clause AND the finally block;
+    # 2+ calls confirm both paths fire and that it's safely idempotent.
+    assert len(kill_calls) >= 2
+
+
 def test_chat_directive_no_session_yet_is_a_no_op(tmp_path):
     """If the captain has no session_id yet (first turn not finished),
     `/chat` is a no-op that emits an info event and clears the pending flag."""
