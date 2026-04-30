@@ -32,8 +32,9 @@ class ChatDashboard:
         print(
             "\n[chat] interactive analysis started — type directives at any moment.\n"
             "  /focus TEXT  /ignore path:PFX  /ignore symbol:NAME  /target TEXT\n"
-            "  /ask TEXT  /now  /show captain  /summary  /stop  /wrap\n"
-            "  any free-form text becomes a `note` directive\n",
+            "  /ask TEXT  /now  /show captain  /chat  /summary  /stop  /wrap\n"
+            "  any free-form text becomes a `note` directive\n"
+            "  /chat hands you the native claude / codex TUI on the captain's session\n",
             flush=True,
         )
 
