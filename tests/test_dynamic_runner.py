@@ -1392,6 +1392,106 @@ def test_chat_mode_keyboard_interrupt_kills_active_and_returns_failure(tmp_path,
     assert len(kill_calls) >= 2
 
 
+def test_captain_context_files_written_each_turn(tmp_path):
+    """frontier.json, mental_model.md, claims.json must be written to
+    .juvenal/ before every captain turn so the captain can Read them on
+    demand instead of receiving everything in the prompt."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+    result, _state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    ctx = tmp_path / ".juvenal"
+    assert (ctx / "frontier.json").exists()
+    assert (ctx / "mental_model.md").exists()
+    assert (ctx / "claims.json").exists()
+    # frontier.json must contain the dispatched target on turn 2 (when it was queued).
+    # By end of run the target is terminal so frontier is empty; mental_model still has content.
+    mental = (ctx / "mental_model.md").read_text()
+    assert "Captain mental model" in mental
+
+
+def test_first_captain_prompt_includes_role_and_mission_subsequent_does_not(tmp_path):
+    """Turn 1's prompt seeds the session with the role + mission. Subsequent
+    turns rely on Claude's session storage and only carry the per-turn delta
+    plus pointers to .juvenal/ context files."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+        session_id="captain-session-x",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+    result, _state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    assert len(captain_prompts) == 2
+
+    # Turn 1: role + mission present.
+    assert "You are the captain for Juvenal's dynamic" in captain_prompts[0]
+    assert "Mission:" in captain_prompts[0]
+
+    # Turn 2: role + mission absent (session memory carries them).
+    assert "You are the captain for Juvenal's dynamic" not in captain_prompts[1]
+    assert "Mission:" not in captain_prompts[1]
+
+    # Both turns reference the canonical state files.
+    for prompt in captain_prompts:
+        assert "frontier.json" in prompt
+        assert "mental_model.md" in prompt
+        assert "claims.json" in prompt
+
+
+def test_per_turn_prompt_carries_event_ids_not_full_payloads(tmp_path):
+    """The slimmer prompt must include claim/target IDs in the delta so the
+    captain knows what changed, but should NOT inline the full claim payload
+    (assertion text, primary_location, etc.) — that's what claims.json is for."""
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(enqueue_targets=[_target("target-1")]))
+    backend.add_role_response("worker", output=_claim_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "verifier",
+        output=_verification_output("target-1-g1-claim-c1", "target-1", disposition="verified"),
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+    result, state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    # Turn 2 prompt should reference the verified claim ID (so captain knows
+    # what changed) but not its full assertion / preconditions / reasoning.
+    turn2 = captain_prompts[1]
+    verified_claim_ids = [c.claim_id for c in state.claims.values() if c.status == "verified"]
+    assert verified_claim_ids
+    assert any(cid in turn2 for cid in verified_claim_ids)
+    # Full claim payload bloat (one of the long fields) must not appear inline.
+    assert "The expected validation branch is absent." not in turn2  # the reasoning field
+    # And no inline frontier with full instructions.
+    assert "Analyze target-1." not in turn2  # the instructions field
+
+
 def test_rate_limit_backoff_bails_out_on_shutdown(tmp_path):
     """When kill_active fires while a background thread is sleeping in
     _rate_limit_backoff, the sleep returns within milliseconds. Without this,

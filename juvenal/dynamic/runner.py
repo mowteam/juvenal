@@ -1379,29 +1379,92 @@ class DynamicAnalysisRunner:
         except (KeyError, IndexError, ValueError):
             return template
 
+    def _captain_context_dir(self) -> Path:
+        return self.working_dir / ".juvenal"
+
+    def _write_captain_context_files(self) -> None:
+        """Persist the canonical captain-context state to .juvenal/ so the
+        captain can Read / Grep them on demand instead of receiving everything
+        re-stuffed into every prompt. Coding agents extract from files better
+        than they parse a 100KB blob — this lets the captain pull what it
+        actually needs and keeps the per-turn prompt focused on what's NEW."""
+
+        ctx = self._captain_context_dir()
+        ctx.mkdir(parents=True, exist_ok=True)
+
+        # frontier.json — current non-terminal targets with full instructions.
+        frontier = {
+            "counts": self._frontier_count_dict(),
+            "active_targets": [self._target_prompt_summary(target) for target in self._frontier_targets()],
+        }
+        self._atomic_write(ctx / "frontier.json", json.dumps(frontier, indent=2, sort_keys=True))
+
+        # mental_model.md — captain's most recent structured mental model.
+        mental = self.state.captain.mental_model_summary or "(none yet)"
+        open_qs = self.state.captain.open_questions
+        body = f"# Captain mental model\n\nTurn: {self.state.captain.turn_index}\n\n## Mental model\n\n{mental}\n"
+        if open_qs:
+            body += "\n## Open questions\n\n" + "\n".join(f"- {q}" for q in open_qs) + "\n"
+        self._atomic_write(ctx / "mental_model.md", body)
+
+        # claims.json — every verified + rejected claim with full detail. Used
+        # for variant-analysis lookups and for confirming what's been found.
+        claims = {
+            "verified": [
+                self._claim_full_payload(claim) for claim in self.state.claims.values() if claim.status == "verified"
+            ],
+            "rejected": [
+                self._claim_full_payload(claim) for claim in self.state.claims.values() if claim.status == "rejected"
+            ],
+        }
+        self._atomic_write(ctx / "claims.json", json.dumps(claims, indent=2, sort_keys=True))
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+
+    def _frontier_count_dict(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for target in self._frontier_targets():
+            counts[target.status] = counts.get(target.status, 0) + 1
+        return counts
+
+    def _claim_full_payload(self, claim: ClaimRecord) -> dict[str, Any]:
+        payload = self._claim_prompt_summary(claim)
+        payload["status"] = claim.status
+        payload["target_id"] = claim.target_id
+        payload["rejection_class"] = claim.rejection_class
+        payload["rejection_reason"] = self._latest_rejection_reason(claim)
+        return payload
+
     def _build_captain_prompt(self, *, summary_only: bool = False) -> str:
         nudge = self._pending_continue_nudge
         self._pending_continue_nudge = ""
         post_chat = self._post_chat_reprime
         self._post_chat_reprime = False
+
+        # Persist canonical state to .juvenal/ before this turn so the captain
+        # can Read them on demand instead of getting them re-stuffed in the
+        # prompt. Frontier and claims grow unbounded across turns; refeeding
+        # them inline buries the per-turn signal under noise and (separately)
+        # blew past Linux's argv cap on long runs before we piped via stdin.
+        self._write_captain_context_files()
+
         delta = self.state.pending_captain_delta()
         pending_directives = [
             asdict(self.state.directives[directive_id])
             for directive_id in delta.pending_directive_ids
             if directive_id in self.state.directives
         ]
-        frontier_summary = {
-            "counts": delta.frontier_counts,
-            "active_targets": [self._target_prompt_summary(target) for target in self._frontier_targets()],
-        }
-        delta_payload = {
-            "verified_claims": [self._claim_delta_payload(claim_id) for claim_id in delta.verified_claim_ids],
-            "rejected_claims": [self._claim_delta_payload(claim_id) for claim_id in delta.rejected_claim_ids],
-            "no_findings_targets": [
-                self._target_delta_payload(target_id) for target_id in delta.no_findings_target_ids
-            ],
-            "blocked_targets": [self._target_delta_payload(target_id) for target_id in delta.blocked_target_ids],
-            "exhausted_targets": [self._target_delta_payload(target_id) for target_id in delta.exhausted_target_ids],
+        delta_summary = {
+            "verified_claims": list(delta.verified_claim_ids),
+            "rejected_claims": list(delta.rejected_claim_ids),
+            "no_findings_targets": list(delta.no_findings_target_ids),
+            "blocked_targets": list(delta.blocked_target_ids),
+            "exhausted_targets": list(delta.exhausted_target_ids),
+            "frontier_counts": delta.frontier_counts,
         }
         mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         mode_note = (
@@ -1409,23 +1472,41 @@ class DynamicAnalysisRunner:
             if summary_only
             else "Plan the next bounded analysis work."
         )
-        prompt = (
-            f"{self._captain_role_prompt}\n\n"
-            f"Mission:\n{mission}\n\n"
-            f"Repository root: {self.working_dir}\n"
-            f"Captain turn: {self.state.captain.turn_index + 1}\n"
-            f"Mode: {mode_note}\n\n"
-            "Current mental model:\n"
-            f"{self.state.captain.mental_model_summary or '(none yet)'}\n\n"
-            "Open questions:\n"
-            f"{json.dumps(self.state.captain.open_questions, indent=2)}\n\n"
-            "Pending user directives:\n"
-            f"{json.dumps(pending_directives, indent=2)}\n\n"
-            "Frontier summary:\n"
-            f"{json.dumps(frontier_summary, indent=2)}\n\n"
-            "Event delta since the last captain turn:\n"
-            f"{json.dumps(delta_payload, indent=2)}\n"
+
+        ctx = self._captain_context_dir()
+        is_first_turn = self.state.captain.turn_index == 0
+        files_block = (
+            "Canonical state files (read on demand):\n"
+            f"  - {ctx / 'frontier.json'} — current non-terminal targets with full instructions\n"
+            f"  - {ctx / 'mental_model.md'} — your most recent mental model\n"
+            f"  - {ctx / 'claims.json'} — every verified and rejected claim with full detail\n"
+            "  These files are rewritten before every captain turn. Use Read / Grep to pull "
+            "specific items when you need them — do not assume the prompt contains complete state.\n"
         )
+
+        if is_first_turn:
+            prompt = (
+                f"{self._captain_role_prompt}\n\n"
+                f"Mission:\n{mission}\n\n"
+                f"Repository root: {self.working_dir}\n"
+                f"Captain turn: 1\n"
+                f"Mode: {mode_note}\n\n"
+                f"{files_block}\n"
+                "Pending user directives:\n"
+                f"{json.dumps(pending_directives, indent=2)}\n"
+            )
+        else:
+            prompt = (
+                f"Captain turn: {self.state.captain.turn_index + 1}\n"
+                f"Mode: {mode_note}\n\n"
+                f"{files_block}\n"
+                "Event delta since your last turn (claim/target IDs only — read claims.json "
+                "and frontier.json for details):\n"
+                f"{json.dumps(delta_summary, indent=2)}\n\n"
+                "Pending user directives:\n"
+                f"{json.dumps(pending_directives, indent=2)}\n"
+            )
+
         if nudge and not summary_only:
             prompt = f"{nudge}\n\n{prompt}"
         if post_chat and not summary_only:
