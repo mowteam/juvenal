@@ -272,6 +272,8 @@ juvenal run juvenal/workflows/bug-bounty.yaml -D REPO=curl/curl -D BOUNTY_SCOPE=
 
 The captain runs as a background `claude --resume <uuid>` session and the dashboard prints its turn-by-turn `message_to_user`, worker / verifier / claim events, and acknowledged directives to stdout as they happen. Type directives any moment — the dashboard does not redraw, so your typed line stays put while events scroll past.
 
+As the captain runs, its stream-json output is forwarded chunk-by-chunk to the dashboard so you can watch its tool calls, file reads, and reasoning happen in real time — same content the captain would emit in a Claude Code TUI, just printed to your stdout.
+
 Each input line is persisted as a directive. Supported commands:
 
 - `/focus TEXT` adds advisory focus for the next captain turn.
@@ -281,6 +283,7 @@ Each input line is persisted as a directive. Supported commands:
 - `/ask TEXT` queues a direct question for the captain to answer on the next turn.
 - `/now` forces the next captain turn even if no event delta has fired (useful right after typing a `/focus` or `/target`).
 - `/show captain` prints the full captain message, mental model, and open questions out-of-band — handy when the panel has scrolled.
+- `/chat` waits for the current captain turn to drain, then hands the terminal directly to the backend's native interactive TUI on the captain's existing session (`claude --resume <id>` or `codex resume <id>`). You chat freely; on exit the dashboard restarts and the next captain turn re-primes the structured protocol.
 - `/summary` asks the captain for a concise status summary on the next turn.
 - `/stop` stops scheduling new work immediately, kills active work, and fails the phase.
 - `/wrap` stops new discovery, drains in-flight work, then asks the captain for one final summary turn before the phase completes.
