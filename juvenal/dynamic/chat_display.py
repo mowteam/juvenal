@@ -9,10 +9,14 @@ removed because it cannot cleanly share the cursor with raw stdin reads.
 
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 from threading import Lock
 from typing import Iterable
+
+# Markdown code-fence line, optionally with a language tag (```text, ```bash).
+_MARKDOWN_FENCE_RE = re.compile(r"^\s*```[\w-]*\s*$")
 
 
 class ChatDashboard:
@@ -27,6 +31,13 @@ class ChatDashboard:
         # structured output is for the runner, not for human eyes. We render
         # one placeholder line per block instead of the full JSON.
         self._suppressing_captain_json = False
+        # Markdown fences often wrap CAPTAIN_JSON_BEGIN..END. Hold a fence
+        # opener line in suspense until we know whether it's wrapping the
+        # JSON (drop it) or wrapping something else (flush it).
+        self._pending_fence_line: str | None = None
+        # When CAPTAIN_JSON_END has just been seen, drop the next fence line
+        # (the fence closer that wrapped the JSON).
+        self._expect_fence_close: bool = False
         # Claude Code's stream-json emits `assistant` events with cumulative
         # content (each new event contains the entire response so far, not
         # just the new delta). Track the last forwarded chunk so we can print
@@ -75,6 +86,8 @@ class ChatDashboard:
             self._captain_turn_index = turn_index
             self._last_streamed_chunk = ""
             self._suppressing_captain_json = False
+            self._pending_fence_line = None
+            self._expect_fence_close = False
         print(f"\n[captain turn {turn_index} ✓]", flush=True)
 
     def render_event(self, *, kind: str, text: str, ts: float | None = None) -> None:
@@ -116,14 +129,39 @@ class ChatDashboard:
 
         for line in new_text.splitlines():
             if "CAPTAIN_JSON_BEGIN" in line:
+                # The fence opener (if any) was just wrapping the JSON — drop it.
+                self._pending_fence_line = None
                 self._suppressing_captain_json = True
                 print("  [captain → emitting CAPTAIN_JSON …]", flush=True)
                 continue
             if "CAPTAIN_JSON_END" in line:
                 self._suppressing_captain_json = False
+                self._expect_fence_close = True
                 continue
             if self._suppressing_captain_json:
                 continue
+            if _MARKDOWN_FENCE_RE.match(line):
+                if self._expect_fence_close:
+                    # The fence closer wrapped the JSON — drop it.
+                    self._expect_fence_close = False
+                    continue
+                # Could be a fence opener wrapping JSON (which we'd drop) or
+                # wrapping something else (which we'd flush). Hold it until
+                # the next non-blank line tells us which.
+                if self._pending_fence_line is not None:
+                    print(f"  {self._pending_fence_line}", flush=True)
+                self._pending_fence_line = line
+                continue
+            # Non-fence, non-marker content. Blank lines don't decide whether
+            # the pending fence wraps JSON — they can sit between the fence
+            # and CAPTAIN_JSON_BEGIN. Only a non-blank line forces us to
+            # commit (flush the pending fence as real content).
+            if line.strip():
+                if self._pending_fence_line is not None:
+                    print(f"  {self._pending_fence_line}", flush=True)
+                    self._pending_fence_line = None
+                if self._expect_fence_close:
+                    self._expect_fence_close = False
             print(f"  {line}", flush=True)
 
     def render_frontier(self, counts: dict[str, int], active_targets: Iterable[tuple[str, str]]) -> None:

@@ -97,6 +97,71 @@ def test_render_captain_chunk_suppresses_captain_json_block(capsys):
     assert "Trailing text after the block." in captured
 
 
+def test_render_captain_chunk_suppresses_fences_around_captain_json(capsys):
+    """Captain often wraps CAPTAIN_JSON in a markdown code fence (```text …
+    ```). The fences must be dropped along with the JSON content so the
+    placeholder isn't surrounded by orphaned ``` lines on screen."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()
+    dashboard.render_captain_chunk(
+        "Some prose before the JSON.\n"
+        "\n"
+        "```text\n"
+        "CAPTAIN_JSON_BEGIN\n"
+        '{"termination_state": "continue"}\n'
+        "CAPTAIN_JSON_END\n"
+        "```\n"
+        "Some prose after the JSON."
+    )
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert "Some prose before the JSON." in captured
+    assert "Some prose after the JSON." in captured
+    assert "[captain → emitting CAPTAIN_JSON …]" in captured
+    # The fences themselves must NOT appear on screen.
+    assert "```text" not in captured
+    # Plain ``` would also be ugly; check that at least no isolated ``` line
+    # shows up (lines starting with whitespace + ``` only).
+    for line in captured.splitlines():
+        assert line.strip() != "```"
+
+
+def test_render_captain_chunk_keeps_fences_for_non_json_blocks(capsys):
+    """Markdown fences that wrap NON-JSON content (e.g. captain showing a
+    bash command) must be preserved — only fences directly wrapping CAPTAIN_JSON
+    get dropped."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()
+    dashboard.render_captain_chunk(
+        "Here's the build command:\n```bash\ngcc -fsanitize=address foo.c\n```\nRun it and check for crashes."
+    )
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert "```bash" in captured
+    assert "gcc -fsanitize=address foo.c" in captured
+    # And the closing fence too.
+    assert any(line.strip() == "```" for line in captured.splitlines())
+
+
+def test_render_captain_chunk_suppresses_fence_split_across_chunks(capsys):
+    """The fence opener may arrive in one chunk and CAPTAIN_JSON_BEGIN in
+    the next. The held fence must be dropped retroactively."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()
+    dashboard.render_captain_chunk("Some prose.\n```text")
+    dashboard.render_captain_chunk("Some prose.\n```text\nCAPTAIN_JSON_BEGIN\n{}\nCAPTAIN_JSON_END\n```")
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert "Some prose." in captured
+    assert "[captain → emitting CAPTAIN_JSON …]" in captured
+    assert "```text" not in captured
+    for line in captured.splitlines():
+        assert line.strip() != "```"
+
+
 def test_render_captain_chunk_dedupes_cumulative_chunks(capsys):
     """Claude Code stream-json sends cumulative assistant events: each new
     event has the entire response so far. We must print only the suffix on
