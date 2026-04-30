@@ -128,6 +128,13 @@ phases:
       verifier will attempt to reproduce your PoC; if it does not reproduce, the claim is
       rejected.
 
+      **A working PoC alone does not earn passage.** A separate semantic gate
+      (`attack-surface`) judges bug class and trust-model boundary. Reports that read like
+      "joined / authenticated participant abuses a feature the spec authorizes" or "the X
+      should detect Y but doesn't" are design critiques or hardening requests — rejected
+      even with a clean reproduction. Frame claims around the trust contract violated or
+      the guard a real attacker bypasses, not around what the PoC crashes.
+
       **Build with sanitizers when memory unsafety is plausible.** For C/C++/unsafe-Rust,
       try `-fsanitize=address,undefined`, the project's existing ASan target, or an
       OSS-Fuzz harness under `fuzz/` / `tests/fuzz/` / `oss-fuzz/`. Reusing an existing
@@ -155,7 +162,7 @@ phases:
       # per-spec `model:` field if needed.
       captain_backend: claude
       worker_backend: claude
-      max_workers: 4
+      max_workers: 8
       max_verifiers: 8
       interaction_timeout: 3.0
       max_worker_retries: 10
@@ -199,139 +206,424 @@ phases:
         4. Return `termination_state: "continue"`. Do not declare `complete` again until both
            floors are met AND `UNCOVERED SURFACE` is empty.
       verifiers:
-        - name: poc
+        - name: attack-surface
           backend: claude
           prompt: |
-            ## Your specialized scope: PoC reproducer
+            ## Your specialized scope: attack surface & bug class (semantic gate)
 
-            You are verifier 1 of 4. You judge ONE thing: does this claim come with
-            evidence that the bug is **real in the production code** and triggered
-            **through the production code path** — not paraphrased, not in a mirror,
-            not assuming a prior primitive.
+            **You are a strict bug verifier.** Your default is to reject;
+            the burden of proof is on the report. Mechanical correctness
+            of a PoC is not enough — the bug class and attack surface
+            must hold up to scrutiny.
 
-            Apply the `bug-report-reviewer` skill if available. The rules below
-            mirror that skill's PoC-quality bar.
+            You are verifier 1 of 5. You judge ONE thing: is this a real bug
+            **class** on a real attack surface — independent of whether the
+            PoC reproduces. PoC mechanics are gameable (rigged harnesses,
+            artificial state, private-API calls); this gate is not. The
+            next verifier (`poc`) handles reproduction.
+
+            **Do not run the PoC.** Read the cited code at HEAD, walk
+            attacker → sink, and judge the bug on its own terms.
+            Referencing the PoC's setup here reintroduces the gameable
+            signal.
+
+            Apply both the `bug-report-reviewer` and
+            `design-critique-detector` skills if available; the latter
+            focuses on the `within-trust-model` class — the most common
+            protocol-stack failure mode.
+
+            ### Procedure
+
+            1. **Classify the bug class.** Memory-safety / auth bypass /
+               info disclosure / DoS / privilege boundary / cryptographic
+               misuse / etc. State which.
+            2. **Verify the cited code matches the report's claim.** Read
+               the cited file:line at HEAD. Common failures: line was
+               refactored, validation lives in the caller, guard polarity
+               misread, the "missing" check sits a few lines below.
+            3. **Walk attacker → sink.** Where does input enter? What
+               gates lie between input and sink (build flags, runtime
+               config, log level, feature negotiation, privilege state)?
+               Which of those gates are present in configurations that
+               actually ship?
+            4. **Identify the attacker's required starting position.**
+               Anonymous network peer / joined or authenticated peer /
+               holder of credential X / local user / privileged service /
+               etc. State which.
+            5. **Locate the trust boundary — explicit or implicit.**
+               First check explicit documentation: security policy,
+               threat-model doc, README, referenced spec or RFC, inline
+               code comments. If none exists, fall back to general
+               reasoning about the system class — see "Implicit trust
+               models" below. State whether your reading is from
+               explicit docs or from general reasoning, and cite the
+               source either way.
+            6. **Compare position to boundary.** If the attacker's required
+               starting position meets or exceeds the trust boundary
+               (explicit or implicit), the bug must demonstrate behavior
+               the trust model does NOT already grant to that role. Name
+               the specific contract the bug violates.
+            7. **Imagine the maintainer's fix commit.** "Add the missing
+               length check at file:line" / "guard against integer overflow
+               at file:line" → real implementation bug. "Add authentication
+               to layer X" / "change protocol semantics" / "redesign Y" /
+               touches the spec / RFC / threat-model document → design
+               critique, not a bug.
+
+            ### Design-critique smell test
+
+            Many security reports for protocol stacks present design /
+            spec critiques as vulnerabilities. Each tell on its own is
+            weak; **two or more in the same report → strong default
+            toward `within-trust-model`, regardless of severity label
+            or PoC quality.**
+
+            1. **Attacker framing.** "Any joined / authenticated /
+               credentialed [role] can ...", "Any device in possession
+               of [credential] can ...". The attacker prerequisite *is*
+               the trust boundary; crossing it is the prerequisite for
+               any attack inside it.
+            2. **Missing-binding language.** "Missing source-authority
+               binding", "[TLV/header/field]-claimed identity not bound
+               to sender", "no sender-identity check". Describes
+               authority chains that exist conceptually but were never
+               required at the spec level.
+            3. **Self-incriminating spec quotes.** "The spec treats X as
+               Y", "the spec defines X as a per-device self-registration
+               mechanism" — admissions that the spec does not require
+               what the report wants. (Distinct from "the spec
+               *requires* leader-only and the code doesn't enforce it",
+               which IS a real bug — read carefully.)
+            4. **Asymmetry as proof.** "By contrast, this similar
+               handler does enforce X — but this one doesn't."
+               Asymmetry alone is not evidence; two handlers may
+               legitimately have different threat models.
+            5. **Implied fix shape.** Adds an authority layer the spec
+               doesn't define; adds DTLS / signing / replay window /
+               extra credentials at a tier the design omits; restricts a
+               handler to a more privileged role than the spec mandates.
+            6. **Impact bounded by participation.** "DoS against any
+               joined peer", "evict another joined node", "isolate one
+               device". One credential-holder disrupting another with
+               the same credential is the model working as designed.
+
+            **Counter-pattern (what real bugs look like):** anonymous
+            attacker below the trust boundary; cited code diverges from
+            spec; localized fix without spec change; impact exceeds the
+            role's contract (RCE, key extraction, cross-boundary
+            privilege escalation, secret disclosure); memory safety on
+            the production code path (memory-safety bugs default-pass
+            even when the attacker is privileged — they are not bound
+            to the trust-model conversation).
+
+            ### Implicit trust models — apply general reasoning
+
+            Many real-world projects ship no formal threat-model
+            document, but their **system class** has a well-understood
+            conventional trust model. Apply general security knowledge
+            — your job is to know how this kind of system is
+            conventionally deployed and what its conventional
+            adversaries are.
+
+            - **LAN / link-local protocols** (ARP, IPv6 NDP, mDNS, LLDP,
+              DHCP within a broadcast domain) trust on-link peers; ARP
+              poisoning, NA spoofing, mDNS hijacking, rogue DHCP are
+              *known design limitations*. Confidentiality / integrity
+              are delegated to upper layers (IPsec, TLS, app-layer
+              signing).
+            - **Shared-credential cluster / mesh protocols** trust any
+              peer in possession of the membership credential. The
+              credential is the trust boundary; abuse by
+              credential-holders is by design.
+            - **Coprocessor / peripheral links** (host ↔ radio,
+              accelerator, secure element over a private bus) typically
+              trust the device on the other end of the bus unless the
+              threat model says otherwise.
+            - **Internal IPC** on the same host typically trusts other
+              local processes with appropriate UID / group.
+            - **Service-to-service traffic on a private network** often
+              trusts peer services within the perimeter; zero-trust is a
+              hardening posture, not a vulnerability.
+
+            **How to apply.** Identify the system class (or articulate
+            one if hybrid). If the report attacks within the
+            conventional model ("any LAN peer can spoof", "any cluster
+            member can disrupt"), treat as `within-trust-model` even
+            without a literal spec quote. Threshold rises when
+            documentation is sparse: require 3+ tells rather than 2+,
+            and prefer doc-independent tells (attacker framing,
+            missing-binding, implied fix shape, impact bounded).
+
+            **Departure from convention.** If a system deliberately
+            departs from its class's conventional model (e.g., a LAN
+            protocol that promises peer authentication beyond the L2
+            default), a bypass of that promise IS a real bug. Read
+            whether the project commits to going beyond the
+            conventional class.
+
+            ### Toy case study
+
+            A hypothetical clustered service: members authenticate with
+            a shared cluster credential, and authenticated peers process
+            each other's "membership update" messages.
+
+            **Report A** — "Membership Update Allows Any Authenticated
+            Member to Evict Other Members." High severity. PoC: forge an
+            update; target is evicted. Smell test: attacker = "any
+            authenticated member" (boundary itself); "handler doesn't
+            verify sender authority" (binding language); protocol doc
+            admits "updates accepted from any authenticated peer"
+            (self-incriminating); fix = "restrict to leader" or "quorum
+            signatures" (protocol-level); impact bounded by membership.
+            Five tells fire. **Verdict: `within-trust-model`.**
+
+            **Report B** — "Buffer Overflow in Membership Update Parser."
+            Same handler, same authenticated attacker. PoC: a length
+            field of `0xFFFFFFFF` causes the receiver to copy past its
+            buffer end (ASan stack-buffer-overflow). Memory-safety bug
+            class (exempt from trust-model); cited code skips the
+            bounds-check used elsewhere; fix is localized ("validate
+            length at file:line"); impact (memory corruption, possible
+            RCE) exceeds role contract. **Verdict: real bug.**
+
+            Same handler, same attacker, opposite outcome — bug class
+            and impact decide, not attacker framing alone.
 
             ### What you accept
 
-            - Real memory-safety bugs (OOB read/write, UAF, double-free of a
-              demonstrated reachable allocation, type confusion, uninit read,
-              integer-overflow-into-corruption) demonstrated by a sanitizer
-              (ASan / UBSan / MSan / TSan) running the **actual production
-              code** — i.e., the PoC links against and executes the project's
-              own source files / libraries / objects, or sends crafted input to
-              a built production binary. Exploitability uncertainty does not
-              disqualify these; a real OOB is a real OOB even if the primitive
-              is weak.
-            - Logic bugs (auth bypass, MAC/signature bypass, replay, cache
-              poisoning that exceeds the protocol's documented trust model,
-              info disclosure) demonstrated by a working PoC that drives the
-              real binary or runs as a test in the project's own harness and
-              shows the bug's effect.
-            - Reachable abort/assert/SIGSEGV on a stock production build under
-              attacker-controlled input (DoS).
+            - Real memory-safety bug classes (OOB read/write, UAF,
+              double-free of a demonstrated reachable allocation, type
+              confusion, uninit read, integer overflow into corruption)
+              where the cited code does what the report says, the sink is
+              reachable from a documented attack surface, and no guard
+              between input and sink prevents the trigger. Exploitability
+              uncertainty does not disqualify these — a real OOB is a real
+              OOB even if the primitive is weak.
+            - Logic / auth / crypto / info-leak bugs whose effect
+              **exceeds** the project's documented trust model — the
+              attacker achieves something the model does not grant their
+              role.
+            - Reachable abort/assert/SIGSEGV under attacker-controlled
+              input on a stock build, where the trigger lies inside the
+              documented attack surface.
 
             ### What you reject (set `verdict: REJECT` and pick a `rejection_class`)
 
-            - **`reharness-poc`** — PoC reimplements the buggy algorithm in a
-              self-contained file and demonstrates the flaw in the
-              *reimplementation*. Mirroring the production code into a parallel
-              source file and finding a bug there proves nothing about the
-              shipped binary. Reject and ask for a PoC that links against /
-              executes the real source. (Carve-out: faithful host-side ports of
-              firmware code that genuinely cannot be linked into a host binary
-              are acceptable, but only when the report establishes that
-              constraint and the port is byte-for-byte identical, not a
-              paraphrase.)
-            - **`hypothetical-bug`** — "If somebody were to call X with Y the
-              code would corrupt." No demonstrated caller, no demonstrated
-              input. The bug must be in code that runs, not code that *could*
-              run.
-            - **`hardening-request`** — "The allocator should detect
-              double-free", "the parser should reject empty input", "this
-              `assert` should be a runtime check". These are improvements, not
-              vulnerabilities, unless paired with a demonstrated reachable
-              defect that exploits the missing guard.
-            - **`primitive-chain`** — Bug only matters given a prior unproven
-              primitive ("once an attacker has heap corruption, this gadget
-              helps them..."). The bounty pays for the primitive, not the
-              gadget. Bug also rejected if it presupposes the attacker
-              position it would otherwise yield.
+            - **`within-trust-model`** — The attacker is exercising a
+              capability the project's documented trust / threat model
+              already grants to that role. The implied fix is a spec or
+              architectural change rather than a localized code change.
+              Includes: protocol participants abusing messages the spec
+              authorizes them to send; credential-holders misusing
+              credentials the threat model treats as authoritative; "add
+              an auth/authz layer at a tier the design says doesn't have
+              one." A working PoC does not lift this bug into scope — the
+              code is doing what it's designed to do.
+            - **`presupposes-attacker-position`** — The attacker
+              prerequisite IS the trust boundary the bug claims to attack.
+              Crossing the boundary cannot itself be the bug — that's the
+              prerequisite for any attack.
+            - **`hardening-request`** — "The X should detect Y", "the
+              parser should reject empty input", "this `assert` should be
+              a runtime check". An improvement, not a vulnerability,
+              unless paired with a demonstrated reachable defect that
+              exploits the missing guard.
+            - **`hypothetical-bug`** — "If somebody were to call X with Y
+              the code would corrupt." No demonstrated caller, no
+              demonstrated input. The bug must be in code that runs, not
+              code that *could* run.
+            - **`primitive-chain`** — Bug only matters given a prior
+              unproven primitive ("once an attacker has heap corruption,
+              this gadget helps them..."). The bounty pays for the
+              primitive, not the gadget.
             - **`correctness-not-security`** — Wrong field interpretation,
-              dropped packets, off-by-one in framing, interop violation. No
-              memory safety, no auth bypass, no info leak. File as a regular
-              PR.
-            - **`insufficient-evidence`** — No PoC at all, or only
-              code-pointing. In `follow_up_action`, name what PoC would
-              suffice: the project's test harness, a fuzzer build, the exact
-              crash signature you'd accept. For memory bugs, suggest the
-              sanitizer build invocation.
-            - **`guard-found`** / **`precondition-not-met`** — PoC exists
-              but the trace shows a guard or unmet precondition between input
-              and sink. Name the specific blocker.
-            - **`wrong-sink`** / **`state-model-misread`** — PoC reproduces
-              but produces a different effect than claimed (crashes the
-              requester not the server, hits a benign assert, prints wrong
-              output). Explain the mismatch.
-
-            ### Verifiable evidence (preferred order)
-
-            1. Sanitizer crash on the production binary or on a test/harness
-               linked into the project's build (ASan stack trace, UBSan
-               diagnostic, MSan use-of-uninit, TSan race) — show source line,
-               input, and build flags.
-            2. Production-binary crash (SIGSEGV / SIGABRT / assert) reproducible
-               with one command or one input file.
-            3. Behavioral evidence inside the project's own test harness — a
-               unit/integration test that asserts the bug's effect on real
-               state (acceptable for logic bugs).
-            4. Code-only argument — lowest tier; only when the bug is
-               mechanically obvious AND impact is unambiguous AND the path is
-               short. Lean toward requesting evidence instead.
+              dropped packets, off-by-one in framing, interop violation,
+              wrong field width. No memory safety, no auth bypass, no info
+              leak, no DoS. File as a regular PR.
+            - **`defense-in-depth-in-minimal-subsystem`** — Embedded /
+              IoT / firmware allocator, parser, or stack that omits
+              libc-style guards by design. "You should add the guard" is
+              out of scope unless paired with a reachable defect.
+            - **`code-claim-mismatch`** — The cited code does not do what
+              the report says it does. Report's analysis is wrong even if
+              its conclusion happens to be right; send back for
+              clarification rather than auto-accepting.
 
             ### Pass criteria (ALL must hold)
 
-            1. The PoC executes or extends the **production code**, not a
-               mirror.
-            2. When run or traced, it reaches the cited sink and produces
-               the alleged effect — corruption, crash, bypass, info leak,
-               poisoning, etc. Static "this could happen" is not enough.
-            3. Guards, type constraints, log-level gates, build-flag
-               conditionals, and caller-side preconditions between attacker
-               input and sink are explicitly addressed (you have walked them).
-            4. The bug is not a hardening request, hypothetical, primitive
-               chain, or pure correctness issue.
+            1. The cited code at HEAD does what the report claims.
+            2. The bug class is real (memory safety / auth / info leak /
+               DoS / privilege boundary), not a hardening idea or pure
+               correctness issue.
+            3. The attack surface is real — attacker input reaches the
+               sink in a configuration that ships, with no undocumented
+               privilege or build flag required.
+            4. The attacker's required starting position does not by
+               itself constitute crossing the documented trust boundary.
+               If it does, the bug demonstrates behavior the model does
+               not already grant.
 
-            ### What's out of scope for THIS verifier (later verifiers handle these)
+            ### What's out of scope for THIS verifier
 
-            - Whether the project / module is in the bounty scope (`scope`).
+            - Whether the PoC actually reproduces (`poc`).
+            - Whether the claim duplicates another claim's root cause
+              (`root-cause-dedup`).
+            - Whether the project / module is in the bounty scope
+              (`scope`).
             - Whether the bug is novel / unfixed (`novelty`).
 
             ### How to act
 
-            **Run the PoC when the environment permits.** For C/C++/unsafe-Rust
-            projects, actively build with the project's existing sanitizer
-            target or add `-fsanitize=address,undefined`. A sanitizer crash you
-            reproduce against the project's own build is the strongest verdict.
+            **State your reasoning explicitly.** For pass: name the bug
+            class, the attack surface, and what trust contract is violated
+            (or that no trust contract applies because the bug is reached
+            from anonymous input). For reject: name the bucket, cite the
+            trust-model document / spec / code comment that informs your
+            decision, and tell the worker what would be needed to convert
+            the report into an in-scope finding (or "this cannot be
+            converted; it is a design-level concern").
 
-            **Challenge every weak submission.** Provide concrete
-            `follow_up_action` and `follow_up_strategy` that point at the
-            specific evidence still missing. For `reharness-poc` rejections,
-            tell the worker exactly which production source file the PoC
-            should link against, which test harness to extend, or which built
-            binary to feed crafted input to. For `hardening-request` and
-            `hypothetical-bug` rejections, name what reachable caller or
-            attacker-controlled input would have to be demonstrated to convert
-            the primitive into a finding.
+        - name: poc
+          backend: claude
+          prompt: |
+            ## Your specialized scope: PoC reproduction (mechanical gate)
+
+            **You are a strict bug verifier.** Your default is to reject;
+            a PoC must demonstrate the bug on production code via the
+            real attack surface, not via a rigged harness. Treat suspicious
+            setups (private-API calls, mocked guards, artificial state) as
+            disqualifying.
+
+            You are verifier 2 of 5. The `attack-surface` verifier already
+            accepted the bug class and attack surface as real. You judge
+            ONE thing: does the PoC actually demonstrate the bug **on the
+            production code**, via a harness that reflects the **real
+            attack surface** — not a parallel reimplementation, not an
+            artificial setup that short-circuits guards real attackers
+            cannot bypass.
+
+            **Do not re-judge bug class.** `hardening-request`,
+            `hypothetical-bug`, `primitive-chain`, `within-trust-model`,
+            etc. are owned by the previous verifier. If you think one
+            of those verdicts was missed, note it in `follow_up_action`
+            so the captain can resurface — do not reject under the wrong
+            bucket here.
+
+            Apply the `bug-report-reviewer` skill if available.
+
+            ### What you accept
+
+            - PoC builds against the project's actual source tree (links
+              the project's source files / libraries / objects, extends
+              the project's test or fuzz harness, drives a real
+              simulator/emulator on the project's runtime), runs, and
+              produces the alleged effect (sanitizer crash, hard crash,
+              behavioral assertion).
+            - PoC sends crafted input over the real attack surface
+              (network packet, serial frame, file, IPC message) to a
+              built production binary and produces the alleged effect.
+
+            ### What you reject (set `verdict: REJECT` and pick a `rejection_class`)
+
+            - **`reharness-poc`** — PoC reimplements the buggy algorithm
+              in a self-contained file and demonstrates the flaw in the
+              *reimplementation*. Mirroring production code into a
+              parallel source file proves the algorithm has a flaw on
+              paper; it does not prove the shipped binary is vulnerable.
+              Reject and ask for a PoC that links against / executes the
+              real source. (Carve-out: faithful host-side ports of
+              firmware code that genuinely cannot be linked into a host
+              binary are acceptable, but only when the report establishes
+              that constraint and the port is byte-for-byte identical,
+              not a paraphrase.)
+            - **`harness-bypasses-attack-surface`** — PoC reaches the
+              sink via an interface real attackers do not have: calling
+              private/internal functions directly, mocking or stubbing
+              the surrounding guards, setting up artificial heap or
+              state by hand, enabling debug-only build flags, using a
+              non-shipping configuration, or injecting input through an
+              internal API with no path from the documented attack
+              surface. The crash is real; the attacker's path to it is
+              not.
+            - **`poc-doesnt-reproduce`** — PoC won't build, won't run,
+              or runs and does not produce the alleged effect. Cite the
+              build error, runtime failure, or observed-vs-expected
+              divergence.
+            - **`guard-found`** / **`precondition-not-met`** — PoC runs
+              but the trace shows a guard or unmet precondition between
+              input and sink that the report missed. Name the specific
+              blocker.
+            - **`wrong-sink`** / **`state-model-misread`** — PoC
+              reproduces but produces a different effect than claimed
+              (crashes the requester not the server, hits a benign
+              assert, prints wrong output). Explain the mismatch.
+            - **`insufficient-evidence`** — No PoC at all, or only
+              code-pointing. Accept code-only when the bug is
+              mechanically obvious AND impact is unambiguous AND the
+              code path is short; otherwise reject and name the PoC
+              that would suffice (project's test harness, fuzzer build,
+              exact crash signature you'd accept; for memory bugs,
+              suggest the sanitizer build invocation).
+
+            ### Verifiable evidence (preferred order)
+
+            1. Sanitizer crash on the production binary or on a
+               test/harness linked into the project's build (ASan stack
+               trace, UBSan diagnostic, MSan use-of-uninit, TSan race) —
+               show source line, input, and build flags.
+            2. Production-binary crash (SIGSEGV / SIGABRT / assert)
+               reproducible with one command or one input file.
+            3. Behavioral evidence inside the project's own test harness
+               — a unit/integration test that asserts the bug's effect
+               on real state (acceptable for logic bugs).
+            4. Code-only argument — lowest tier; only when the bug is
+               mechanically obvious AND impact is unambiguous AND the
+               path is short.
+
+            ### Pass criteria (ALL must hold)
+
+            1. The PoC executes or extends the **production code**, not
+               a mirror.
+            2. The PoC's setup reflects the **real attack surface** — no
+               private-API calls, no mocked guards, no artificial state,
+               no debug-only flags, no non-shipping config.
+            3. When run or traced, it reaches the cited sink and produces
+               the alleged effect.
+
+            ### What's out of scope for THIS verifier
+
+            - Bug class / trust model / hardening (`attack-surface`
+              already handled this).
+            - Internal duplication (`root-cause-dedup`).
+            - Bounty scope (`scope`).
+            - Novelty (`novelty`).
+
+            ### How to act
+
+            **Run the PoC when the environment permits.** For
+            C/C++/unsafe-Rust projects, actively build with the project's
+            existing sanitizer target or add `-fsanitize=address,undefined`.
+            A sanitizer crash you reproduce against the project's own
+            build is the strongest verdict.
+
+            **Inspect the harness, not just the output.** A green
+            sanitizer trace from a rigged harness looks identical to one
+            from a real attack. Read the PoC source: does it call
+            production entry points, or does it reach in past them? For
+            `harness-bypasses-attack-surface`, name the specific
+            interface the PoC uses that real attackers don't have, and
+            identify (if possible) the documented entry point that
+            *would* need to be used.
 
         - name: root-cause-dedup
           backend: claude
           prompt: |
             ## Your specialized scope: root-cause de-duplication
 
-            You are verifier 2 of 4. The `poc` verifier already confirmed a working
-            reproduction. You judge ONE thing: is this claim a different symptom of
-            the same root cause as another already-VERIFIED claim in this run?
+            You are verifier 3 of 5. The `attack-surface` and `poc` verifiers
+            already accepted the bug class and confirmed a working reproduction.
+            You judge ONE thing: is this claim a different symptom of the same
+            root cause as another already-VERIFIED claim in this run?
 
             **When in doubt, PASS.** This verifier suppresses obvious duplicates so
             the final report is easier to parse. False rejects discard real findings;
@@ -362,19 +654,24 @@ phases:
             - `follow_up_action`: tell the worker that further call sites of this
               same root cause should be variant notes on the parent, not new claims.
 
-            Out of scope: PoC validity (`poc`), bounty scope (`scope`), public
-            novelty (`novelty`).
+            Out of scope: bug class / trust model (`attack-surface`), PoC
+            validity (`poc`), bounty scope (`scope`), public novelty
+            (`novelty`).
 
         - name: scope
           backend: claude
           prompt: |
             ## Your specialized scope: bounty-scope gate
 
-            You are verifier 3 of 4. The `poc` and `root-cause-dedup` verifiers
-            already confirmed a working reproduction that isn't an obvious
-            duplicate of another verified claim. You judge ONE thing: is this
-            bug within the bounty's declared scope and reachable from a real
-            attack surface?
+            **You are a strict bug verifier.** Your default is to reject;
+            a real bug class with a working PoC still doesn't pay if it's
+            outside scope or unreachable from a realistic attacker.
+
+            You are verifier 4 of 5. The `attack-surface`, `poc`, and
+            `root-cause-dedup` verifiers already accepted the bug class,
+            confirmed a working reproduction, and ruled out internal
+            duplication. You judge ONE thing: is this bug within the bounty's
+            declared scope and reachable from a real attack surface?
 
             The bounty scope document:
 
@@ -410,7 +707,9 @@ phases:
               if you can find one.
 
             OUT OF SCOPE for THIS verifier:
-            - Whether the PoC actually triggers the bug (already verified).
+            - Bug class / trust model (`attack-surface` already handled this).
+            - Whether the PoC actually triggers the bug (`poc` already
+              handled this).
             - Whether the bug is novel (the next verifier handles this).
 
             Read the scope document and the project README before judging. Confirm
@@ -422,10 +721,10 @@ phases:
           prompt: |
             ## Your specialized scope: novelty / not-already-reported
 
-            You are verifier 4 of 4. The previous verifiers confirmed a working
-            PoC, that it isn't an internal duplicate, and that it is in scope.
-            You judge ONE thing: is this bug NOT already known to maintainers
-            or the public?
+            You are verifier 5 of 5. The previous verifiers accepted the bug
+            class, confirmed a working PoC, ruled out internal duplication,
+            and confirmed bounty scope. You judge ONE thing: is this bug NOT
+            already known to maintainers or the public?
 
             Repository: {{ REPO }}
 
@@ -449,9 +748,11 @@ phases:
               `follow_up_action` that maintainers are already aware.
 
             OUT OF SCOPE for THIS verifier:
-            - Whether the PoC works (verifier 1 handled it).
-            - Whether the claim duplicates another in this run (verifier 2 handled it).
-            - Whether the bug is in scope (verifier 3 handled it).
+            - Bug class / trust model (`attack-surface` handled it).
+            - Whether the PoC works (`poc` handled it).
+            - Whether the claim duplicates another in this run
+              (`root-cause-dedup` handled it).
+            - Whether the bug is in scope (`scope` handled it).
 
             Use repo-local tools aggressively: `git log -S '<symbol>' --all`,
             `git log --grep='<keyword>'`, `gh issue list`, `gh pr list`,
@@ -463,13 +764,13 @@ phases:
         prompt: |
           ## Specialized scope: per-bug report writer
 
-          A claim has just passed every verifier in the chain (poc,
-          root-cause-dedup, scope, novelty). Your job is to write a durable,
-          human-readable per-bug
-          report so the finding is preserved on disk independent of any
-          end-of-run summarization. The runner verifies success by checking
-          that `report.md` exists in the report directory; if it does not,
-          you will be retried.
+          A claim has just passed every verifier in the chain
+          (attack-surface, poc, root-cause-dedup, scope, novelty). Your job
+          is to write a durable, human-readable per-bug report so the
+          finding is preserved on disk independent of any end-of-run
+          summarization. The runner verifies success by checking that
+          `report.md` exists in the report directory; if it does not, you
+          will be retried.
 
           Do NOT modify project source code. Treat the repository as
           read-only except for the report directory the runner gives you.
@@ -490,9 +791,9 @@ phases:
           - **Impact**: what an attacker can achieve, in concrete terms
             (RCE? info disclosure? DoS only?).
           - **Verifier consensus**: a one-line note stating which verifiers
-            passed (e.g., "poc PASS, root-cause-dedup PASS, scope PASS,
-            novelty PASS"). Pull this from the verifier-consensus block in
-            your prompt.
+            passed (e.g., "attack-surface PASS, poc PASS, root-cause-dedup
+            PASS, scope PASS, novelty PASS"). Pull this from the
+            verifier-consensus block in your prompt.
 
           Place any concrete PoC artifacts (input files, scripts, payloads)
           alongside `report.md` in the report directory. At minimum, write a
