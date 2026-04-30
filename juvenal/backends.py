@@ -288,6 +288,10 @@ class ClaudeBackend(Backend):
         proc = subprocess.Popen(
             cmd,
             cwd=working_dir,
+            # Detach from the parent tty's stdin. Non-interactive agents do not
+            # need stdin, but if they inherit it they race the chat dashboard's
+            # reader for typed keystrokes and silently steal user input.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -445,7 +449,9 @@ class CodexBackend(Backend):
         proc = subprocess.Popen(
             cmd,
             cwd=working_dir,
-            stdin=subprocess.PIPE if stdin_input else None,
+            # Pipe when feeding a prompt; otherwise detach from the parent tty
+            # so the subprocess can't race the chat reader for keystrokes.
+            stdin=subprocess.PIPE if stdin_input else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

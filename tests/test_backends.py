@@ -1,6 +1,8 @@
 """Unit tests for backend helper functions and factory."""
 
+import subprocess
 import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -272,3 +274,49 @@ class TestKillActive:
         assert late_proc.kill_calls == 1
         assert late_proc.wait_calls == 1
         assert backend._active_procs == []
+
+
+def _stub_popen() -> MagicMock:
+    """Build a Popen mock whose process exits cleanly with no events.
+
+    The returned mock has stdout iterable as an empty pipe, stderr readable
+    as empty, and wait() returning 0. Lets us inspect Popen call kwargs
+    without touching real subprocesses."""
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter([])
+    mock_proc.stderr = MagicMock()
+    mock_proc.stderr.read.return_value = ""
+    mock_proc.wait.return_value = 0
+    mock_proc.returncode = 0
+    mock_proc.stdin = MagicMock()
+    return mock_proc
+
+
+class TestSubprocessStdinIsolation:
+    """Non-interactive agents must NOT inherit the parent tty's stdin —
+    otherwise they race the chat dashboard's stdin reader for keystrokes."""
+
+    def test_claude_run_agent_uses_stdin_devnull(self):
+        backend = ClaudeBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent("hi", working_dir="/tmp")
+        kwargs = popen.call_args.kwargs
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+
+    def test_claude_resume_agent_uses_stdin_devnull(self):
+        backend = ClaudeBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.resume_agent(
+                "1d3f0c80-3a0b-4f0c-bfba-5b18e3f9a1e2",
+                "hi",
+                working_dir="/tmp",
+            )
+        kwargs = popen.call_args.kwargs
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+
+    def test_codex_run_agent_pipes_stdin_for_prompt(self):
+        backend = CodexBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent("hi", working_dir="/tmp")
+        kwargs = popen.call_args.kwargs
+        assert kwargs.get("stdin") is subprocess.PIPE
