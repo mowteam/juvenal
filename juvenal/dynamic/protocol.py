@@ -281,7 +281,7 @@ def parse_user_directive(raw_text: str, *, directive_id: str) -> UserDirective:
     if not text:
         raise ValueError("directive text must not be empty")
 
-    kind: Literal["focus", "ignore", "target", "ask", "summary", "stop", "wrap", "note"]
+    kind: Literal["focus", "ignore", "target", "ask", "summary", "stop", "wrap", "note", "now", "show"]
     payload = text
 
     if text.startswith("/"):
@@ -312,6 +312,14 @@ def parse_user_directive(raw_text: str, *, directive_id: str) -> UserDirective:
             kind = "stop"
         elif normalized == "/wrap":
             kind = "wrap"
+        elif normalized == "/now":
+            if payload:
+                raise ValueError("/now does not accept arguments")
+            kind = "now"
+        elif normalized == "/show":
+            if payload != "captain":
+                raise ValueError("/show currently supports only 'captain' (e.g. /show captain)")
+            kind = "show"
         else:
             raise ValueError(f"unsupported directive command: {command}")
     else:

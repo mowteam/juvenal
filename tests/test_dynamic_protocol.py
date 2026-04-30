@@ -333,6 +333,8 @@ class TestScopeValidation:
         ("/summary", "summary", ""),
         ("/stop", "stop", ""),
         ("/wrap", "wrap", ""),
+        ("/now", "now", ""),
+        ("/show captain", "show", "captain"),
         ("look at the TLS handshake parser", "note", "look at the TLS handshake parser"),
     ],
 )
@@ -345,3 +347,18 @@ def test_parse_user_directive_commands(raw_text: str, expected_kind: str, expect
     assert directive.status == "pending"
     assert directive.acknowledged_at is None
     assert directive.created_at > 0
+
+
+def test_parse_now_directive_rejects_arguments():
+    with pytest.raises(ValueError, match="/now does not accept arguments"):
+        parse_user_directive("/now please", directive_id="dir-now")
+
+
+def test_parse_show_directive_rejects_unknown_topic():
+    with pytest.raises(ValueError, match="/show currently supports only 'captain'"):
+        parse_user_directive("/show frontier", directive_id="dir-show")
+
+
+def test_parse_show_directive_rejects_empty_topic():
+    with pytest.raises(ValueError, match="/show currently supports only 'captain'"):
+        parse_user_directive("/show", directive_id="dir-show")
