@@ -357,6 +357,10 @@ class AnalysisConfig:
     max_captain_repairs: int = 2
     allow_repo_tools: bool = True
     max_consecutive_errors: int = 5
+    min_captain_turns: int = 0
+    min_terminal_targets_before_complete: int = 0
+    continue_nudge: str | None = None
+    max_premature_completes: int = 5
     verifiers: list[VerifierSpec] = field(default_factory=list)
     reporter: ReporterSpec | None = None
 
@@ -376,6 +380,10 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_captain_repairs",
     "allow_repo_tools",
     "max_consecutive_errors",
+    "min_captain_turns",
+    "min_terminal_targets_before_complete",
+    "continue_nudge",
+    "max_premature_completes",
     "verifiers",
     "reporter",
 }
@@ -612,6 +620,28 @@ def _parse_analysis_config(
         field_name="max_consecutive_errors",
         minimum=1,
     )
+    min_captain_turns = _parse_analysis_int(
+        raw.get("min_captain_turns", defaults.min_captain_turns),
+        phase_id=phase_id,
+        field_name="min_captain_turns",
+        minimum=0,
+    )
+    min_terminal_targets_before_complete = _parse_analysis_int(
+        raw.get("min_terminal_targets_before_complete", defaults.min_terminal_targets_before_complete),
+        phase_id=phase_id,
+        field_name="min_terminal_targets_before_complete",
+        minimum=0,
+    )
+    max_premature_completes = _parse_analysis_int(
+        raw.get("max_premature_completes", defaults.max_premature_completes),
+        phase_id=phase_id,
+        field_name="max_premature_completes",
+        minimum=1,
+    )
+    raw_nudge = raw.get("continue_nudge", defaults.continue_nudge)
+    if raw_nudge is not None and not isinstance(raw_nudge, str):
+        raise ValueError(f"Phase '{phase_id}': analysis.continue_nudge must be a string when set")
+    continue_nudge = raw_nudge
 
     verifiers: list[VerifierSpec] = []
     if "verifiers" in raw:
@@ -647,6 +677,10 @@ def _parse_analysis_config(
         max_captain_repairs=max_captain_repairs,
         allow_repo_tools=allow_repo_tools,
         max_consecutive_errors=max_consecutive_errors,
+        min_captain_turns=min_captain_turns,
+        min_terminal_targets_before_complete=min_terminal_targets_before_complete,
+        continue_nudge=continue_nudge,
+        max_premature_completes=max_premature_completes,
         verifiers=verifiers,
         reporter=reporter,
     )

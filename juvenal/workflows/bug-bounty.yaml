@@ -60,6 +60,32 @@ phases:
       architecture and attack surface, then decompose it into bounded investigation targets that
       workers can execute independently.
 
+      **Operate at scale.** This workflow is configured for an exhaustive, multi-hour run. You
+      should expect to spawn many dozens to hundreds of targets across the analysis. Run time is
+      not a concern — coverage and depth are. The engine enforces explicit floors on captain
+      turns and terminal targets and will reject premature `complete` declarations until those
+      floors are met.
+
+      **Per-turn fanout (hard expectation).** While `UNCOVERED SURFACE` in your
+      `mental_model_summary` is non-empty, every turn must enqueue at least 8 new targets.
+      Spread them across:
+      - Unexplored subsystems and entry points pulled from `UNCOVERED SURFACE`
+      - Variant-analysis follow-ups for recently verified or rejected claims (see policy below)
+      - Deeper drills into the highest-yield surfaces already in flight
+
+      **Variant-analysis policy (apply every turn that has new evidence):**
+      - **Verified claim** (real bug found): the bug itself is a leaf — do NOT respawn the bug.
+        Treat it as proof the surface is fertile. Spawn targets in the surrounding subsystem:
+        sibling functions, callers and callees, related modules, structurally identical patterns
+        elsewhere ("if pattern X exists here, where else does pattern X exist?").
+      - **Rejected claim** (PoC failed or guard found): the path was wrong, not necessarily the
+        surface. Spawn targets for: alternate paths to the same sink, sibling code that may LACK
+        the verifier-identified guard, or a different vulnerability class on the same surface.
+      - **No-findings target**: do NOT re-investigate the same scope. Only spawn an adjacent
+        fresh-angle target if you have a concrete new reason.
+      - **Blocked target**: do NOT respawn until the blocker is addressed (different build path,
+        static-only approach, alternative tooling).
+
       Prioritize (memory-safety-rich surfaces first when the codebase is in a memory-unsafe language):
       1. Parsers/decoders/deserializers of untrusted input written in C/C++/unsafe-Rust — these are
          the highest-yield targets for ASan-crashing memory bugs (binary protocols, file format
@@ -83,17 +109,23 @@ phases:
 
       #### Coverage expectations
 
-      Before declaring the analysis complete, you must have:
-      1. Enumerated ALL externally reachable entry points (network handlers, CLI parsers,
-         file format parsers, IPC handlers, environment variable consumers, plugin/hook interfaces).
-      2. Investigated at least one bounded target per major subsystem that handles untrusted input.
-      3. Followed every verified finding to at least one layer of adjacent attack surface
-         (sibling functions, callers, callees, shared data structures).
-      4. Explored at least 3 different vulnerability classes from the "What counts" list above.
+      Your `mental_model_summary` MUST track coverage explicitly using the `SUBSYSTEMS`,
+      `ENTRY POINTS`, `UNCOVERED SURFACE`, and `NOTES` sections defined in the captain role
+      prompt. Every turn, update those sections in light of the latest event delta and the
+      variant-analysis policy.
 
-      Do NOT declare termination_state: "complete" until these coverage bars are met.
+      Before declaring `termination_state: "complete"`, you must have:
+      1. Enumerated ALL externally reachable entry points (network handlers, CLI parsers,
+         file format parsers, IPC handlers, environment variable consumers, plugin/hook interfaces)
+         in `ENTRY POINTS` and reached `covered` or `dry-hole` for each.
+      2. Reached `covered` or `dry-hole` for every entry in `SUBSYSTEMS`.
+      3. Followed every verified finding to adjacent attack surface per the variant-analysis policy.
+      4. Explored at least 3 different vulnerability classes from the "What counts" list above.
+      5. `UNCOVERED SURFACE` is empty (`(none)`).
+
       If you run out of high-priority targets, pivot to medium-priority exploration of
-      unexplored subsystems rather than terminating.
+      unexplored subsystems and add them to your spawn batch — do NOT terminate. The engine
+      will reject premature `complete` declarations until the configured floors are met.
 
       ### Worker guidance — PoCs are mandatory
 
@@ -163,86 +195,272 @@ phases:
       max_worker_retries: 10
       max_captain_repairs: 4
       allow_repo_tools: true
+      # Engine-enforced floors before the captain may declare `complete`.
+      # The captain explores hundreds of targets across many turns; these floors
+      # prevent early termination after the first wave of verified findings.
+      min_captain_turns: 50
+      min_terminal_targets_before_complete: 200
+      # Soft escape: after this many consecutive overridden `complete` declarations,
+      # the engine accepts completion to avoid an infinite nudge loop on dry codebases.
+      max_premature_completes: 5
+      continue_nudge: |
+        ## Continue nudge — bug-bounty floors not yet met
+
+        The engine has REJECTED your `complete` declaration (override #{consecutive} of
+        {max_premature_completes}). Status: {turns} captain turn(s) elapsed; {terminal} target(s)
+        in terminal state. Required floors: >= {min_captain_turns} captain turns AND
+        >= {min_terminal_targets} terminal targets. This is a deep, exhaustive bug-bounty run —
+        run time is not a concern; coverage is.
+
+        Required actions for THIS turn:
+
+        1. Update `mental_model_summary` with structured coverage accounting (SUBSYSTEMS,
+           ENTRY POINTS, UNCOVERED SURFACE, NOTES). UNCOVERED SURFACE must be empty before
+           `complete` is allowed.
+        2. Apply the variant-analysis policy:
+           - Verified claim: spawn targets in the surrounding subsystem (siblings, callers,
+             callees, related modules, structurally identical patterns elsewhere). Do NOT respawn
+             the same bug.
+           - Rejected claim: spawn targets for alternate paths to the same sink, sibling code
+             that may LACK the verifier-identified guard, or a different vulnerability class on
+             the same surface.
+           - No-findings target: do NOT re-investigate; only spawn an adjacent fresh-angle target
+             if you have a concrete new reason.
+           - Blocked target: do NOT respawn until the blocker is addressed.
+        3. Enqueue at least 10 new targets pivoting to UNCOVERED SURFACE or following the
+           variant-analysis rules above. Bias toward memory-safety-rich surfaces (parsers,
+           decoders, allocators in C/C++/unsafe-Rust) for ASan-crashing PoCs.
+        4. Return `termination_state: "continue"`. Do not declare `complete` again until both
+           floors are met AND `UNCOVERED SURFACE` is empty.
       verifiers:
         - name: poc
           backend: claude
           prompt: |
             ## Your specialized scope: PoC reproducer
 
-            You are verifier 1 of 3 in this analysis chain. You judge ONE thing: does
-            this claim come with a proof of concept that actually triggers the
-            alleged bug?
+            You are verifier 1 of 4. You judge ONE thing: does this claim come with
+            evidence that the bug is **real in the production code** and triggered
+            **through the production code path** — not paraphrased, not in a mirror,
+            not assuming a prior primitive.
 
-            **Gold-standard evidence: a sanitizer crash report.** When the alleged bug
-            is memory unsafety (buffer overflow, UAF, double-free, OOB read/write,
-            uninitialized read, type confusion, integer-overflow-into-corruption), the
-            strongest possible PoC is one that produces an AddressSanitizer / UBSan /
-            MSan crash report (or a SIGSEGV/SIGABRT trace from a debugger). If the
-            claim packet contains such output that you can independently reproduce or
-            verify, PASS without further hesitation — sanitizer reports are
-            mechanically verifiable and rarely false-positive.
+            Apply the `bug-report-reviewer` skill if available. The rules below
+            mirror that skill's PoC-quality bar.
 
-            Pass criteria (ALL must hold):
-            1. The claim packet contains a concrete PoC: an input string, a script,
-               a test case, a sequence of commands, or a reproduction recipe.
-            2. The PoC is runnable (you can run it now) or traceable (you can walk
-               it through the code with full confidence end-to-end).
-            3. When run or traced, the PoC reaches the alleged sink/condition AND
-               produces the alleged effect (corruption, crash, incorrect output,
-               injection, bypass, etc.). Static "this could happen" is not enough.
-            4. Any guards, sanitizers, type constraints, or caller-side preconditions
-               on the path from input to sink are addressed by the PoC.
+            ### What you accept
 
-            For memory-safety claims specifically:
-            - If a sanitizer report is included AND you can reproduce it, PASS.
-            - If the claim is a memory bug but no sanitizer/crash output was attempted,
-              try to build the project with `-fsanitize=address,undefined` (or the
-              project's existing ASan target) and re-run the PoC. If you produce a
-              crash, PASS and capture the report. If you cannot build with sanitizers
-              (no toolchain, missing deps), trace the PoC through the code carefully
-              — but prefer requesting a sanitizer reproduction in `follow_up_action`
-              when feasible.
-            - If the worker traced a memory bug but the trace shows the path is
-              guarded or sanitized before the sink, REJECT with `guard-found`.
+            - Real memory-safety bugs (OOB read/write, UAF, double-free of a
+              demonstrated reachable allocation, type confusion, uninit read,
+              integer-overflow-into-corruption) demonstrated by a sanitizer
+              (ASan / UBSan / MSan / TSan) running the **actual production
+              code** — i.e., the PoC links against and executes the project's
+              own source files / libraries / objects, or sends crafted input to
+              a built production binary. Exploitability uncertainty does not
+              disqualify these; a real OOB is a real OOB even if the primitive
+              is weak.
+            - Logic bugs (auth bypass, MAC/signature bypass, replay, cache
+              poisoning that exceeds the protocol's documented trust model,
+              info disclosure) demonstrated by a working PoC that drives the
+              real binary or runs as a test in the project's own harness and
+              shows the bug's effect.
+            - Reachable abort/assert/SIGSEGV on a stock production build under
+              attacker-controlled input (DoS).
 
-            Reject criteria — pick the most accurate `rejection_class`:
-            - No PoC, or only code-pointing without a trigger: `insufficient-evidence`.
-              In `follow_up_action`, tell the worker exactly what kind of PoC would
-              suffice (e.g., "construct a malformed protobuf message X that reaches
-              `Parser::Read()` and triggers heap-buffer-overflow under ASan"). For
-              memory bugs, explicitly suggest a sanitizer-instrumented build.
-            - PoC exists but does not reproduce when run/traced: `precondition-not-met`
-              or `guard-found` depending on what blocks it. Name the specific guard
-              or precondition that defeats the PoC.
-            - PoC reproduces but the observed effect is different from the claim
-              (e.g., crashes the requester, not the server): `wrong-sink` or
-              `state-model-misread`. Explain the mismatch.
+            ### What you reject (set `verdict: REJECT` and pick a `rejection_class`)
 
-            OUT OF SCOPE for THIS verifier (do NOT reject for these — later verifiers handle them):
-            - Whether the bug is in the bounty scope (the `scope` verifier handles this).
-            - Whether the bug has already been reported (the `novelty` verifier handles this).
+            - **`reharness-poc`** — PoC reimplements the buggy algorithm in a
+              self-contained file and demonstrates the flaw in the
+              *reimplementation*. Mirroring the production code into a parallel
+              source file and finding a bug there proves nothing about the
+              shipped binary. Reject and ask for a PoC that links against /
+              executes the real source. (Carve-out: faithful host-side ports of
+              firmware code that genuinely cannot be linked into a host binary
+              are acceptable, but only when the report establishes that
+              constraint and the port is byte-for-byte identical, not a
+              paraphrase.)
+            - **`hypothetical-bug`** — "If somebody were to call X with Y the
+              code would corrupt." No demonstrated caller, no demonstrated
+              input. The bug must be in code that runs, not code that *could*
+              run.
+            - **`hardening-request`** — "The allocator should detect
+              double-free", "the parser should reject empty input", "this
+              `assert` should be a runtime check". These are improvements, not
+              vulnerabilities, unless paired with a demonstrated reachable
+              defect that exploits the missing guard.
+            - **`primitive-chain`** — Bug only matters given a prior unproven
+              primitive ("once an attacker has heap corruption, this gadget
+              helps them..."). The bounty pays for the primitive, not the
+              gadget. Bug also rejected if it presupposes the attacker
+              position it would otherwise yield.
+            - **`correctness-not-security`** — Wrong field interpretation,
+              dropped packets, off-by-one in framing, interop violation. No
+              memory safety, no auth bypass, no info leak. File as a regular
+              PR.
+            - **`insufficient-evidence`** — No PoC at all, or only
+              code-pointing. In `follow_up_action`, name what PoC would
+              suffice: the project's test harness, a fuzzer build, the exact
+              crash signature you'd accept. For memory bugs, suggest the
+              sanitizer build invocation.
+            - **`guard-found`** / **`precondition-not-met`** — PoC exists
+              but the trace shows a guard or unmet precondition between input
+              and sink. Name the specific blocker.
+            - **`wrong-sink`** / **`state-model-misread`** — PoC reproduces
+              but produces a different effect than claimed (crashes the
+              requester not the server, hits a benign assert, prints wrong
+              output). Explain the mismatch.
 
-            Run the PoC if the environment permits. **For C/C++/unsafe-Rust projects,
-            actively try to enable sanitizers when verifying memory-safety claims** —
-            an ASan/UBSan/MSan crash you reproduce yourself is the most defensible
-            PASS verdict. If a build toolchain or dependencies are missing, trace the
-            PoC through the code with the same rigor.
+            ### Verifiable evidence (preferred order)
 
-            **Challenge the worker on every rejection.** Provide concrete
-            `follow_up_action` and `follow_up_strategy` that point at the next thing
-            to try. For rejected memory-safety claims, recommend a specific sanitizer
-            build invocation and the exact crash signature that would constitute proof.
-            Workers operate on bounded context and can miss project-wide invariants —
-            your job is to push them toward stronger evidence.
+            1. Sanitizer crash on the production binary or on a test/harness
+               linked into the project's build (ASan stack trace, UBSan
+               diagnostic, MSan use-of-uninit, TSan race) — show source line,
+               input, and build flags.
+            2. Production-binary crash (SIGSEGV / SIGABRT / assert) reproducible
+               with one command or one input file.
+            3. Behavioral evidence inside the project's own test harness — a
+               unit/integration test that asserts the bug's effect on real
+               state (acceptable for logic bugs).
+            4. Code-only argument — lowest tier; only when the bug is
+               mechanically obvious AND impact is unambiguous AND the path is
+               short. Lean toward requesting evidence instead.
+
+            ### Pass criteria (ALL must hold)
+
+            1. The PoC executes or extends the **production code**, not a
+               mirror.
+            2. When run or traced, it reaches the cited sink and produces
+               the alleged effect — corruption, crash, bypass, info leak,
+               poisoning, etc. Static "this could happen" is not enough.
+            3. Guards, type constraints, log-level gates, build-flag
+               conditionals, and caller-side preconditions between attacker
+               input and sink are explicitly addressed (you have walked them).
+            4. The bug is not a hardening request, hypothetical, primitive
+               chain, or pure correctness issue.
+
+            ### What's out of scope for THIS verifier (later verifiers handle these)
+
+            - Whether the project / module is in the bounty scope (`scope`).
+            - Whether the bug is novel / unfixed (`novelty`).
+
+            ### How to act
+
+            **Run the PoC when the environment permits.** For C/C++/unsafe-Rust
+            projects, actively build with the project's existing sanitizer
+            target or add `-fsanitize=address,undefined`. A sanitizer crash you
+            reproduce against the project's own build is the strongest verdict.
+
+            **Challenge every weak submission.** Provide concrete
+            `follow_up_action` and `follow_up_strategy` that point at the
+            specific evidence still missing. For `reharness-poc` rejections,
+            tell the worker exactly which production source file the PoC
+            should link against, which test harness to extend, or which built
+            binary to feed crafted input to. For `hardening-request` and
+            `hypothetical-bug` rejections, name what reachable caller or
+            attacker-controlled input would have to be demonstrated to convert
+            the primitive into a finding.
+
+        - name: root-cause-dedup
+          backend: claude
+          prompt: |
+            ## Your specialized scope: root-cause de-duplication
+
+            You are verifier 2 of 4. The `poc` verifier already confirmed a working
+            reproduction. You judge ONE thing: is this claim a different *symptom*
+            of the same *root cause* as another already-verified claim in this run?
+
+            **Be lenient. Pass on ambiguity.** This verifier exists to suppress
+            obvious duplicates so the final report is easier to parse — not to
+            argue fine distinctions about whether two related bugs share a fix
+            point. When unsure, PASS and let the reporter handle the writeup.
+
+            ### How to find other verified claims
+
+            The captain state lives in a JSON file at the project root, named
+            `.juvenal-state-<phase-id>-analysis.json` (for this phase, look for
+            `.juvenal-state-hunt-bugs-analysis.json`; if absent, fall back to
+            any `.juvenal-state-*-analysis.json` in the current working
+            directory). Read it (use `jq` if available) and filter
+            `claims[*]` where `status == "verified"`.
+
+            Each claim record carries:
+              - `primary_location` → `path`, `line`, `symbol`
+              - `subcategory` → bug class
+              - `assertion` → the bug statement
+              - `retry_of_claim_id` and `related_claim_ids` → captain-assigned
+                links
+
+            Also check whether the claim under review appears in another
+            verified claim's `related_claim_ids` or `retry_claim_ids` — that's
+            a captain hint that they overlap.
+
+            ### Reject only when ALL of the following hold
+
+            1. **Same root cause.** Either:
+               - Identical `primary_location.path` AND `line` (or within ~5
+                 lines) AND `symbol`, OR
+               - Same `subcategory` AND the assertions describe the same
+                 underlying defect mechanism (not just the same vulnerability
+                 *class* — "two unrelated OOBs" is not a duplicate; "two
+                 crash sites of the same parser-layer guard miss" is), OR
+               - The fix is the same one-line / one-function change at a
+                 shared upstream symbol (e.g., a parser-layer bound check
+                 whose absence is the root cause of N call-site crashes).
+            2. **Same fix retires both.** A single patch at one location
+               would make the current claim's PoC stop reproducing AND make
+               the other verified claim's PoC stop reproducing.
+            3. **Compared against an already-verified claim, not a pending or
+               rejected one.** Only verified parent claims qualify; otherwise
+               two parallel-verified siblings could mutually reject each other.
+
+            Captain hints (`retry_of_claim_id` pointing at a verified claim,
+            or being listed in another verified claim's `retry_claim_ids` /
+            `related_claim_ids`) are strong signals — when they line up with
+            #1 and #2, REJECT confidently.
+
+            If #1 holds but #2 does not (i.e., related but the fixes are
+            distinct), PASS — it's a related-but-distinct finding worth
+            keeping.
+
+            ### Reject criterion
+
+            - `rejection_class: duplicate-root-cause`
+            - `summary`: name the parent verified claim ID and the shared
+              root cause in one sentence
+              (e.g., "duplicate of `target-posix-spinel-parser-g1-claim-c1`
+              — both crash at distinct call sites of the same `spinel.c:617`
+              `>=` parser bug, single one-character fix retires both").
+            - `follow_up_action`: tell the worker the parent claim ID and
+              that any further discovered call sites of this same root cause
+              should be added as variant notes on the parent rather than
+              filed as new claims.
+
+            ### What's out of scope for THIS verifier
+
+            - Whether the PoC works (`poc` handled this).
+            - Whether the bug is in the bounty scope (`scope` handles this).
+            - Whether the bug is already known to maintainers / public
+              (`novelty` handles this — that's an external duplicate check;
+              this verifier is the *internal* duplicate check across the
+              current run).
+
+            ### How to act
+
+            Spend a small budget — one or two reads of the state file, then
+            decide. If you cannot read the state file or cannot find clear
+            evidence of overlap, default to PASS. False rejects on this
+            verifier discard real findings; false passes only produce
+            cosmetically redundant report rows that the reporter can fold
+            together later.
 
         - name: scope
           backend: claude
           prompt: |
             ## Your specialized scope: bounty-scope gate
 
-            You are verifier 2 of 3. The PoC verifier already confirmed a working
-            reproduction. You judge ONE thing: is this bug within the bounty's
-            declared scope and reachable from a real attack surface?
+            You are verifier 3 of 4. The `poc` and `root-cause-dedup` verifiers
+            already confirmed a working reproduction that isn't an obvious
+            duplicate of another verified claim. You judge ONE thing: is this
+            bug within the bounty's declared scope and reachable from a real
+            attack surface?
 
             The bounty scope document:
 
@@ -290,9 +508,10 @@ phases:
           prompt: |
             ## Your specialized scope: novelty / not-already-reported
 
-            You are verifier 3 of 3. The previous verifiers confirmed a working
-            PoC in scope. You judge ONE thing: is this bug NOT already known to
-            maintainers or the public?
+            You are verifier 4 of 4. The previous verifiers confirmed a working
+            PoC, that it isn't an internal duplicate, and that it is in scope.
+            You judge ONE thing: is this bug NOT already known to maintainers
+            or the public?
 
             Repository: {{ REPO }}
 
@@ -329,8 +548,9 @@ phases:
         prompt: |
           ## Specialized scope: per-bug report writer
 
-          A claim has just passed every verifier in the chain (poc, scope,
-          novelty). Your job is to write a durable, human-readable per-bug
+          A claim has just passed every verifier in the chain (poc,
+          root-cause-dedup, scope, novelty). Your job is to write a durable,
+          human-readable per-bug
           report so the finding is preserved on disk independent of any
           end-of-run summarization. The runner verifies success by checking
           that `report.md` exists in the report directory; if it does not,

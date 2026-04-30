@@ -870,3 +870,126 @@ def test_consecutive_errors_backoff_and_retry(tmp_path):
 
     assert result.success is True
     assert state.targets["target-1"].status == "no_findings"
+
+
+def test_premature_complete_is_overridden_until_floor_met(tmp_path):
+    """Captain declares `complete` before min_captain_turns is reached.
+    The engine overrides, prepends a continue nudge to the next captain prompt,
+    and only accepts `complete` after the floor is met.
+    """
+    backend = MockBackend()
+    for _ in range(3):
+        backend.add_role_response(
+            "captain",
+            output=_captain_output(termination_state="complete", termination_reason="No more work."),
+        )
+
+    config = AnalysisConfig(
+        max_workers=1,
+        max_verifiers=1,
+        max_worker_retries=1,
+        min_captain_turns=3,
+        min_terminal_targets_before_complete=0,
+        max_premature_completes=10,
+    )
+    result, state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    assert state.captain.turn_index == 3
+
+    captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    assert len(captain_prompts) == 3
+    assert "Continue nudge" not in captain_prompts[0]
+    assert "Continue nudge" in captain_prompts[1]
+    assert "Continue nudge" in captain_prompts[2]
+    assert "override #1" in captain_prompts[1]
+    assert "override #2" in captain_prompts[2]
+
+
+def test_completion_floors_met_accepts_complete(tmp_path):
+    """When floors are met after the first captain turn, `complete` is accepted."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    config = AnalysisConfig(
+        max_workers=1,
+        max_verifiers=1,
+        max_worker_retries=1,
+        min_captain_turns=1,
+        min_terminal_targets_before_complete=0,
+    )
+    result, state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    assert state.captain.turn_index == 1
+    captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    assert len(captain_prompts) == 1
+    assert "Continue nudge" not in captain_prompts[0]
+
+
+def test_soft_escape_after_max_premature_completes(tmp_path):
+    """After max_premature_completes consecutive overrides, the engine accepts complete.
+    Prevents an infinite nudge loop on dry codebases when floors cannot be met.
+    """
+    backend = MockBackend()
+    for _ in range(3):
+        backend.add_role_response(
+            "captain",
+            output=_captain_output(termination_state="complete", termination_reason="Nothing left."),
+        )
+
+    config = AnalysisConfig(
+        max_workers=1,
+        max_verifiers=1,
+        max_worker_retries=1,
+        min_captain_turns=100,
+        min_terminal_targets_before_complete=0,
+        max_premature_completes=2,
+    )
+    result, state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    assert state.captain.turn_index == 3
+
+    captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    assert len(captain_prompts) == 3
+    assert "Continue nudge" in captain_prompts[1]
+    assert "Continue nudge" in captain_prompts[2]
+
+
+def test_continue_nudge_counter_resets_when_captain_returns_continue(tmp_path):
+    """If the captain pivots to `continue` after a nudge, the premature-complete counter
+    resets — a single dry stretch followed by productive turns should not accelerate the
+    soft escape later in the run.
+    """
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done early."),
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Now actually done."),
+    )
+
+    config = AnalysisConfig(
+        max_workers=1,
+        max_verifiers=1,
+        max_worker_retries=1,
+        min_captain_turns=3,
+        min_terminal_targets_before_complete=0,
+        max_premature_completes=1,
+    )
+    result, state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    assert state.captain.turn_index == 3
+    assert state.targets["target-1"].status == "no_findings"

@@ -47,10 +47,41 @@ _CAPTAIN_EVENT_TYPES = frozenset(
     }
 )
 _NON_TERMINAL_STATUSES = frozenset({"queued", "running", "verifying", "deferred", "requeue_pending"})
+_TERMINAL_TARGET_STATUSES = frozenset({"completed", "no_findings", "blocked", "exhausted"})
 _RUNNING_STATUSES = frozenset({"running", "verifying"})
 _IDLE_SLEEP_SECONDS = 0.05
 _MAX_SINGLE_BACKOFF_SECONDS = 3600  # 1 hour per wait
 _MAX_TOTAL_BACKOFF_SECONDS = 5 * 3600  # 5 hours cumulative across all waits in a run
+
+_DEFAULT_CONTINUE_NUDGE = (
+    "## Continue nudge — engine override\n\n"
+    "The engine has REJECTED your `complete` declaration (override #{consecutive} of "
+    "{max_premature_completes} before the engine accepts the soft escape).\n\n"
+    "Status: {turns} captain turn(s) elapsed; {terminal} target(s) reached terminal state. "
+    "Configured floors: >= {min_captain_turns} captain turns AND >= {min_terminal_targets} "
+    "terminal targets.\n\n"
+    "Required actions for THIS turn:\n"
+    "1. Update `mental_model_summary` with structured coverage accounting:\n"
+    "   - `SUBSYSTEMS:` list each in-scope subsystem with a status tag "
+    "(`untouched` | `active` | `covered` | `dry-hole`) and a one-line note.\n"
+    "   - `ENTRY POINTS:` list each externally reachable entry point with a status tag.\n"
+    "   - `UNCOVERED SURFACE:` enumerate every subsystem, file, or entry point not yet "
+    "investigated. This list MUST be empty before you may declare `complete`.\n"
+    "2. Apply the variant-analysis policy when seeding follow-up targets:\n"
+    "   - Verified claim: spawn targets in the surrounding subsystem (siblings, callers, callees, "
+    "related modules, structurally identical patterns elsewhere). Do NOT respawn the same bug.\n"
+    "   - Rejected claim: spawn targets for alternate paths to the same sink, sibling code that "
+    "may LACK the verifier-identified guard, or a different vulnerability class on the same "
+    "surface. Rejection is negative evidence on a path, not on the surface.\n"
+    "   - No-findings target: do NOT re-investigate; only spawn an adjacent fresh-angle target if "
+    "you have a concrete reason.\n"
+    "   - Blocked target: do NOT respawn until the blocker is addressed (different build path, "
+    "static-only approach, alternative tooling).\n"
+    "3. Enqueue at least 8 new targets pivoting to UNCOVERED SURFACE or following the "
+    "variant-analysis rules above.\n"
+    '4. Return `termination_state: "continue"`. Do not declare `complete` again until both '
+    "floors are met AND `UNCOVERED SURFACE` is empty.\n"
+)
 
 # Per-backend, per-role default model. When the YAML does not specify a model
 # (and no role-level override is set), this picks the right tier so users
@@ -159,6 +190,8 @@ class DynamicAnalysisRunner:
         self._reporter_attempts: dict[str, int] = {}
         self._captain_termination_state: Literal["continue", "complete"] = "continue"
         self._captain_termination_reason = ""
+        self._pending_continue_nudge: str = ""
+        self._consecutive_premature_completes: int = 0
         self._last_captain_snapshot: tuple[Any, ...] | None = None
         self._last_review_snapshot: tuple[Any, ...] | None = None
         self._last_review_event_seq = 0
@@ -435,6 +468,9 @@ class DynamicAnalysisRunner:
         if self.state.control.wrap_requested:
             return self.state.control.wrap_summary_pending and not self._has_active_runtime_work()
 
+        if self._pending_continue_nudge and not self._has_active_runtime_work():
+            return True
+
         current_snapshot = self._captain_snapshot()
         if self.state.captain.turn_index == 0:
             return True
@@ -518,6 +554,8 @@ class DynamicAnalysisRunner:
 
         self._captain_termination_state = turn.termination_state
         self._captain_termination_reason = turn.termination_reason
+        if turn.termination_state == "continue":
+            self._consecutive_premature_completes = 0
         self._last_captain_snapshot = self._captain_snapshot()
 
     def _repair_captain_turn(
@@ -1029,9 +1067,25 @@ class DynamicAnalysisRunner:
 
         frontier = self._frontier_targets()
         if self._captain_termination_state == "complete" and not frontier and not self._has_active_runtime_work():
-            return True, True, ""
+            if self._completion_floors_met():
+                return True, True, ""
+            if self._consecutive_premature_completes >= self.config.max_premature_completes:
+                print(
+                    "Captain repeatedly declared `complete` despite floors "
+                    f"({self._consecutive_premature_completes} consecutive overrides); "
+                    "accepting completion via soft escape.",
+                    flush=True,
+                )
+                return True, True, ""
+            self._consecutive_premature_completes += 1
+            self._pending_continue_nudge = self._compose_continue_nudge()
+            self._captain_termination_state = "continue"
+            self._captain_termination_reason = ""
+            return False, False, ""
 
         if not frontier and not self._has_active_runtime_work():
+            if self._pending_continue_nudge:
+                return False, False, ""
             delta = self.state.pending_captain_delta()
             all_terminal = bool(self.state.targets) and all(
                 self._is_terminal_target(target) or self._is_target_ignored(target)
@@ -1083,6 +1137,34 @@ class DynamicAnalysisRunner:
                 return True, False, "captain left the frontier empty without requesting completion"
 
         return False, False, ""
+
+    def _count_terminal_targets(self) -> int:
+        return sum(
+            1
+            for target in self.state.targets.values()
+            if target.status in _TERMINAL_TARGET_STATUSES and not self._is_target_ignored(target)
+        )
+
+    def _completion_floors_met(self) -> bool:
+        if self.state.captain.turn_index < self.config.min_captain_turns:
+            return False
+        if self._count_terminal_targets() < self.config.min_terminal_targets_before_complete:
+            return False
+        return True
+
+    def _compose_continue_nudge(self) -> str:
+        template = self.config.continue_nudge or _DEFAULT_CONTINUE_NUDGE
+        try:
+            return template.format(
+                turns=self.state.captain.turn_index,
+                terminal=self._count_terminal_targets(),
+                min_captain_turns=self.config.min_captain_turns,
+                min_terminal_targets=self.config.min_terminal_targets_before_complete,
+                max_premature_completes=self.config.max_premature_completes,
+                consecutive=self._consecutive_premature_completes,
+            )
+        except (KeyError, IndexError, ValueError):
+            return template
 
     def _build_interactive_captain_prompt(self) -> str:
         """Build the initial prompt for the interactive tmux captain session."""
@@ -1136,6 +1218,8 @@ class DynamicAnalysisRunner:
         )
 
     def _build_captain_prompt(self, *, summary_only: bool = False) -> str:
+        nudge = self._pending_continue_nudge
+        self._pending_continue_nudge = ""
         delta = self.state.pending_captain_delta()
         pending_directives = [
             asdict(self.state.directives[directive_id])
@@ -1161,7 +1245,7 @@ class DynamicAnalysisRunner:
             if summary_only
             else "Plan the next bounded analysis work."
         )
-        return (
+        prompt = (
             f"{self._captain_role_prompt}\n\n"
             f"Mission:\n{mission}\n\n"
             f"Repository root: {self.working_dir}\n"
@@ -1178,6 +1262,9 @@ class DynamicAnalysisRunner:
             "Event delta since the last captain turn:\n"
             f"{json.dumps(delta_payload, indent=2)}\n"
         )
+        if nudge and not summary_only:
+            prompt = f"{nudge}\n\n{prompt}"
+        return prompt
 
     def _build_worker_prompt(self, target: TargetRecord, attempt: WorkerAttempt) -> str:
         task_packet = {

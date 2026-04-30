@@ -10,6 +10,33 @@ Core rules:
 - Respect scope, ignore lists, user directives, and termination policy.
 - Do not emit duplicate targets or whole-repository bug hunts unless the mission explicitly requires that breadth.
 
+Mental model structure:
+The `mental_model_summary` MUST be structured (not freeform prose) so the engine and the user can audit coverage. Include these labeled sections, in order:
+
+```text
+SUBSYSTEMS:
+  - <name> [untouched | active | covered | dry-hole] — <one-line note: target count, verified/rejected counts, blockers>
+ENTRY POINTS:
+  - <name> [untouched | active | covered | dry-hole] — <one-line note>
+UNCOVERED SURFACE:
+  - <bullet list of in-scope subsystems / files / entry points not yet investigated>
+  - (write `(none)` only when truly empty)
+NOTES:
+  - <free-form running notes, hypotheses, hot leads>
+```
+
+Status tags:
+- `untouched`: no target dispatched yet.
+- `active`: at least one target queued, running, or verifying.
+- `covered`: at least one target has reached a terminal state (completed / no_findings) AND adjacent surface has been swept.
+- `dry-hole`: investigated and judged unproductive. Note why so future turns do not re-investigate.
+
+Variant-analysis policy (apply on every turn):
+- Verified claim — the bug itself is a leaf. Do NOT respawn the same bug. DO spawn targets in the surrounding subsystem: sibling functions, callers and callees, related modules, structurally identical patterns elsewhere in the codebase. A verified finding is evidence the surface is fertile; sweep it.
+- Rejected claim — the specific PoC failed, but the surface may still be real. Spawn targets for: alternate paths to the same sink, sibling code that may LACK the verifier-identified guard, or a different vulnerability class on the same surface. Treat rejection as negative evidence on a path, not on the surface.
+- No-findings target — do NOT re-investigate the same scope. Only spawn an adjacent fresh-angle target when there is a concrete new reason (e.g., a recent verified finding suggests a related pattern).
+- Blocked target — do NOT respawn until the blocker is addressed (different build path, static-only approach, alternative tooling). Note the blocker in `mental_model_summary` so it is not silently retried.
+
 Available decomposition strategies:
 - `function-level`: audit one suspicious function and its immediate callers or callees.
 - `module-level`: map one file or tightly related file cluster to understand responsibilities and risks.
@@ -31,16 +58,14 @@ User directives:
 
 Completion:
 - Set `termination_state` to `"complete"` only when ALL of the following are true:
-  1. You have systematically enumerated the major subsystems and entry points in scope.
-  2. Each major subsystem has been investigated with at least one bounded target.
-  3. Active investigation seams from verified findings have been followed to adjacent attack surface.
+  1. The `UNCOVERED SURFACE` section of `mental_model_summary` is empty (`(none)`).
+  2. Every entry in `SUBSYSTEMS` and `ENTRY POINTS` has reached `covered` or `dry-hole` status.
+  3. Active investigation seams from verified findings have been followed via the variant-analysis policy.
   4. No concrete, high-value next target remains inside scope.
   5. A wrap-style summary turn has been requested, OR the termination policy says discovery should stop.
 - Do not mark completion just because one target finished or a few targets returned no findings.
-- Do not mark completion after only a handful of targets — a thorough analysis explores dozens of targets across multiple subsystems over many captain turns.
-- Verified findings should OPEN new investigation fronts, not close the investigation. Each verified finding is evidence of a productive seam — pivot to adjacent attack surface (sibling functions, related modules, upstream/downstream data flow).
-- After each round of verified findings, ask: "What other code shares this pattern, boundary, or data flow?" and spawn targets for those areas.
-- Rejected claims are negative evidence, not dead ends. If a claim was rejected with `guard-found`, investigate whether the guard has gaps or whether sibling code lacks equivalent guards.
+- Do not mark completion after only a handful of targets. A thorough analysis explores many dozens or hundreds of targets across multiple subsystems over many captain turns. The engine may impose explicit floors on captain turns and terminal targets and will REJECT premature completion until those floors are met; the engine reports the override and the unmet floors back to you in the next prompt.
+- If you find yourself with `UNCOVERED SURFACE` non-empty and no obvious next target, broaden the search: enumerate additional in-scope files, follow build/dependency graphs, audit configuration entry points, or pick the next-lowest-priority subsystem you skipped.
 - If any concrete, high-value next target remains inside scope, return `termination_state: "continue"`.
 
 Return exactly one machine-readable block using these markers:
@@ -102,7 +127,7 @@ CAPTAIN_JSON_BEGIN
 {
   "message_to_user": "I incorporated your parser focus request and will defer unrelated logging work.",
   "acknowledged_directive_ids": ["dir-7", "dir-8"],
-  "mental_model_summary": "Untrusted network input appears to enter through handle_client(), flow through decode_header(), and concentrate risk in parse_frame() where length arithmetic and allocation decisions happen.",
+  "mental_model_summary": "SUBSYSTEMS:\n  - net/server [active] — handle_client dispatched as target-1; awaiting worker.\n  - net/parser [active] — parse_frame focused via target-parse-frame-callers.\n  - storage/db [untouched] — sqlite wrappers not yet surveyed.\nENTRY POINTS:\n  - tcp accept loop [active] — covered indirectly via handle_client target.\n  - cli flags [untouched] — argv parsing in main.c not investigated.\nUNCOVERED SURFACE:\n  - storage/db wrappers (src/storage/*.c)\n  - cli flag parser (src/main.c)\n  - sibling parser helpers (parse_message, parse_chunk)\nNOTES:\n  - Verified claim claim-12 confirms attacker-controlled length reaches parse_frame; sweep siblings next.",
   "open_questions": [
     "Does any caller clamp payload_len before parse_frame()?",
     "Do sibling parser helpers repeat the same length arithmetic pattern?"

@@ -101,6 +101,47 @@ phases:
             allow_repo_tools=False,
         )
 
+    def test_yaml_analysis_phase_continue_loop_fields(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      min_captain_turns: 50
+      min_terminal_targets_before_complete: 200
+      max_premature_completes: 3
+      continue_nudge: "keep going, captain"
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        analysis = wf.phases[0].analysis
+        assert analysis is not None
+        assert analysis.min_captain_turns == 50
+        assert analysis.min_terminal_targets_before_complete == 200
+        assert analysis.max_premature_completes == 3
+        assert analysis.continue_nudge == "keep going, captain"
+
+    def test_yaml_analysis_phase_continue_nudge_must_be_string(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      continue_nudge: 42
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        with pytest.raises(ValueError, match="continue_nudge must be a string"):
+            load_workflow(yaml_path)
+
     def test_yaml_analysis_phase_defaults(self, tmp_path):
         yaml_content = """\
 name: test
