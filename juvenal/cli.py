@@ -73,12 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-i",
         "--interactive",
         action="store_true",
-        help=("Enable phased-planning chat, implement interactive phases, and analysis review-point interaction"),
-    )
-    run_p.add_argument(
-        "--attach",
-        action="store_true",
-        help="With --interactive, auto-join the captain tmux window into the current tmux session",
+        help="Enable phased-planning chat, implement interactive phases, and the analysis chat dashboard",
     )
     run_p.add_argument("--serialize", action="store_true", help="Disable all parallelization")
 
@@ -403,7 +398,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         clear_context_on_bounce=args.clear_context_on_bounce,
         serialize=args.serialize,
         interactive=args.interactive,
-        attach=getattr(args, "attach", False),
     )
     return engine.run()
 

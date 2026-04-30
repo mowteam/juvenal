@@ -175,7 +175,6 @@ class DynamicAnalysisRunner:
         run_mode: Literal["fresh", "resume", "reset"],
         display: Display,
         interactive: bool,
-        attach: bool = False,
         failure_context: str = "",
         interaction_channel: UserInteractionChannel | None = None,
         chat_dashboard: Any = None,
@@ -186,7 +185,6 @@ class DynamicAnalysisRunner:
         self.run_mode = run_mode
         self.display = display
         self.interactive = interactive
-        self.attach = attach
         self.failure_context = failure_context
         self.config = phase.analysis or AnalysisConfig()
         self.working_dir = Path(workflow.working_dir).resolve()
@@ -488,179 +486,6 @@ class DynamicAnalysisRunner:
             counts[target.status] = counts.get(target.status, 0) + 1
         active = [(target.target_id, target.status) for target in self._frontier_targets()]
         self._dashboard.render_frontier(counts, active)
-
-    def _run_interactive(self) -> PhaseResult:
-        """Interactive execution: captain is a Claude Code session in tmux."""
-
-        from juvenal.dynamic.tmux_captain import FileWatcher, TmuxCaptainSession
-
-        juvenal_dir = self.working_dir / ".juvenal"
-        juvenal_dir.mkdir(parents=True, exist_ok=True)
-        dispatch_file = juvenal_dir / "dispatch.jsonl"
-        results_file = juvenal_dir / "results.jsonl"
-
-        # Initialize dispatch/results files (don't truncate on resume)
-        if self.run_mode != "resume":
-            dispatch_file.write_text("", encoding="utf-8")
-            results_file.write_text("", encoding="utf-8")
-
-        captain_model = _resolve_model(self.config.captain_backend, "captain", self.config.captain_model)
-        tmux_session = TmuxCaptainSession(
-            session_name=f"juvenal-{self.phase.id}",
-            working_dir=self.working_dir,
-            dispatch_file=dispatch_file,
-            results_file=results_file,
-            model=captain_model,
-        )
-        watcher = FileWatcher(dispatch_file, self._handle_dispatch)
-        self._tmux_session = tmux_session
-        self._results_file = results_file
-
-        try:
-            prompt = self._build_interactive_captain_prompt()
-            tmux_session.start(prompt, env=self._role_env("captain"))
-            watcher.start()
-
-            print(
-                f"\nCaptain started in tmux session: {tmux_session.session_name}",
-                flush=True,
-            )
-            if self.attach:
-                tmux_session.attach_to_current()
-                print("  Captain window joined to current tmux session.", flush=True)
-            else:
-                print(f"  Attach with: tmux attach -t {tmux_session.session_name}", flush=True)
-            print(f"  Dispatch file: {dispatch_file}", flush=True)
-            print(f"  Results file:  {results_file}\n", flush=True)
-
-            # Grace period for captain to initialize
-            session_start = time.time()
-            startup_deadline = session_start + 10.0
-
-            # Autonomous loop: no captain turns, no user waits
-            while True:
-                # Check if captain is still alive (with startup grace period)
-                if not tmux_session.is_alive():
-                    if time.time() < startup_deadline:
-                        time.sleep(1.0)
-                        continue
-                    # Captain exited. Drain any in-flight work first; then fail loudly —
-                    # the captain has no juvenal-mediated "done" signal other than
-                    # `.juvenal/stop` (handled below), so an unexpected exit is a real
-                    # failure (commonly: invalid CLI flag, auth error, OOM in claude).
-                    self._drain_completed_futures()
-                    if self._has_active_runtime_work():
-                        time.sleep(1.0)
-                        continue
-                    elapsed = time.time() - session_start
-                    if elapsed < 30.0:
-                        message = (
-                            f"captain tmux session ended {elapsed:.1f}s after launch — "
-                            "likely a startup failure (check claude CLI flags, auth, model name)"
-                        )
-                    else:
-                        message = (
-                            f"captain tmux session ended unexpectedly after {elapsed:.0f}s "
-                            "without creating `.juvenal/stop`"
-                        )
-                    return PhaseResult(success=False, failure_context=message)
-
-                # Check for terminal failure
-                if self._terminal_failure:
-                    return PhaseResult(success=False, failure_context=self._terminal_failure)
-
-                # Background work
-                self._drain_completed_futures()
-                self._schedule_verifiers()
-                self._schedule_workers()
-                self._schedule_reporters()
-
-                # Check stop signal
-                if (juvenal_dir / "stop").exists():
-                    return PhaseResult(success=False, failure_context="Stopped by .juvenal/stop signal")
-
-                time.sleep(_IDLE_SLEEP_SECONDS)
-        finally:
-            watcher.stop()
-            if tmux_session.is_alive():
-                tmux_session.kill()
-            self._worker_executor.shutdown(wait=False, cancel_futures=True)
-            self._verifier_executor.shutdown(wait=False, cancel_futures=True)
-            self._reporter_executor.shutdown(wait=False, cancel_futures=True)
-
-    def _handle_dispatch(self, data: dict[str, Any]) -> None:
-        """Callback from FileWatcher when a new target dispatch is found."""
-        now = time.time()
-        target_id = data.get("target_id", "")
-        if not target_id or target_id in self.state.targets:
-            return
-
-        target = TargetRecord(
-            target_id=target_id,
-            title=data.get("title", target_id),
-            kind=data.get("kind", "captain-dispatch"),
-            priority=max(0, min(100, data.get("priority", 80))),
-            status="queued",
-            source="captain",
-            scope_paths=data.get("scope_paths", []),
-            scope_symbols=data.get("scope_symbols", []),
-            instructions=data.get("instructions", ""),
-            depends_on_claim_ids=[],
-            spawn_reason=data.get("spawn_reason", "Captain dispatched via interactive session."),
-            generation=1,
-            active_generation=1,
-            active_attempt_id=None,
-            deferred_until_turn=None,
-            pending_verification_ids=[],
-            accepted_claim_ids=[],
-            rejected_claim_ids=[],
-            created_at=now,
-            updated_at=now,
-        )
-        self.state.targets[target.target_id] = target
-        self.state.append_event(
-            "target.discovered",
-            target_id=target.target_id,
-            generation=target.active_generation,
-            source=target.source,
-        )
-
-    def _append_result(self, result_data: dict[str, Any]) -> None:
-        """Append a result line to the results JSONL file and notify the captain."""
-        if not hasattr(self, "_results_file"):
-            return
-        with open(self._results_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(result_data, sort_keys=True) + "\n")
-        if hasattr(self, "_tmux_session") and self._tmux_session.is_alive():
-            target_id = result_data.get("target_id", "")
-            status = result_data.get("status", "")
-            self._tmux_session.inject(f"[juvenal] Target {target_id}: {status}. Read {self._results_file} for details.")
-
-    def _notify_target_result(self, target: TargetRecord, leaf_claims: list[ClaimRecord]) -> None:
-        """Write a target result to the results file (interactive mode only)."""
-        if not self.interactive:
-            return
-        claims_summary = []
-        for claim in leaf_claims:
-            entry: dict[str, Any] = {
-                "claim_id": claim.claim_id,
-                "status": claim.status,
-                "kind": claim.kind,
-                "severity": claim.severity,
-                "summary": claim.summary,
-            }
-            if claim.status == "rejected":
-                entry["rejection_class"] = claim.rejection_class
-                entry["rejection_reason"] = self._latest_rejection_reason(claim)
-            claims_summary.append(entry)
-        self._append_result(
-            {
-                "target_id": target.target_id,
-                "title": target.title,
-                "status": target.status,
-                "claims": claims_summary,
-            }
-        )
 
     def kill_active(self) -> None:
         """Kill all active subprocesses owned by the runner."""
@@ -1398,57 +1223,6 @@ class DynamicAnalysisRunner:
         except (KeyError, IndexError, ValueError):
             return template
 
-    def _build_interactive_captain_prompt(self) -> str:
-        """Build the initial prompt for the interactive tmux captain session."""
-        mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
-        dispatch_schema = json.dumps(
-            {
-                "target_id": "unique-kebab-id",
-                "title": "Short description of the analysis target",
-                "kind": "function-level | module-level | data-flow | call-graph | entry-point",
-                "priority": 80,
-                "scope_paths": ["path/to/file.py"],
-                "scope_symbols": ["function_name"],
-                "instructions": "Detailed instructions for the worker",
-                "spawn_reason": "Why this target is worth investigating",
-            },
-            indent=2,
-        )
-        return (
-            f"{self._captain_role_prompt}\n\n"
-            f"# Mission\n\n{mission}\n\n"
-            f"Repository root: {self.working_dir}\n\n"
-            "# Interactive Analysis Protocol\n\n"
-            "You are running as an interactive Claude Code session. Workers and verifiers run\n"
-            "autonomously in the background. You communicate with the Juvenal engine via files.\n\n"
-            "## Dispatching targets\n\n"
-            "To dispatch analysis targets to workers, append one JSON object per line to:\n"
-            f"  `{self.working_dir / '.juvenal' / 'dispatch.jsonl'}`\n\n"
-            "Each line must be a valid JSON object with this schema:\n"
-            f"```json\n{dispatch_schema}\n```\n\n"
-            "The engine monitors this file and immediately dispatches workers for each new target.\n"
-            "Workers investigate the target, produce claims, and verifiers independently check them.\n\n"
-            "## Reading results\n\n"
-            "Worker and verifier results are appended to:\n"
-            f"  `{self.working_dir / '.juvenal' / 'results.jsonl'}`\n\n"
-            "Each line is a JSON object with target_id, status (completed/exhausted/no_findings/blocked),\n"
-            "and a claims array with verification outcomes (verified/rejected with reasons).\n\n"
-            "Check this file periodically to see what workers found and what verifiers concluded.\n"
-            "Use verified findings to guide your next targets. Use rejections as negative evidence.\n\n"
-            "## How to work\n\n"
-            "1. Explore the codebase using your tools (read files, grep, run commands)\n"
-            "2. Build a mental model of the attack surface\n"
-            "3. Dispatch bounded analysis targets by appending to dispatch.jsonl\n"
-            "4. Continue exploring while workers run in the background\n"
-            "5. Periodically read results.jsonl to see verification outcomes\n"
-            "6. Use results to refine your model and dispatch follow-up targets\n"
-            "7. Keep iterating — do not stop after a few targets\n\n"
-            "## Stopping\n\n"
-            "To signal that you are done, create the file `.juvenal/stop`.\n"
-            "The engine will wait for active workers to finish, then end the analysis.\n\n"
-            "Start by exploring the repository structure and identifying the highest-risk attack surfaces.\n"
-        )
-
     def _build_captain_prompt(self, *, summary_only: bool = False) -> str:
         nudge = self._pending_continue_nudge
         self._pending_continue_nudge = ""
@@ -1940,7 +1714,6 @@ class DynamicAnalysisRunner:
         if report.outcome == "no_findings":
             target.status = "no_findings"
             self.state.append_event("target.no_findings", target_id=target.target_id, generation=attempt.generation)
-            self._notify_target_result(target, [])
             self.state.save()
             return
 
@@ -2524,7 +2297,6 @@ class DynamicAnalysisRunner:
         if leaf_claims and all(claim.status == "verified" for claim in leaf_claims):
             target.status = "completed"
             self.state.append_event("target.completed", target_id=target.target_id, generation=target.active_generation)
-            self._notify_target_result(target, leaf_claims)
             return
 
         # Check for retryable rejected claims
@@ -2548,7 +2320,6 @@ class DynamicAnalysisRunner:
         if exhausted_rejected:
             target.status = "exhausted"
             self.state.append_event("target.exhausted", target_id=target.target_id, generation=target.active_generation)
-            self._notify_target_result(target, leaf_claims)
             return
 
         target.status = "queued"

@@ -256,9 +256,9 @@ can inspect the verified findings or audit trail if they need to summarize resul
 
 In v1, `analysis` phases may not appear inside `parallel_groups`.
 
-### Analysis Review Points
+### Analysis Chat Dashboard
 
-Run analysis workflows with `--interactive` to open short review windows between scheduling turns:
+Run analysis workflows with `--interactive` to open a Rich Live chat dashboard. The captain runs as a background `claude --resume <uuid>` session, the dashboard renders its turn-by-turn `message_to_user` and structured `mental_model_summary`, the event stream surfaces worker/verifier/claim activity, and the user can type directives at any moment:
 
 ```bash
 juvenal run juvenal/workflows/analysis-example.yaml --interactive
@@ -271,9 +271,13 @@ Each input line is persisted as a directive. Supported commands:
 - `/ignore symbol:<exact-symbol>` prevents future scheduling for targets scoped to that symbol.
 - `/target TEXT` injects a high-priority user target immediately.
 - `/ask TEXT` queues a direct question for the captain to answer on the next turn.
+- `/now` forces the next captain turn even if no event delta has fired (useful right after typing a `/focus` or `/target`).
+- `/show captain` prints the full captain message, mental model, and open questions out-of-band — handy when the panel has scrolled.
 - `/summary` asks the captain for a concise status summary on the next turn.
 - `/stop` stops scheduling new work immediately, kills active work, and fails the phase.
 - `/wrap` stops new discovery, drains in-flight work, then asks the captain for one final summary turn before the phase completes.
+
+Free-form text (no leading `/`) is persisted as a `note` directive and surfaced to the captain on the next turn.
 
 ### Analysis Example Workflow
 
@@ -469,7 +473,7 @@ juvenal validate <workflow>
 | `--checker SPEC` | Inject checker on every implement phase (`tester`, `tester:"extra instructions"`, or `prompt:"TEXT"`). Repeatable. |
 | `--implementer ROLE` | Prepend implementer role prompt to every implement phase |
 | `--phased-implementer SPEC` | On `run`, first plan a complex goal into linear implement phases, then execute them with your CLI-injected checker stack. Accepts either `GOAL` or `ROLE:"GOAL"`. |
-| `-i`, `--interactive` | Enable planner/refinement interaction, implement interactive phases, and analysis review-point directives. |
+| `-i`, `--interactive` | Enable planner/refinement interaction, implement interactive phases, and the analysis chat dashboard. |
 | `--clear-context-on-bounce` | Start fresh agent session on bounce (default: resume session) |
 | `-D VAR=VAL` | Set a Jinja2 template variable. Repeatable. |
 | `--backoff SECONDS` | Exponential backoff base delay between bounces |

@@ -127,38 +127,44 @@ flowchart LR
 
 ## Interactive Mode (`--interactive`)
 
-With `--interactive`, the captain runs as a real Claude Code session in tmux.
+With `--interactive`, the runner opens a Rich Live chat dashboard. The
+captain still runs as the same `claude --session-id=<uuid>` session it
+uses in batch mode (resumed via `claude --resume <uuid>` per turn), but
+output is rendered in the dashboard's captain panel and the user can
+inject directives at any moment via the chat input.
 
 ```mermaid
 graph LR
-    subgraph TMUX["tmux session"]
-        CC["Claude Code<br/>(captain TUI)"]
+    subgraph DASH["Rich Live Dashboard"]
+        CP["Captain panel<br/>(message + mental model)"]
+        ES["Event stream<br/>(workers / verifiers / claims)"]
+        CI["Chat input<br/>(>>> )"]
     end
 
-    subgraph Files["File Protocol"]
-        D["dispatch.jsonl<br/><i>captain writes targets</i>"]
-        R["results.jsonl<br/><i>engine writes results</i>"]
-    end
-
-    subgraph BG["Background Engine"]
-        FW["FileWatcher"]
+    subgraph BG["Runner Loop"]
+        CT["Captain turn<br/>(background thread)"]
         WK["Workers"]
         VF["Verifiers"]
+        UC["UserInteractionChannel<br/>(stdin reader)"]
     end
 
-    User["User<br/>(optional)"] -.->|"tmux attach"| CC
-    CC -->|"writes"| D
-    D -->|"monitors"| FW
-    FW --> WK
+    User["User"] -->|"types directive"| UC
+    UC -->|"poll(0.0)"| BG
+    BG -->|"render hooks"| DASH
+    CT -->|"CAPTAIN_JSON"| BG
+    BG --> WK
     WK --> VF
-    VF -->|"appends"| R
-    R -.->|"captain reads"| CC
-    BG -->|"tmux send-keys<br/>notifications"| CC
 
-    style CC fill:#4a9eff,color:#fff
+    style DASH fill:#4a9eff,color:#fff
     style BG fill:#2d3436,color:#fff
     style User fill:#636e72,color:#fff
 ```
+
+Directives the user can type at any moment:
+`/focus <text>`, `/ignore path:<prefix>`, `/ignore symbol:<name>`,
+`/target <text>`, `/ask <question>`, `/now` (force the next captain
+turn now), `/show captain` (print the full captain mental model
+out-of-band), `/summary`, `/stop`, `/wrap`, or any free-form note.
 
 ## Error Handling
 

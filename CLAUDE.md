@@ -34,11 +34,11 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 | `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups (flat or lane-based). `BounceCounter` for thread-safe global bounce tracking in lanes. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
 | `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. `apply_vars()` handles `{{VAR}}` template substitution. In directory convention, extra `.md` files in a phase dir become check phases; command execution belongs inside agentic checker prompts rather than `.sh` phase discovery. |
 | `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. `run_interactive()` for terminal passthrough (Claude only). |
-| `dynamic/` | Dynamic analysis engine package. `runner.py` owns captain/worker/verifier orchestration, `protocol.py` parses structured outputs and directives, `state.py` persists child analysis state, `models.py` defines protocol/state dataclasses, and `interaction.py` handles timed review-point input. |
+| `dynamic/` | Dynamic analysis engine package. `runner.py` owns captain/worker/verifier orchestration (with both batch and chat modes), `protocol.py` parses structured outputs and directives, `state.py` persists child analysis state, `models.py` defines protocol/state dataclasses, `interaction.py` collects user input on a background thread, and `chat_display.py` renders the chat dashboard for `--interactive` runs. |
 | `state.py` | Atomic JSON state persistence (`PipelineState`). Thread-safe (RLock). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume, rewind, and scoped invalidation (for lane bounces). |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`). |
 | `display.py` | Rich TUI with rolling 15-line buffer. Thread-safe (Lock). Falls back to plain text with `--plain` or parallel mode. `pause()`/`resume()` for interactive terminal passthrough. |
-| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`, `validate`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`, `-D VAR=VAL`, `--serialize`. `run`/`validate` surface `type: analysis` semantics, and `run --interactive` enables analysis review-point interaction in addition to existing planning/interactive-phase flows. `status` exits 0 if pipeline fully completed, 1 otherwise. |
+| `cli.py` | CLI entry point. Commands: `run`, `plan`, `do`, `status`, `init`, `validate`. Run flags: `--resume`, `--rewind N`, `--rewind-to PHASE_ID`, `--phase`, `--backoff`, `--notify`, `-D VAR=VAL`, `--serialize`. `run`/`validate` surface `type: analysis` semantics, and `run --interactive` opens the analysis chat dashboard in addition to existing planning/interactive-phase flows. `status` exits 0 if pipeline fully completed, 1 otherwise. |
 | `notifications.py` | Webhook notification support (`build_notification_payload`, `send_webhook`). |
 
 ### Execution Flow
@@ -56,7 +56,7 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 - **implement** — agent executes a prompt to build/modify code. Supports `interactive: true` for terminal passthrough (Claude only, enabled with `--interactive`)
 - **check** — separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason`
 - **workflow** — sub-workflow: dynamic (LLM plans from `prompt`) or static (`workflow_file` / `workflow_dir`). Recursion depth capped by `max_depth`. Parent vars propagate to sub-workflows.
-- **analysis** — dynamic captain/worker/verifier analysis. Uses nested `analysis:` config (`AnalysisConfig`) and persists child state to `.juvenal-state-<phase-id>-analysis.json`. `--interactive` opens review-point directive windows for these phases.
+- **analysis** — dynamic captain/worker/verifier analysis. Uses nested `analysis:` config (`AnalysisConfig`) and persists child state to `.juvenal-state-<phase-id>-analysis.json`. `--interactive` opens a Rich Live chat dashboard (`juvenal/dynamic/chat_display.py`) where the user can watch the captain's mental model and event stream and inject directives (`/focus`, `/ignore`, `/target`, `/ask`, `/now`, `/show captain`, `/summary`, `/stop`, `/wrap`, free-form notes) at any moment.
 
 ### Template Variables
 
@@ -109,10 +109,11 @@ juvenal/
 ├── cli.py               # CLI argument parsing and dispatch
 ├── display.py           # Rich TUI rendering
 ├── dynamic/             # Dynamic analysis engine package
-│   ├── interaction.py   # Timed review-point input polling
+│   ├── chat_display.py  # Rich Live chat dashboard (--interactive mode)
+│   ├── interaction.py   # Background-thread non-blocking stdin reader
 │   ├── models.py        # Captain/worker/verifier protocol and state dataclasses
 │   ├── protocol.py      # Structured output and directive parsing
-│   ├── runner.py        # DynamicAnalysisRunner orchestration loop
+│   ├── runner.py        # DynamicAnalysisRunner orchestration loop (batch + chat)
 │   └── state.py         # Analysis child-state persistence and resume normalization
 ├── engine.py            # Core execution loop
 ├── notifications.py     # Webhook notifications

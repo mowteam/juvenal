@@ -268,13 +268,13 @@ class TestArgumentParsing:
         args = parser.parse_args(["run", "workflow.yaml", "-i"])
         assert args.interactive is True
 
-    def test_run_help_mentions_analysis_review_points(self):
+    def test_run_help_mentions_analysis_chat_dashboard(self):
         parser = build_parser()
         subparsers = next(action for action in parser._actions if getattr(action, "choices", None))
         help_text = subparsers.choices["run"].format_help()
 
         assert "type: analysis" in help_text
-        assert "review-point" in help_text
+        assert "chat dashboard" in help_text
 
     def test_validate_help_mentions_analysis_config(self):
         parser = build_parser()
