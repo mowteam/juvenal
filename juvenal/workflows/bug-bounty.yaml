@@ -17,27 +17,21 @@ phases:
 
       ## Mission
 
-      Find real, reproducible bugs in this codebase. The bar is a working proof of concept (PoC),
-      not a theoretical concern. Every claim you advance must be something a maintainer could
-      reproduce by following concrete steps.
+      Find real, reproducible bugs in this codebase. Every claim must include a working PoC
+      that triggers the bug — not a theoretical concern.
 
-      **Strongly prefer memory-safety bugs that produce a sanitizer crash report (AddressSanitizer,
-      MemorySanitizer, UndefinedBehaviorSanitizer, ThreadSanitizer) or a hard crash (SIGSEGV,
-      SIGABRT, assertion failure).** These are the highest-value findings because:
-      - The crash report is mechanically verifiable evidence — no judgment call needed
-      - They almost always fall within scope of standard VRP / bug-bounty programs
-      - They have a low false-positive rate once reproduced
-      - They are easy to write up and easy for maintainers to triage
-      This is a preference, not a hard requirement. Logic, injection, auth, and crypto bugs are
-      still valuable when concrete and exploitable; just bias attention toward memory-safety
-      surfaces first when the project is written in a memory-unsafe language (C, C++, unsafe Rust,
-      Cython, native extensions, etc.). For memory-safe languages, fall back to the broader list below.
+      **Strongly prefer memory-safety bugs with a sanitizer crash report or hard crash trace**
+      (ASan/UBSan/MSan/TSan, SIGSEGV/SIGABRT, assertion failure). Sanitizer output is
+      mechanically verifiable, low false-positive, and almost always in VRP scope. This is a
+      preference, not a hard rule — logic, injection, auth, and crypto bugs still count. For
+      memory-unsafe languages (C/C++/unsafe-Rust), bias toward memory-safety surfaces first;
+      for memory-safe languages, fall back to the broader list below.
 
       ### What counts
 
-      - **Memory safety bugs (HIGHEST PRIORITY)**: buffer overflows, use-after-free, double-free,
-        uninitialized reads, OOB reads/writes, type confusion, integer overflow leading to memory
-        corruption. **Gold-standard evidence: an ASan/UBSan/MSan crash report or a SIGSEGV trace.**
+      - **Memory safety (HIGHEST PRIORITY in C/C++/unsafe-Rust)**: buffer overflows, UAF,
+        double-free, OOB reads/writes, type confusion, integer overflow into corruption,
+        uninitialized reads.
       - Logic errors that violate documented invariants or produce incorrect results
       - Injection and input-validation failures (command injection, SQL injection, path traversal, XSS, SSRF)
       - Authentication and authorization bypasses
@@ -87,9 +81,9 @@ phases:
         static-only approach, alternative tooling).
 
       Prioritize (memory-safety-rich surfaces first when the codebase is in a memory-unsafe language):
-      1. Parsers/decoders/deserializers of untrusted input written in C/C++/unsafe-Rust — these are
-         the highest-yield targets for ASan-crashing memory bugs (binary protocols, file format
-         parsers, image/audio/video codecs, compression, regex engines, ASN.1/DER parsers, etc.)
+      1. Parsers/decoders/deserializers of untrusted input in C/C++/unsafe-Rust — highest yield
+         for memory-safety crashes (binary protocols, file format parsers, codecs, compression,
+         regex engines, ASN.1/DER parsers, etc.)
       2. Allocation and lifetime management in unsafe/native code (manual malloc/free, custom
          allocators, refcounting, ownership transfers across FFI boundaries) — fertile ground for
          use-after-free and double-free
@@ -129,59 +123,31 @@ phases:
 
       ### Worker guidance — PoCs are mandatory
 
-      Workers: you are investigators, not theorists. Your job is to find concrete bugs and prove
-      they are real. Every claim you submit MUST include a proof of concept.
+      Every claim must include a concrete trigger that reaches the alleged sink and produces
+      the alleged effect. Static "this could be a bug" arguments are not findings. The
+      verifier will attempt to reproduce your PoC; if it does not reproduce, the claim is
+      rejected.
 
-      **What a PoC means:**
-      - A specific sequence of steps, inputs, or commands that triggers the bug
-      - For memory bugs (PREFERRED): a crafted input or call sequence that produces an
-        AddressSanitizer / UBSan / MSan crash report, a SIGSEGV/SIGABRT, or an assertion failure.
-        Capture the full sanitizer report (including the stack trace and the "SUMMARY:" line) and
-        paste it into the claim. ASan output is the gold-standard PoC because it is
-        mechanically verifiable and rarely contested.
-      - For logic bugs: a concrete test case showing incorrect output vs. expected output
-      - For injection/validation bugs: an actual malicious input string and the code path it takes
-      - For race conditions: a reproduction script or interleaving description that triggers the
-        race; ThreadSanitizer (`-fsanitize=thread`) output is the strongest evidence
-      - For crashes/DoS: a minimal input or request that causes the crash or resource exhaustion
+      **Build with sanitizers when memory unsafety is plausible.** For C/C++/unsafe-Rust,
+      try `-fsanitize=address,undefined`, the project's existing ASan target, or an
+      OSS-Fuzz harness under `fuzz/` / `tests/fuzz/` / `oss-fuzz/`. Reusing an existing
+      fuzzer is often the fastest path to a real crash.
 
-      **Prefer producing a sanitizer crash report when memory unsafety is plausible.** Concretely:
-      - When the project is C/C++/unsafe-Rust, attempt to build with `-fsanitize=address,undefined`
-        (or the project's existing ASan target — many projects ship one in `BUILD`, `CMakeLists`,
-        Makefile flags, or a Dockerfile). If the build system supports fuzzers or test harnesses
-        with sanitizers enabled, use them — they are the fastest path to a crash.
-      - When the project has an OSS-Fuzz integration, look for `fuzz/`, `tests/fuzz/`, or
-        `oss-fuzz/` directories. Reusing an existing fuzz harness is often the lowest-effort way
-        to trigger a real crash on a candidate input.
-      - When you cannot build with sanitizers (no toolchain, complex deps), construct the input
-        anyway and document what crash signature ASan would produce (e.g., "heap-buffer-overflow
-        WRITE of size 4 in `parse_header()` at parser.c:142"). The verifier may complete the
-        sanitizer run.
-      - If the bug class is not memory unsafety (e.g., logic, injection, auth), still produce a
-        concrete trigger — sanitizer crashes are the gold standard but are not the only acceptable
-        evidence.
+      **What a PoC must contain:**
+      - A specific input, command sequence, or test case that triggers the bug.
+      - For memory bugs: paste the full sanitizer report (stack trace + SUMMARY line) or
+        SIGSEGV/SIGABRT trace into the claim.
+      - For logic / injection / auth bugs: the concrete malicious input and its observed effect.
+      - For races: a reproduction script or interleaving description (TSan output preferred).
+      - PoC commands recorded in `commands_run`, including build flags used to enable sanitizers.
 
-      **PoC requirements:**
-      - Write the PoC as a script, test case, or step-by-step command sequence in your report
-      - Record the PoC commands in `commands_run` (include the build commands you used to enable
-        sanitizers, if any)
-      - If you ran the PoC and it triggered the bug, say so and include the output. **For
-        sanitizer crashes, paste the full report.**
-      - If the environment prevents running the PoC (no build toolchain, missing dependencies),
-        write the PoC anyway and note the blocker — the verifier will attempt to run it
-      - A claim without a PoC is incomplete. If you cannot construct a PoC, your confidence should
-        be `low` and you should explain in `reasoning` exactly why a PoC was not possible
+      If the environment blocks running the PoC (no toolchain, missing deps), still write the
+      PoC and document the expected crash signature (e.g. "heap-buffer-overflow WRITE of size 4
+      at parser.c:142") — the verifier will attempt to run it. A claim with no PoC is incomplete:
+      report `confidence: low` with a `reasoning` note explaining why.
 
-      **Why PoCs matter:**
-      Static code reading alone produces false positives. Guards, sanitizers, type constraints,
-      and caller-side preconditions are easy to miss. A PoC that actually triggers the bug is the
-      difference between a real finding and a wasted cycle. The verifier will attempt to reproduce
-      your PoC independently — if it does not reproduce, the claim will be rejected.
-
-      Do not submit theoretical "this could be a bug" claims. Either prove it or return `no_findings`.
-
-      **Output**
-      Output a **brief** description of the bug and the PoC into `output/<bug-name>.md` and `output/<bug-name>-poc`, respectively.
+      **Output:** brief bug description in `output/<bug-name>.md`; PoC artifact in
+      `output/<bug-name>-poc`.
     analysis:
       # Models default per role: claude → opus 4.7 1M for captain/worker,
       # sonnet 4.6 for verifier/reporter; codex → CLI default.
@@ -364,92 +330,40 @@ phases:
             ## Your specialized scope: root-cause de-duplication
 
             You are verifier 2 of 4. The `poc` verifier already confirmed a working
-            reproduction. You judge ONE thing: is this claim a different *symptom*
-            of the same *root cause* as another already-verified claim in this run?
+            reproduction. You judge ONE thing: is this claim a different symptom of
+            the same root cause as another already-VERIFIED claim in this run?
 
-            **Be lenient. Pass on ambiguity.** This verifier exists to suppress
-            obvious duplicates so the final report is easier to parse — not to
-            argue fine distinctions about whether two related bugs share a fix
-            point. When unsure, PASS and let the reporter handle the writeup.
+            **When in doubt, PASS.** This verifier suppresses obvious duplicates so
+            the final report is easier to parse. False rejects discard real findings;
+            false passes only produce cosmetically redundant rows that the reporter
+            can fold together.
 
-            ### How to find other verified claims
+            Read other verified claims from `.juvenal-state-hunt-bugs-analysis.json`
+            (or any `.juvenal-state-*-analysis.json` at the project root). Filter
+            `claims[*]` where `status == "verified"`. Each record carries
+            `primary_location` (path/line/symbol), `subcategory`, `assertion`, and
+            captain-assigned `retry_of_claim_id` / `related_claim_ids` links.
 
-            The captain state lives in a JSON file at the project root, named
-            `.juvenal-state-<phase-id>-analysis.json` (for this phase, look for
-            `.juvenal-state-hunt-bugs-analysis.json`; if absent, fall back to
-            any `.juvenal-state-*-analysis.json` in the current working
-            directory). Read it (use `jq` if available) and filter
-            `claims[*]` where `status == "verified"`.
+            REJECT only when a single fix at one location would retire both this
+            claim's PoC AND another verified claim's PoC — shared root cause, not
+            just shared bug class. Strong signals:
+            - Identical `primary_location.path` AND `line` (within ~5 lines) AND `symbol`.
+            - Same `subcategory` AND assertions describe the same defect mechanism.
+            - Captain links: this claim's `retry_of_claim_id` points at a verified
+              claim, or it's listed in another verified claim's `retry_claim_ids` /
+              `related_claim_ids`.
 
-            Each claim record carries:
-              - `primary_location` → `path`, `line`, `symbol`
-              - `subcategory` → bug class
-              - `assertion` → the bug statement
-              - `retry_of_claim_id` and `related_claim_ids` → captain-assigned
-                links
+            "Two unrelated OOBs" is NOT a duplicate. "Two crash sites of the same
+            missing parser-layer check" IS.
 
-            Also check whether the claim under review appears in another
-            verified claim's `related_claim_ids` or `retry_claim_ids` — that's
-            a captain hint that they overlap.
-
-            ### Reject only when ALL of the following hold
-
-            1. **Same root cause.** Either:
-               - Identical `primary_location.path` AND `line` (or within ~5
-                 lines) AND `symbol`, OR
-               - Same `subcategory` AND the assertions describe the same
-                 underlying defect mechanism (not just the same vulnerability
-                 *class* — "two unrelated OOBs" is not a duplicate; "two
-                 crash sites of the same parser-layer guard miss" is), OR
-               - The fix is the same one-line / one-function change at a
-                 shared upstream symbol (e.g., a parser-layer bound check
-                 whose absence is the root cause of N call-site crashes).
-            2. **Same fix retires both.** A single patch at one location
-               would make the current claim's PoC stop reproducing AND make
-               the other verified claim's PoC stop reproducing.
-            3. **Compared against an already-verified claim, not a pending or
-               rejected one.** Only verified parent claims qualify; otherwise
-               two parallel-verified siblings could mutually reject each other.
-
-            Captain hints (`retry_of_claim_id` pointing at a verified claim,
-            or being listed in another verified claim's `retry_claim_ids` /
-            `related_claim_ids`) are strong signals — when they line up with
-            #1 and #2, REJECT confidently.
-
-            If #1 holds but #2 does not (i.e., related but the fixes are
-            distinct), PASS — it's a related-but-distinct finding worth
-            keeping.
-
-            ### Reject criterion
-
+            On reject:
             - `rejection_class: duplicate-root-cause`
-            - `summary`: name the parent verified claim ID and the shared
-              root cause in one sentence
-              (e.g., "duplicate of `target-posix-spinel-parser-g1-claim-c1`
-              — both crash at distinct call sites of the same `spinel.c:617`
-              `>=` parser bug, single one-character fix retires both").
-            - `follow_up_action`: tell the worker the parent claim ID and
-              that any further discovered call sites of this same root cause
-              should be added as variant notes on the parent rather than
-              filed as new claims.
+            - `summary`: parent claim ID + the shared root cause in one sentence.
+            - `follow_up_action`: tell the worker that further call sites of this
+              same root cause should be variant notes on the parent, not new claims.
 
-            ### What's out of scope for THIS verifier
-
-            - Whether the PoC works (`poc` handled this).
-            - Whether the bug is in the bounty scope (`scope` handles this).
-            - Whether the bug is already known to maintainers / public
-              (`novelty` handles this — that's an external duplicate check;
-              this verifier is the *internal* duplicate check across the
-              current run).
-
-            ### How to act
-
-            Spend a small budget — one or two reads of the state file, then
-            decide. If you cannot read the state file or cannot find clear
-            evidence of overlap, default to PASS. False rejects on this
-            verifier discard real findings; false passes only produce
-            cosmetically redundant report rows that the reporter can fold
-            together later.
+            Out of scope: PoC validity (`poc`), bounty scope (`scope`), public
+            novelty (`novelty`).
 
         - name: scope
           backend: claude
@@ -536,7 +450,8 @@ phases:
 
             OUT OF SCOPE for THIS verifier:
             - Whether the PoC works (verifier 1 handled it).
-            - Whether the bug is in scope (verifier 2 handled it).
+            - Whether the claim duplicates another in this run (verifier 2 handled it).
+            - Whether the bug is in scope (verifier 3 handled it).
 
             Use repo-local tools aggressively: `git log -S '<symbol>' --all`,
             `git log --grep='<keyword>'`, `gh issue list`, `gh pr list`,
@@ -575,8 +490,9 @@ phases:
           - **Impact**: what an attacker can achieve, in concrete terms
             (RCE? info disclosure? DoS only?).
           - **Verifier consensus**: a one-line note stating which verifiers
-            passed (e.g., "poc PASS, scope PASS, novelty PASS"). Pull this
-            from the verifier-consensus block in your prompt.
+            passed (e.g., "poc PASS, root-cause-dedup PASS, scope PASS,
+            novelty PASS"). Pull this from the verifier-consensus block in
+            your prompt.
 
           Place any concrete PoC artifacts (input files, scripts, payloads)
           alongside `report.md` in the report directory. At minimum, write a
