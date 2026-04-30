@@ -357,6 +357,14 @@ class AnalysisConfig:
     max_captain_repairs: int = 2
     allow_repo_tools: bool = True
     max_consecutive_errors: int = 5
+    # Rate-limit backoff knobs.
+    # `max_single_backoff_seconds`: cap on any individual sleep (default 1h).
+    # `max_total_backoff_seconds`: cap on cumulative sleep WITHOUT progress.
+    # Resets to zero on every successful agent run, so productive turns don't
+    # eat into this budget. Default 24h gives generous headroom past the
+    # nominal 5h Anthropic rate-limit window without trapping a stuck run.
+    max_single_backoff_seconds: int = 3600
+    max_total_backoff_seconds: int = 24 * 3600
     min_captain_turns: int = 0
     min_terminal_targets_before_complete: int = 0
     continue_nudge: str | None = None
@@ -380,6 +388,8 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_captain_repairs",
     "allow_repo_tools",
     "max_consecutive_errors",
+    "max_single_backoff_seconds",
+    "max_total_backoff_seconds",
     "min_captain_turns",
     "min_terminal_targets_before_complete",
     "continue_nudge",
@@ -620,6 +630,18 @@ def _parse_analysis_config(
         field_name="max_consecutive_errors",
         minimum=1,
     )
+    max_single_backoff_seconds = _parse_analysis_int(
+        raw.get("max_single_backoff_seconds", defaults.max_single_backoff_seconds),
+        phase_id=phase_id,
+        field_name="max_single_backoff_seconds",
+        minimum=1,
+    )
+    max_total_backoff_seconds = _parse_analysis_int(
+        raw.get("max_total_backoff_seconds", defaults.max_total_backoff_seconds),
+        phase_id=phase_id,
+        field_name="max_total_backoff_seconds",
+        minimum=1,
+    )
     min_captain_turns = _parse_analysis_int(
         raw.get("min_captain_turns", defaults.min_captain_turns),
         phase_id=phase_id,
@@ -677,6 +699,8 @@ def _parse_analysis_config(
         max_captain_repairs=max_captain_repairs,
         allow_repo_tools=allow_repo_tools,
         max_consecutive_errors=max_consecutive_errors,
+        max_single_backoff_seconds=max_single_backoff_seconds,
+        max_total_backoff_seconds=max_total_backoff_seconds,
         min_captain_turns=min_captain_turns,
         min_terminal_targets_before_complete=min_terminal_targets_before_complete,
         continue_nudge=continue_nudge,

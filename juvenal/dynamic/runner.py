@@ -67,8 +67,6 @@ _DASHBOARD_EVENT_KINDS = frozenset(
     }
 )
 _IDLE_SLEEP_SECONDS = 0.05
-_MAX_SINGLE_BACKOFF_SECONDS = 3600  # 1 hour per wait
-_MAX_TOTAL_BACKOFF_SECONDS = 5 * 3600  # 5 hours cumulative across all waits in a run
 
 
 def _flush_stdin_buffer() -> None:
@@ -2787,17 +2785,20 @@ class DynamicAnalysisRunner:
         sleep — state is already saved so --resume will pick up where it left off.
         """
         self.state.save()
-        remaining_budget = _MAX_TOTAL_BACKOFF_SECONDS - self._total_backoff_seconds
+        max_total = self.config.max_total_backoff_seconds
+        max_single = self.config.max_single_backoff_seconds
+        remaining_budget = max_total - self._total_backoff_seconds
         if remaining_budget <= 0:
             self._terminal_failure = (
                 f"rate-limit backoff budget exhausted: slept "
-                f"{self._total_backoff_seconds / 3600:.1f}h cumulatively "
-                f"(cap: {_MAX_TOTAL_BACKOFF_SECONDS / 3600:.0f}h). State saved; resume later."
+                f"{self._total_backoff_seconds / 3600:.1f}h consecutively without progress "
+                f"(cap: {max_total / 3600:.0f}h, configurable via analysis.max_total_backoff_seconds). "
+                "State saved; resume later."
             )
             print(f"\n[juvenal] {self._terminal_failure}", flush=True)
             return
 
-        delay = min(60 * (2**self._backoff_count), _MAX_SINGLE_BACKOFF_SECONDS)
+        delay = min(60 * (2**self._backoff_count), max_single)
         delay = min(delay, remaining_budget)
         self._backoff_count += 1
         minutes = delay / 60
@@ -2805,7 +2806,7 @@ class DynamicAnalysisRunner:
         print(
             f"\n[juvenal] {self._consecutive_errors} consecutive errors — "
             f"likely rate limit. Sleeping {minutes:.0f}m before retrying "
-            f"(cumulative: {cumulative_minutes:.0f}m of {_MAX_TOTAL_BACKOFF_SECONDS / 60:.0f}m cap). "
+            f"(cumulative: {cumulative_minutes:.0f}m of {max_total / 60:.0f}m cap). "
             "State saved (Ctrl+C to exit, --resume to continue later).",
             flush=True,
         )
@@ -2826,9 +2827,15 @@ class DynamicAnalysisRunner:
         return self._shutdown_event.wait(seconds)
 
     def _record_success(self) -> None:
-        """Reset the consecutive error counter on any successful worker/verifier completion."""
+        """Reset error and backoff counters on any successful agent run.
+
+        Crucially this also zeroes _total_backoff_seconds so the cumulative
+        cap means "consecutive backoff time without progress," not "total
+        backoff in run." A 12-hour productive run with ~5h of waits sprinkled
+        between successful turns must not crash on the cap."""
         self._consecutive_errors = 0
         self._backoff_count = 0
+        self._total_backoff_seconds = 0.0
 
     def _dependencies_satisfied(self, target: TargetRecord) -> bool:
         def verified_via_retries(claim_id: str, seen: set[str]) -> bool:

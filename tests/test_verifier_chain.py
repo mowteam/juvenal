@@ -499,8 +499,9 @@ def test_rate_limit_backoff_caps_single_wait_at_one_hour(tmp_path):
     assert sum(sleeps) <= 3600 + 1
 
 
-def test_rate_limit_backoff_caps_total_at_five_hours(tmp_path):
-    """Cumulative wait across calls is capped at 5 hours, then run fails."""
+def test_rate_limit_backoff_caps_total_at_configured_budget(tmp_path):
+    """Cumulative wait across consecutive calls is capped at the configured
+    budget, then the run fails. Default is 24h."""
     runner = _make_runner(tmp_path)
     total_slept: list[float] = []
 
@@ -508,14 +509,65 @@ def test_rate_limit_backoff_caps_total_at_five_hours(tmp_path):
         total_slept.append(d)
         return False
 
+    expected_cap = runner.config.max_total_backoff_seconds
+    expected_calls = expected_cap // runner.config.max_single_backoff_seconds + 1
+
     with patch.object(runner, "_sleep_with_shutdown", side_effect=fake_sleep):
-        for _ in range(6):
-            runner._backoff_count = 20  # 60 * 2**20 >> 3600 → capped at 1h
+        for _ in range(expected_calls):
+            runner._backoff_count = 20  # 60 * 2**20 >> max single → capped
             runner._rate_limit_backoff()
     cumulative = sum(total_slept)
-    assert cumulative <= 5 * 3600 + 1
+    assert cumulative <= expected_cap + 1
     assert runner._terminal_failure
     assert "budget exhausted" in runner._terminal_failure
+
+
+def test_rate_limit_backoff_resets_on_record_success(tmp_path):
+    """A successful agent run must zero the cumulative backoff tracker so
+    productive turns don't count toward the cap. Otherwise a 12h productive
+    run with ~5h of intermittent waits would falsely trip the cap."""
+    runner = _make_runner(tmp_path)
+
+    def fake_sleep(d):
+        return False
+
+    with patch.object(runner, "_sleep_with_shutdown", side_effect=fake_sleep):
+        runner._backoff_count = 20
+        runner._rate_limit_backoff()
+        assert runner._total_backoff_seconds > 0
+
+        runner._record_success()
+        assert runner._total_backoff_seconds == 0
+        assert runner._backoff_count == 0
+        assert runner._consecutive_errors == 0
+
+
+def test_rate_limit_backoff_caps_use_analysis_config(tmp_path):
+    """Bumping max_total_backoff_seconds via AnalysisConfig actually changes
+    the budget the runner enforces."""
+    from juvenal.workflow import AnalysisConfig
+
+    runner = _make_runner(
+        tmp_path,
+        config=AnalysisConfig(max_total_backoff_seconds=2 * 3600, max_single_backoff_seconds=1800),
+    )
+    sleeps: list[float] = []
+
+    def fake_sleep(d):
+        sleeps.append(d)
+        return False
+
+    with patch.object(runner, "_sleep_with_shutdown", side_effect=fake_sleep):
+        # Force backoff_count high so single-wait hits the cap each call
+        for _ in range(10):
+            runner._backoff_count = 20
+            runner._rate_limit_backoff()
+
+    # Each sleep is capped at max_single (1800s)
+    assert all(s <= 1800 + 1 for s in sleeps)
+    # Cumulative is capped at max_total (7200s)
+    assert sum(sleeps) <= 2 * 3600 + 1
+    assert "budget exhausted" in (runner._terminal_failure or "")
 
 
 def test_verifier_prompt_renders_template_vars(tmp_path):
