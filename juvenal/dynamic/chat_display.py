@@ -65,14 +65,17 @@ class ChatDashboard:
         open_questions: Iterable[str],
         turn_index: int,
     ) -> None:
+        """End-of-turn state update.
+
+        The captain's message_to_user already streamed line-by-line via
+        render_captain_chunk as the response was generated. Printing it again
+        here would duplicate it on screen. Just reset per-turn streaming
+        state for the next captain turn and emit a brief boundary marker."""
         with self._lock:
             self._captain_turn_index = turn_index
-            # Turn boundary — clear streamed-chunk dedup state so the next
-            # turn's first chunk isn't compared against this turn's last.
             self._last_streamed_chunk = ""
             self._suppressing_captain_json = False
-        first_line = (message_to_user.strip().splitlines() or [""])[0][:200]
-        print(f"\n[captain turn {turn_index}] {first_line}", flush=True)
+        print(f"\n[captain turn {turn_index} ✓]", flush=True)
 
     def render_event(self, *, kind: str, text: str, ts: float | None = None) -> None:
         stamp = time.strftime("%H:%M:%S", time.localtime(ts if ts is not None else time.time()))

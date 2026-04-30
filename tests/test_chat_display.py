@@ -19,7 +19,11 @@ def test_dashboard_start_stop_is_idempotent(capsys):
     assert captured.count("[chat] interactive analysis ended") == 1
 
 
-def test_dashboard_renders_captain_message(capsys):
+def test_dashboard_renders_captain_turn_boundary(capsys):
+    """render_captain emits a brief turn-boundary marker without re-printing
+    the message_to_user — that text already streamed via render_captain_chunk
+    as the response was generated. Re-printing duplicates the message on
+    screen with a 200-char truncation, which the user found visually noisy."""
     dashboard = ChatDashboard()
     dashboard.start()
     dashboard.render_captain(
@@ -30,7 +34,9 @@ def test_dashboard_renders_captain_message(capsys):
     )
     dashboard.stop()
     captured = capsys.readouterr().out
-    assert "[captain turn 4] Pivoting to codecs." in captured
+    assert "[captain turn 4 ✓]" in captured
+    # The message itself is NOT re-printed — streaming is the canonical view.
+    assert "Pivoting to codecs." not in captured
 
 
 def test_dashboard_renders_events_with_timestamp(capsys):
