@@ -91,6 +91,59 @@ def test_render_captain_chunk_suppresses_captain_json_block(capsys):
     assert "Trailing text after the block." in captured
 
 
+def test_render_captain_chunk_dedupes_cumulative_chunks(capsys):
+    """Claude Code stream-json sends cumulative assistant events: each new
+    event has the entire response so far. We must print only the suffix on
+    the second event, not the entire repeated paragraph."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()  # discard banner
+    dashboard.render_captain_chunk("First paragraph.\nSecond line.")
+    dashboard.render_captain_chunk("First paragraph.\nSecond line.\nThird line.")
+    dashboard.render_captain_chunk("First paragraph.\nSecond line.\nThird line.\nFourth line.")
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    # Each line should appear exactly once.
+    assert captured.count("First paragraph.") == 1
+    assert captured.count("Second line.") == 1
+    assert captured.count("Third line.") == 1
+    assert captured.count("Fourth line.") == 1
+
+
+def test_render_captain_chunk_drops_identical_retransmissions(capsys):
+    """If the same chunk is delivered twice (rare but possible), the second
+    delivery is dropped silently."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()
+    dashboard.render_captain_chunk("Identical chunk.")
+    dashboard.render_captain_chunk("Identical chunk.")
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert captured.count("Identical chunk.") == 1
+
+
+def test_render_captain_resets_dedup_state_per_turn(capsys):
+    """A new turn must clear cumulative-dedup state so the new turn's first
+    chunk isn't false-positive-matched against the previous turn's text."""
+    dashboard = ChatDashboard()
+    dashboard.start()
+    capsys.readouterr()
+    dashboard.render_captain_chunk("Turn one analysis.")
+    dashboard.render_captain(
+        message_to_user="done",
+        mental_model_summary="",
+        open_questions=[],
+        turn_index=1,
+    )
+    capsys.readouterr()
+    # Same text in turn 2 must print, not be dropped as a duplicate.
+    dashboard.render_captain_chunk("Turn one analysis.")
+    dashboard.stop()
+    captured = capsys.readouterr().out
+    assert "Turn one analysis." in captured
+
+
 def test_render_captain_chunk_suppresses_captain_json_split_across_chunks(capsys):
     """The BEGIN/END markers can land in different stream chunks; suppression
     must persist across chunks until END is seen."""

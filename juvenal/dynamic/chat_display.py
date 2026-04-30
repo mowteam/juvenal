@@ -27,6 +27,11 @@ class ChatDashboard:
         # structured output is for the runner, not for human eyes. We render
         # one placeholder line per block instead of the full JSON.
         self._suppressing_captain_json = False
+        # Claude Code's stream-json emits `assistant` events with cumulative
+        # content (each new event contains the entire response so far, not
+        # just the new delta). Track the last forwarded chunk so we can print
+        # only the new suffix on subsequent cumulative events.
+        self._last_streamed_chunk: str = ""
 
     def start(self) -> None:
         with self._lock:
@@ -62,6 +67,10 @@ class ChatDashboard:
     ) -> None:
         with self._lock:
             self._captain_turn_index = turn_index
+            # Turn boundary — clear streamed-chunk dedup state so the next
+            # turn's first chunk isn't compared against this turn's last.
+            self._last_streamed_chunk = ""
+            self._suppressing_captain_json = False
         first_line = (message_to_user.strip().splitlines() or [""])[0][:200]
         print(f"\n[captain turn {turn_index}] {first_line}", flush=True)
 
@@ -79,10 +88,30 @@ class ChatDashboard:
         belong to a CAPTAIN_JSON block are suppressed and replaced with a
         single placeholder — the structured output is what the runner parses,
         not what the user wants to read.
+
+        Claude Code's stream-json emits cumulative assistant events: chunk N+1
+        contains chunk N's content plus the newly-streamed delta. We dedupe
+        by checking if the new chunk is a strict superset of what we've
+        already printed and emitting only the new suffix.
         """
         if not text:
             return
-        for line in text.splitlines():
+
+        # Cumulative-event dedup. If the new chunk is identical to or a
+        # prefix of the last, drop it. If it's a strict superset, print only
+        # the suffix that hasn't been streamed yet.
+        if text == self._last_streamed_chunk:
+            return
+        if self._last_streamed_chunk and text.startswith(self._last_streamed_chunk):
+            new_text = text[len(self._last_streamed_chunk) :]
+            self._last_streamed_chunk = text
+        elif self._last_streamed_chunk and self._last_streamed_chunk.startswith(text):
+            return  # already shown
+        else:
+            new_text = text
+            self._last_streamed_chunk = text
+
+        for line in new_text.splitlines():
             if "CAPTAIN_JSON_BEGIN" in line:
                 self._suppressing_captain_json = True
                 print("  [captain → emitting CAPTAIN_JSON …]", flush=True)
