@@ -488,8 +488,12 @@ def test_rate_limit_backoff_caps_single_wait_at_one_hour(tmp_path):
     """Single wait must never exceed 3600 seconds even after many failures."""
     runner = _make_runner(tmp_path)
     sleeps: list[float] = []
-    with patch("juvenal.dynamic.runner.time.sleep", side_effect=lambda d: sleeps.append(d)):
-        # Force backoff_count high so 60*2**count >> 3600
+
+    def fake_sleep(d):
+        sleeps.append(d)
+        return False  # not interrupted
+
+    with patch.object(runner, "_sleep_with_shutdown", side_effect=fake_sleep):
         runner._backoff_count = 20
         runner._rate_limit_backoff()
     assert sum(sleeps) <= 3600 + 1
@@ -499,15 +503,17 @@ def test_rate_limit_backoff_caps_total_at_five_hours(tmp_path):
     """Cumulative wait across calls is capped at 5 hours, then run fails."""
     runner = _make_runner(tmp_path)
     total_slept: list[float] = []
-    with patch("juvenal.dynamic.runner.time.sleep", side_effect=lambda d: total_slept.append(d)):
-        # Force each call to use the full 1-hour single cap. Five fill the 5-hour budget;
-        # the sixth must refuse and terminate the run.
+
+    def fake_sleep(d):
+        total_slept.append(d)
+        return False
+
+    with patch.object(runner, "_sleep_with_shutdown", side_effect=fake_sleep):
         for _ in range(6):
             runner._backoff_count = 20  # 60 * 2**20 >> 3600 → capped at 1h
             runner._rate_limit_backoff()
     cumulative = sum(total_slept)
     assert cumulative <= 5 * 3600 + 1
-    # The 6th call should have set terminal_failure (no further sleeps after the cap).
     assert runner._terminal_failure
     assert "budget exhausted" in runner._terminal_failure
 

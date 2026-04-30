@@ -978,8 +978,14 @@ def test_consecutive_errors_backoff_and_retry(tmp_path):
         output=_captain_output(termination_state="complete", termination_reason="Done."),
     )
 
-    # Mock time.sleep so the backoff doesn't actually wait.
-    with patch("juvenal.dynamic.runner.time.sleep"):
+    # Skip the backoff sleep so the test runs fast.
+    with (
+        patch("juvenal.dynamic.runner.time.sleep"),
+        patch(
+            "juvenal.dynamic.runner.DynamicAnalysisRunner._sleep_with_shutdown",
+            return_value=False,
+        ),
+    ):
         result, state, _ = _run_runner(
             tmp_path,
             backend,
@@ -1384,6 +1390,51 @@ def test_chat_mode_keyboard_interrupt_kills_active_and_returns_failure(tmp_path,
     # kill_active is called both in the except-clause AND the finally block;
     # 2+ calls confirm both paths fire and that it's safely idempotent.
     assert len(kill_calls) >= 2
+
+
+def test_rate_limit_backoff_bails_out_on_shutdown(tmp_path):
+    """When kill_active fires while a background thread is sleeping in
+    _rate_limit_backoff, the sleep returns within milliseconds. Without this,
+    Ctrl-C leaves the captain executor thread sleeping for up to 60+ seconds
+    and Python's atexit hook hangs joining it."""
+    import time as _time
+    from threading import Thread
+    from unittest.mock import patch
+
+    from juvenal.display import Display
+    from juvenal.dynamic.runner import DynamicAnalysisRunner
+    from juvenal.workflow import AnalysisConfig, Phase, Workflow
+
+    backend = MockBackend()
+    phase = Phase(id="analyze", type="analysis", prompt="x", analysis=AnalysisConfig())
+    workflow = Workflow(name="x", phases=[phase], working_dir=str(tmp_path))
+    state_file = tmp_path / "state.json"
+
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        runner = DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=False,
+        )
+
+    # Force a backoff that would otherwise sleep 60s.
+    runner._consecutive_errors = 1
+    runner._backoff_count = 0
+
+    started = _time.monotonic()
+    backoff_thread = Thread(target=runner._rate_limit_backoff, daemon=True)
+    backoff_thread.start()
+    # Give the thread a moment to enter the wait, then signal shutdown.
+    _time.sleep(0.05)
+    runner.kill_active()
+    backoff_thread.join(timeout=1.0)
+    elapsed = _time.monotonic() - started
+
+    assert not backoff_thread.is_alive(), "rate-limit backoff did not bail on shutdown"
+    assert elapsed < 1.0, f"backoff took {elapsed:.2f}s; expected near-instant exit"
 
 
 def test_chat_directive_no_session_yet_is_a_no_op(tmp_path):

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Literal
 
 from juvenal.backends import AgentResult, Backend, create_backend
@@ -236,6 +236,11 @@ class DynamicAnalysisRunner:
         self._consecutive_errors = 0
         self._backoff_count = 0
         self._total_backoff_seconds = 0.0
+        # Set on shutdown (Ctrl-C, kill_active). Background threads in
+        # _rate_limit_backoff use this to interrupt their sleep loop so the
+        # process can exit promptly instead of waiting up to an hour for a
+        # rate-limit timer to elapse.
+        self._shutdown_event = Event()
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self._interaction_channel = interaction_channel if interactive else None
@@ -553,8 +558,10 @@ class DynamicAnalysisRunner:
         self._dashboard.render_frontier(counts, active)
 
     def kill_active(self) -> None:
-        """Kill all active subprocesses owned by the runner."""
+        """Kill all active subprocesses owned by the runner and signal any
+        background threads (e.g. rate-limit sleep) to bail out promptly."""
 
+        self._shutdown_event.set()
         for backend in set(self._backend_by_name.values()):
             backend.kill_active()
 
@@ -2715,14 +2722,21 @@ class DynamicAnalysisRunner:
             "State saved (Ctrl+C to exit, --resume to continue later).",
             flush=True,
         )
-        # Sleep in small increments so Ctrl+C is responsive
-        remaining = delay
-        while remaining > 0:
-            chunk = min(remaining, 5.0)
-            time.sleep(chunk)
-            remaining -= chunk
+        # Use a threading.Event so kill_active / Ctrl-C can interrupt this
+        # sleep on a background executor thread (time.sleep is uninterruptible
+        # from outside the thread; Event.wait is not).
+        if self._sleep_with_shutdown(delay):
+            self._total_backoff_seconds += delay
+            return
         self._total_backoff_seconds += delay
         self._consecutive_errors = 0
+
+    def _sleep_with_shutdown(self, seconds: float) -> bool:
+        """Sleep up to `seconds`. Returns True if the shutdown event fires
+        first. Carved out so tests can patch this single method to skip
+        backoff waits without having to patch time.sleep or Event.wait."""
+
+        return self._shutdown_event.wait(seconds)
 
     def _record_success(self) -> None:
         """Reset the consecutive error counter on any successful worker/verifier completion."""
