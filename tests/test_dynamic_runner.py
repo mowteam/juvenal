@@ -172,6 +172,7 @@ class FakeChatDashboard:
         self.frontier_calls: list[dict] = []
         self.chat_input_calls: list[list[str]] = []
         self.show_captain_calls: list[dict] = []
+        self.captain_chunks: list[str] = []
         self._running = False
 
     def start(self) -> None:
@@ -212,6 +213,9 @@ class FakeChatDashboard:
                 "open_questions": list(open_questions),
             }
         )
+
+    def render_captain_chunk(self, text: str) -> None:
+        self.captain_chunks.append(text)
 
 
 class ChatScriptedChannel:
@@ -1265,3 +1269,113 @@ def test_chat_mode_continuous_directive_ingestion(tmp_path):
     # Dashboard saw a directive.applied event for each.
     applied_events = [text for kind, text in dashboard.events if kind == "directive.applied"]
     assert len(applied_events) == 3
+
+
+def test_chat_mode_streams_captain_chunks_to_dashboard(tmp_path):
+    """Captain's stream-json events flow through display_callback into
+    dashboard.render_captain_chunk so the user sees the captain thinking."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+    backend.add_role_chunks(
+        "captain",
+        [
+            "Reading the codebase to understand the parser surface.",
+            "[tool: Read]",
+            "[tool: Grep]",
+            "Identified one obvious bug. Marking complete.",
+        ],
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel()
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, _state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert dashboard.captain_chunks == [
+        "Reading the codebase to understand the parser surface.",
+        "[tool: Read]",
+        "[tool: Grep]",
+        "Identified one obvious bug. Marking complete.",
+    ]
+
+
+def test_chat_directive_pauses_for_native_resume_interactive(tmp_path):
+    """`/chat` after the first turn calls backend.resume_interactive with the
+    captain's session_id. The next captain turn's prompt includes a re-priming
+    prefix instructing the captain to return to CAPTAIN_JSON output."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(enqueue_targets=[_target("target-1")]),
+        session_id="captain-session-abc",
+    )
+    backend.add_role_response("worker", output=_no_findings_output("target-1-g1-attempt-1", "target-1"))
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="post-chat done"),
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel(batches=[[], [], [], ["/chat"]])
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert backend.interactive_calls == ["resume:captain-session-abc"]
+    chat_directives = [d for d in state.directives.values() if d.kind == "chat"]
+    assert len(chat_directives) == 1
+    assert chat_directives[0].status == "applied"
+    captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    # The post-chat captain turn must include the re-priming prefix.
+    assert any("Resuming from free-form chat" in prompt for prompt in captain_prompts)
+
+
+def test_chat_directive_no_session_yet_is_a_no_op(tmp_path):
+    """If the captain has no session_id yet (first turn not finished),
+    `/chat` is a no-op that emits an info event and clears the pending flag."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    dashboard = FakeChatDashboard()
+    chat = ChatScriptedChannel(batches=[["/chat"]])
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+
+    result, _state, _backend, _runner = _run_chat_runner(
+        tmp_path, backend, chat_channel=chat, dashboard=dashboard, config=config
+    )
+
+    assert result.success is True
+    assert backend.interactive_calls == []
+    info_events = [text for kind, text in dashboard.events if kind == "info"]
+    assert any("/chat skipped" in text for text in info_events)
+
+
+def test_batch_mode_does_not_stream_chunks(tmp_path):
+    """Batch mode (no dashboard) does not pass display_callback, so MockBackend's
+    on_chunk hook never fires. This guards the carve-out: streaming is chat-only."""
+    backend = MockBackend()
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+    backend.add_role_chunks("captain", ["chunk-a", "chunk-b"])
+
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=1)
+    result, _state, _ = _run_runner(tmp_path, backend, config=config)
+
+    assert result.success is True
+    captain_chunks = [text for role, text in backend.chunk_calls if role == "captain"]
+    assert captain_chunks == []

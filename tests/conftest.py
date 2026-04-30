@@ -96,6 +96,8 @@ class MockBackend(Backend):
             "reporter": [],
         }
         self._role_side_effects: dict[str, list] = {}
+        self._role_chunks: dict[str, list[list[str]]] = {}
+        self._chunks: list[list[str]] = []
         self._interactive_responses: list[InteractiveResult] = []
         self._call_count = 0
         self._queue_lock = Lock()
@@ -106,6 +108,13 @@ class MockBackend(Backend):
         # Each agent call records (role, model) for assertion in tests of model
         # selection. `model` is None when the runner falls back to the CLI default.
         self.model_calls: list[tuple[str | None, str | None]] = []
+        # Records every (role, chunk_text) pair sent through a display_callback.
+        self.chunk_calls: list[tuple[str | None, str]] = []
+
+    def add_role_chunks(self, role: str, chunks: list[str]) -> None:
+        """Queue a list of streaming chunks delivered to the next display_callback
+        call for `role`. FIFO per role, consumed once."""
+        self._role_chunks.setdefault(role, []).append(list(chunks))
 
     def add_role_side_effect(self, role: str, side_effect) -> None:
         """Register a callable invoked the next time `role` is dispatched.
@@ -213,12 +222,28 @@ class MockBackend(Backend):
             side_effect = queue.pop(0)
         side_effect(prompt, env)
 
+    def _emit_chunks(self, role: str | None, display_callback) -> None:
+        if role is None or display_callback is None:
+            return
+        with self._queue_lock:
+            queue = self._role_chunks.get(role)
+            chunks = queue.pop(0) if queue else None
+        if chunks is None:
+            return
+        for chunk in chunks:
+            self.chunk_calls.append((role, chunk))
+            try:
+                display_callback(chunk)
+            except Exception:
+                pass
+
     def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
         self.role_calls.append((role, prompt))
         self.model_calls.append((role, model))
         self._consume_side_effect(role, prompt, env)
+        self._emit_chunks(role, display_callback)
         return self._next_result(role)
 
     def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
@@ -227,6 +252,7 @@ class MockBackend(Backend):
         self.role_calls.append((role, prompt))
         self.model_calls.append((role, model))
         self._consume_side_effect(role, prompt, env)
+        self._emit_chunks(role, display_callback)
         return self._next_result(role)
 
     def add_interactive_response(self, exit_code: int = 0, session_id: str = "mock-session"):
@@ -237,6 +263,12 @@ class MockBackend(Backend):
         if self._interactive_responses:
             return self._interactive_responses.pop(0)
         return InteractiveResult(session_id="mock-session", exit_code=0)
+
+    def resume_interactive(self, session_id, working_dir, env=None, model=None):
+        self.interactive_calls.append(f"resume:{session_id}")
+        if self._interactive_responses:
+            return self._interactive_responses.pop(0)
+        return InteractiveResult(session_id=session_id, exit_code=0)
 
 
 @pytest.fixture

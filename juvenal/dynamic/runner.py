@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -228,6 +229,8 @@ class DynamicAnalysisRunner:
         self._captain_future: Future[None] | None = None
         self._chat_history: list[str] = []
         self._force_captain_turn: bool = False
+        self._chat_pending: bool = False
+        self._post_chat_reprime: bool = False
         self._last_dashboard_event_seq: int = 0
 
         prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
@@ -358,6 +361,10 @@ class DynamicAnalysisRunner:
                 made_progress |= self._apply_continuous_directives()
                 made_progress |= self._drain_captain_future()
 
+                if self._chat_pending and self._captain_future is None:
+                    self._enter_chat_mode()
+                    made_progress = True
+
                 terminate, success, reason = self._should_terminate()
                 if terminate:
                     if not success:
@@ -427,6 +434,24 @@ class DynamicAnalysisRunner:
                 text=f"turn #{self.state.captain.turn_index + 1}",
             )
         self._captain_future = self._captain_executor.submit(self._run_captain_turn)
+
+    def _captain_chunk_callback(self) -> Callable[[str], None] | None:
+        """Return a backend display_callback that streams to the dashboard.
+
+        Active only when a chat dashboard is mounted (chat mode). In batch
+        mode there is no dashboard and the callback is None.
+        """
+        dashboard = self._dashboard
+        if dashboard is None or not hasattr(dashboard, "render_captain_chunk"):
+            return None
+
+        def on_chunk(text: str) -> None:
+            try:
+                dashboard.render_captain_chunk(text)
+            except Exception:
+                pass
+
+        return on_chunk
 
     def _drain_captain_future(self) -> bool:
         if self._captain_future is None:
@@ -530,6 +555,7 @@ class DynamicAnalysisRunner:
         prompt = self._build_captain_prompt(summary_only=summary_only)
         backend = self._get_backend(self.config.captain_backend)
         session_id = self.state.captain.session_id
+        display_callback = self._captain_chunk_callback()
 
         captain_model = _resolve_model(self.config.captain_backend, "captain", self.config.captain_model)
         if session_id:
@@ -537,6 +563,7 @@ class DynamicAnalysisRunner:
                 session_id,
                 prompt,
                 working_dir=str(self.working_dir),
+                display_callback=display_callback,
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
                 model=captain_model,
@@ -545,6 +572,7 @@ class DynamicAnalysisRunner:
             result = backend.run_agent(
                 prompt,
                 working_dir=str(self.working_dir),
+                display_callback=display_callback,
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
                 model=captain_model,
@@ -620,6 +648,7 @@ class DynamicAnalysisRunner:
                 session_id,
                 repair_prompt,
                 working_dir=str(self.working_dir),
+                display_callback=self._captain_chunk_callback(),
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
                 model=_resolve_model(self.config.captain_backend, "captain", self.config.captain_model),
@@ -997,7 +1026,81 @@ class DynamicAnalysisRunner:
             return self._apply_now_directive(directive)
         if directive.kind == "show":
             return self._apply_show_directive(directive)
+        if directive.kind == "chat":
+            return self._apply_chat_directive(directive)
         return self._queue_captain_directive(directive)
+
+    def _apply_chat_directive(self, directive: UserDirective) -> bool:
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        self.state.save()
+        self._chat_pending = True
+        return True
+
+    def _enter_chat_mode(self) -> None:
+        """Suspend the dashboard and hand the terminal to the backend's native
+        interactive TUI (claude --resume <id> or codex resume <id>) so the user
+        can chat with the captain directly. On exit, restart the dashboard and
+        flag the next captain turn for re-priming back to the structured
+        protocol."""
+
+        self._chat_pending = False
+        session_id = self.state.captain.session_id
+        if not session_id:
+            if self._dashboard is not None:
+                self._dashboard.render_event(
+                    kind="info",
+                    text="/chat skipped: captain has no session yet (run for one turn first)",
+                )
+            return
+
+        backend = self._get_backend(self.config.captain_backend)
+        captain_model = _resolve_model(self.config.captain_backend, "captain", self.config.captain_model)
+
+        # Suspend dashboard + interaction channel so the native TUI owns the
+        # terminal cleanly. Both restart in `finally`.
+        if self._dashboard is not None:
+            try:
+                self._dashboard.stop()
+            except Exception:
+                pass
+        if self._interaction_channel is not None:
+            try:
+                self._interaction_channel.stop()
+            except Exception:
+                pass
+
+        print(
+            f"\n[chat] handing terminal to {backend.name()} (session {session_id[:8]}…). "
+            "Type your messages directly. Exit the TUI (Ctrl+D, /exit, or whatever the CLI "
+            "supports) to return to Juvenal.\n",
+            flush=True,
+        )
+
+        try:
+            backend.resume_interactive(
+                session_id,
+                working_dir=str(self.working_dir),
+                env=self._role_env("captain"),
+                model=captain_model,
+            )
+        except NotImplementedError as exc:
+            print(f"[chat] {exc}", flush=True)
+        except Exception as exc:
+            print(f"[chat] failed: {exc}", flush=True)
+        finally:
+            print("\n[chat] returning to Juvenal-driven analysis.\n", flush=True)
+            self._post_chat_reprime = True
+            if self._interaction_channel is not None and not self._injected_interaction_channel:
+                try:
+                    self._interaction_channel.start()
+                except Exception:
+                    pass
+            if self._dashboard is not None:
+                try:
+                    self._dashboard.start()
+                except Exception:
+                    pass
 
     def _apply_now_directive(self, directive: UserDirective) -> bool:
         directive.status = "applied"
@@ -1226,6 +1329,8 @@ class DynamicAnalysisRunner:
     def _build_captain_prompt(self, *, summary_only: bool = False) -> str:
         nudge = self._pending_continue_nudge
         self._pending_continue_nudge = ""
+        post_chat = self._post_chat_reprime
+        self._post_chat_reprime = False
         delta = self.state.pending_captain_delta()
         pending_directives = [
             asdict(self.state.directives[directive_id])
@@ -1270,6 +1375,16 @@ class DynamicAnalysisRunner:
         )
         if nudge and not summary_only:
             prompt = f"{nudge}\n\n{prompt}"
+        if post_chat and not summary_only:
+            prompt = (
+                "## Resuming from free-form chat\n\n"
+                "The user just had a free-form interactive conversation with you in their "
+                "terminal. Acknowledge any directions they gave you in `message_to_user`, "
+                "then RETURN to the structured analysis protocol — your next response must "
+                "include exactly one CAPTAIN_JSON block as defined in the role prompt. Do "
+                "not respond conversationally; the runner only consumes structured output "
+                "going forward.\n\n"
+            ) + prompt
         return prompt
 
     def _build_worker_prompt(self, target: TargetRecord, attempt: WorkerAttempt) -> str:

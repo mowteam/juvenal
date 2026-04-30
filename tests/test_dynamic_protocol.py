@@ -335,6 +335,7 @@ class TestScopeValidation:
         ("/wrap", "wrap", ""),
         ("/now", "now", ""),
         ("/show captain", "show", "captain"),
+        ("/chat", "chat", ""),
         ("look at the TLS handshake parser", "note", "look at the TLS handshake parser"),
     ],
 )
@@ -362,3 +363,8 @@ def test_parse_show_directive_rejects_unknown_topic():
 def test_parse_show_directive_rejects_empty_topic():
     with pytest.raises(ValueError, match="/show currently supports only 'captain'"):
         parse_user_directive("/show", directive_id="dir-show")
+
+
+def test_parse_chat_directive_rejects_arguments():
+    with pytest.raises(ValueError, match="/chat does not accept arguments"):
+        parse_user_directive("/chat with the captain", directive_id="dir-chat")

@@ -64,6 +64,19 @@ class ChatDashboard:
         stamp = time.strftime("%H:%M:%S", time.localtime(ts if ts is not None else time.time()))
         print(f"{stamp} {kind} {text}", flush=True)
 
+    def render_captain_chunk(self, text: str) -> None:
+        """Print a single streamed chunk from the captain mid-turn.
+
+        Backends emit one chunk per stream-json event. The text is already
+        formatted by the backend's _process_*_event helper (assistant messages
+        as-is; tool calls as `[tool: name]`). We indent so chunks visually
+        nest under the most recent `[captain turn N]` header.
+        """
+        if not text:
+            return
+        for line in text.splitlines():
+            print(f"  {line}", flush=True)
+
     def render_frontier(self, counts: dict[str, int], active_targets: Iterable[tuple[str, str]]) -> None:
         # No-op in line-scrolling mode — frontier counts would spam the terminal
         # on every loop tick. Use /show captain or read state to inspect.

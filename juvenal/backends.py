@@ -115,6 +115,61 @@ class Backend(ABC):
         """Run an interactive terminal session. Default raises NotImplementedError."""
         raise NotImplementedError(f"{self.name()} backend does not support interactive mode")
 
+    def resume_interactive(
+        self,
+        session_id: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+    ) -> InteractiveResult:
+        """Open an interactive TUI on an existing session. Hands the terminal
+        directly to the underlying CLI's TUI; the parent process blocks until
+        the user exits. Default raises NotImplementedError."""
+        raise NotImplementedError(f"{self.name()} backend does not support interactive resume")
+
+    def _run_inherited_stdio(
+        self,
+        cmd: list[str],
+        working_dir: str,
+        env: dict[str, str] | None,
+    ) -> int:
+        """Spawn `cmd` with inherited stdio so the user drives its native TUI.
+        Restores terminal state and foreground process group on exit. Returns
+        the subprocess exit code."""
+        import sys
+
+        proc_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if env:
+            proc_env.update(env)
+
+        saved_termios = None
+        try:
+            import termios
+
+            if sys.stdin.isatty():
+                saved_termios = termios.tcgetattr(sys.stdin)
+        except (ImportError, termios.error):
+            pass
+
+        proc = subprocess.Popen(cmd, cwd=working_dir, env=proc_env)
+        self._register_proc(proc)
+        try:
+            proc.wait()
+        finally:
+            self._unregister_proc(proc)
+            if saved_termios is not None:
+                try:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved_termios)
+                except termios.error:
+                    pass
+            try:
+                if sys.stdin.isatty():
+                    os.tcsetpgrp(sys.stdin.fileno(), os.getpgrp())
+            except OSError:
+                pass
+
+        return proc.returncode
+
 
 class ClaudeBackend(Backend):
     """Claude CLI backend using stream-json output."""
@@ -183,8 +238,6 @@ class ClaudeBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
     ) -> InteractiveResult:
-        import sys
-
         session_id = str(uuid.uuid4())
         cmd = [
             "claude",
@@ -196,40 +249,27 @@ class ClaudeBackend(Backend):
         if model:
             cmd.extend(["--model", model])
         cmd.append(prompt)
-        proc_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-        if env:
-            proc_env.update(env)
+        exit_code = self._run_inherited_stdio(cmd, working_dir, env)
+        return InteractiveResult(session_id=session_id, exit_code=exit_code)
 
-        # Save terminal state before the interactive TUI takes over
-        saved_termios = None
-        try:
-            import termios
-
-            if sys.stdin.isatty():
-                saved_termios = termios.tcgetattr(sys.stdin)
-        except (ImportError, termios.error):
-            pass
-
-        proc = subprocess.Popen(cmd, cwd=working_dir, env=proc_env)
-        self._register_proc(proc)
-        try:
-            proc.wait()
-        finally:
-            self._unregister_proc(proc)
-            # Restore terminal state so Ctrl-C and normal input work again
-            if saved_termios is not None:
-                try:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved_termios)
-                except termios.error:
-                    pass
-            # Reclaim foreground process group so Ctrl-C reaches us
-            try:
-                if sys.stdin.isatty():
-                    os.tcsetpgrp(sys.stdin.fileno(), os.getpgrp())
-            except OSError:
-                pass
-
-        return InteractiveResult(session_id=session_id, exit_code=proc.returncode)
+    def resume_interactive(
+        self,
+        session_id: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+    ) -> InteractiveResult:
+        cmd = [
+            "claude",
+            "--resume",
+            session_id,
+            "--dangerously-skip-permissions",
+            "--verbose",
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        exit_code = self._run_inherited_stdio(cmd, working_dir, env)
+        return InteractiveResult(session_id=session_id, exit_code=exit_code)
 
     def _run_claude_process(
         self,
@@ -325,6 +365,19 @@ class CodexBackend(Backend):
 
     def name(self) -> str:
         return "codex"
+
+    def resume_interactive(
+        self,
+        session_id: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+    ) -> InteractiveResult:
+        cmd = ["npx", "@openai/codex@latest", "resume", session_id]
+        if model:
+            cmd.extend(["--model", model])
+        exit_code = self._run_inherited_stdio(cmd, working_dir, env)
+        return InteractiveResult(session_id=session_id, exit_code=exit_code)
 
     def run_agent(
         self,

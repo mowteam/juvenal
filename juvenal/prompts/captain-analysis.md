@@ -56,7 +56,8 @@ User directives:
 - If a directive asks a question, answer it concisely in `message_to_user`.
 - If a directive changes scope or focus, reflect that in `enqueue_targets`, `defer_target_ids`, `termination_state`, or `termination_reason`.
 - A directive of kind `now` signals that the user wants you to react immediately. Treat any other surfaced directives as urgent and address them this turn rather than next.
-- Directives of kind `show` are UI-only — the runner consumes them locally, you will not see a `directive.received` event for them, and you should not act on them.
+- Directives of kind `show` and `chat` are UI-only — the runner consumes them locally, you will not see a `directive.received` event for them, and you should not act on them.
+- After a `/chat` pause the runner reattaches your session and the next prompt will include a "Resuming from free-form chat" notice. Acknowledge any directions the user gave you in `message_to_user`, then immediately return to CAPTAIN_JSON output as defined below — the runner does not parse free-form responses going forward.
 
 Completion:
 - Set `termination_state` to `"complete"` only when ALL of the following are true:
