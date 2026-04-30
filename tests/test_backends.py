@@ -294,16 +294,25 @@ def _stub_popen() -> MagicMock:
 
 class TestSubprocessStdinIsolation:
     """Non-interactive agents must NOT inherit the parent tty's stdin —
-    otherwise they race the chat dashboard's stdin reader for keystrokes."""
+    otherwise they race the chat dashboard's stdin reader for keystrokes.
+    When the prompt is fed via stdin (to avoid E2BIG on long argv), use a
+    pipe; otherwise use DEVNULL."""
 
-    def test_claude_run_agent_uses_stdin_devnull(self):
+    def test_claude_run_agent_pipes_prompt_via_stdin(self):
         backend = ClaudeBackend()
         with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
             backend.run_agent("hi", working_dir="/tmp")
         kwargs = popen.call_args.kwargs
-        assert kwargs.get("stdin") is subprocess.DEVNULL
+        # Pipe so the prompt can be written to stdin (bypasses argv length
+        # cap). The subprocess does not race the parent tty because the pipe
+        # is closed as soon as the prompt is delivered.
+        assert kwargs.get("stdin") is subprocess.PIPE
+        # Prompt must NOT be on the command line (would hit MAX_ARG_STRLEN
+        # on long-running runs).
+        cmd = popen.call_args.args[0] if popen.call_args.args else popen.call_args.kwargs["args"]
+        assert "hi" not in cmd
 
-    def test_claude_resume_agent_uses_stdin_devnull(self):
+    def test_claude_resume_agent_pipes_prompt_via_stdin(self):
         backend = ClaudeBackend()
         with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
             backend.resume_agent(
@@ -312,7 +321,9 @@ class TestSubprocessStdinIsolation:
                 working_dir="/tmp",
             )
         kwargs = popen.call_args.kwargs
-        assert kwargs.get("stdin") is subprocess.DEVNULL
+        assert kwargs.get("stdin") is subprocess.PIPE
+        cmd = popen.call_args.args[0] if popen.call_args.args else popen.call_args.kwargs["args"]
+        assert "hi" not in cmd
 
     def test_codex_run_agent_pipes_stdin_for_prompt(self):
         backend = CodexBackend()
@@ -320,3 +331,17 @@ class TestSubprocessStdinIsolation:
             backend.run_agent("hi", working_dir="/tmp")
         kwargs = popen.call_args.kwargs
         assert kwargs.get("stdin") is subprocess.PIPE
+
+    def test_claude_run_agent_handles_prompt_larger_than_argv_limit(self):
+        """A prompt larger than Linux's 128KB MAX_ARG_STRLEN must not be
+        passed via argv. Regression for the multi-hour analysis run that
+        crashed with [Errno 7] Argument list too long after the captain
+        prompt accumulated past 128KB."""
+        backend = ClaudeBackend()
+        big_prompt = "X" * (200 * 1024)  # 200KB — well past argv cap
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent(big_prompt, working_dir="/tmp")
+        cmd = popen.call_args.args[0] if popen.call_args.args else popen.call_args.kwargs["args"]
+        # No argv entry may be the giant prompt.
+        for entry in cmd:
+            assert big_prompt not in entry

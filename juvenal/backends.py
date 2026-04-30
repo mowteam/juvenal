@@ -199,8 +199,12 @@ class ClaudeBackend(Backend):
         ]
         if model:
             cmd.extend(["--model", model])
-        cmd.append(prompt)
-        result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env)
+        # Pipe the prompt via stdin instead of argv. Linux's MAX_ARG_STRLEN
+        # caps each argv entry at 128KB, which long-running analysis runs
+        # blow past once the captain's accumulated state (frontier summary,
+        # claim deltas, mental model) inflates. claude --print reads stdin
+        # when no positional prompt is given.
+        result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
         result.session_id = session_id
         return result
 
@@ -226,8 +230,7 @@ class ClaudeBackend(Backend):
         ]
         if model:
             cmd.extend(["--model", model])
-        cmd.append(prompt)
-        result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env)
+        result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
         result.session_id = session_id
         return result
 
@@ -278,6 +281,7 @@ class ClaudeBackend(Backend):
         display_callback: Callable[[str], None] | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        stdin_input: str | None = None,
     ) -> AgentResult:
         # Strip CLAUDECODE env var so juvenal can be invoked from inside Claude Code
         proc_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
@@ -288,10 +292,11 @@ class ClaudeBackend(Backend):
         proc = subprocess.Popen(
             cmd,
             cwd=working_dir,
-            # Detach from the parent tty's stdin. Non-interactive agents do not
-            # need stdin, but if they inherit it they race the chat dashboard's
-            # reader for typed keystrokes and silently steal user input.
-            stdin=subprocess.DEVNULL,
+            # Pipe when feeding a prompt via stdin; otherwise detach from the
+            # parent tty so the subprocess can't race the chat reader for
+            # keystrokes. Pipe avoids E2BIG on long captain prompts that
+            # exceed Linux's 128KB MAX_ARG_STRLEN per argv entry.
+            stdin=subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -299,6 +304,12 @@ class ClaudeBackend(Backend):
             env=proc_env,
         )
         self._register_proc(proc)
+        if stdin_input is not None:
+            try:
+                proc.stdin.write(stdin_input)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
 
         transcript_lines: list[str] = []
         assistant_messages: list[str] = []
