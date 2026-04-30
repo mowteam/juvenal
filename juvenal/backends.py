@@ -10,6 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 
 
@@ -83,12 +84,20 @@ class Backend(ABC):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> AgentResult:
         """Run an agent with the given prompt. Returns AgentResult.
 
         ``model`` is an opaque CLI model identifier (e.g. ``claude-opus-4-7[1m]``,
         ``claude-sonnet-4-6``, or a Codex model name). When ``None`` the backend's
         CLI default is used.
+
+        ``system_prompt`` is optional content placed in the system role at session
+        start. When provided, the Claude backend writes it to a file under
+        ``.juvenal/prompts/<session_id>.md`` and passes ``--append-system-prompt-file``.
+        ``prompt`` (the user message via stdin) carries only dynamic per-call
+        content. Backends that don't support a separate system prompt may ignore
+        this argument.
         """
         ...
 
@@ -102,7 +111,12 @@ class Backend(ABC):
         env: dict[str, str] | None = None,
         model: str | None = None,
     ) -> AgentResult:
-        """Resume an existing agent session. Default falls back to run_agent."""
+        """Resume an existing agent session. Default falls back to run_agent.
+
+        Resumed sessions inherit the system prompt set at the original
+        ``run_agent`` call; resume callers must not pass ``system_prompt``
+        themselves.
+        """
         return self.run_agent(prompt, working_dir, display_callback, timeout, env, model=model)
 
     def run_interactive(
@@ -185,6 +199,7 @@ class ClaudeBackend(Backend):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> AgentResult:
         session_id = str(uuid.uuid4())
         cmd = [
@@ -199,6 +214,18 @@ class ClaudeBackend(Backend):
         ]
         if model:
             cmd.extend(["--model", model])
+        # When a system_prompt is provided, write it to a file under
+        # .juvenal/prompts/ and load it via --append-system-prompt-file. This
+        # places the role + workflow scope in the system role at session start
+        # rather than the user role, where it stays anchored across the whole
+        # conversation. Dynamic per-call content stays on stdin as the user
+        # message.
+        if system_prompt is not None:
+            prompts_dir = Path(working_dir) / ".juvenal" / "prompts"
+            prompts_dir.mkdir(parents=True, exist_ok=True)
+            system_path = prompts_dir / f"{session_id}.md"
+            system_path.write_text(system_prompt, encoding="utf-8")
+            cmd.extend(["--append-system-prompt-file", str(system_path)])
         # Pipe the prompt via stdin instead of argv. Linux's MAX_ARG_STRLEN
         # caps each argv entry at 128KB, which long-running analysis runs
         # blow past once the captain's accumulated state (frontier summary,
@@ -402,7 +429,13 @@ class CodexBackend(Backend):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> AgentResult:
+        # Codex does not currently expose a separate system-prompt slot; if a
+        # caller passes one, fold it into the user message so the content is
+        # not silently dropped.
+        if system_prompt is not None:
+            prompt = f"{system_prompt}\n\n{prompt}"
         cmd = [
             "npx",
             "@openai/codex@latest",

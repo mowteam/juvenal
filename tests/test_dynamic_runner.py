@@ -7,6 +7,13 @@ from concurrent.futures import Future
 from unittest.mock import patch
 
 from juvenal.display import Display
+from juvenal.dynamic.models import (
+    ClaimRecord,
+    CodeLocation,
+    TargetRecord,
+    VerificationRecord,
+    WorkerAttempt,
+)
 from juvenal.dynamic.runner import DynamicAnalysisRunner
 from juvenal.dynamic.state import DynamicSessionState
 from juvenal.workflow import AnalysisConfig, Phase, Workflow
@@ -1481,9 +1488,9 @@ def test_captain_context_files_written_each_turn(tmp_path):
 
 
 def test_first_captain_prompt_includes_role_and_mission_subsequent_does_not(tmp_path):
-    """Turn 1's prompt seeds the session with the role + mission. Subsequent
-    turns rely on Claude's session storage and only carry the per-turn delta
-    plus pointers to .juvenal/ context files."""
+    """Turn 1 routes the role + mission through the system prompt; subsequent
+    turns rely on the session-inherited system prompt and ship only the
+    per-turn delta plus pointers to .juvenal/ context files via stdin."""
     backend = MockBackend()
     backend.add_role_response(
         "captain",
@@ -1501,13 +1508,20 @@ def test_first_captain_prompt_includes_role_and_mission_subsequent_does_not(tmp_
 
     assert result.success is True
     captain_prompts = [prompt for role, prompt in backend.role_calls if role == "captain"]
+    captain_system_prompts = [system for role, system in backend.system_prompt_calls if role == "captain"]
     assert len(captain_prompts) == 2
+    # Turn 1 hits run_agent (system_prompt set); turn 2 hits resume_agent (no
+    # system_prompt recorded). Only one system prompt is captured here.
+    assert len(captain_system_prompts) == 1
 
-    # Turn 1: role + mission present.
-    assert "You are the captain for Juvenal's dynamic" in captain_prompts[0]
-    assert "Mission:" in captain_prompts[0]
+    # Turn 1: role + mission live in the system prompt, not the user message.
+    assert captain_system_prompts[0] is not None
+    assert "You are the captain for Juvenal's dynamic" in captain_system_prompts[0]
+    assert "Mission:" in captain_system_prompts[0]
+    assert "You are the captain for Juvenal's dynamic" not in captain_prompts[0]
+    assert "Mission:" not in captain_prompts[0]
 
-    # Turn 2: role + mission absent (session memory carries them).
+    # Turn 2: role + mission absent from the user message (session inherits).
     assert "You are the captain for Juvenal's dynamic" not in captain_prompts[1]
     assert "Mission:" not in captain_prompts[1]
 
@@ -1730,3 +1744,234 @@ def test_shared_mode_default_is_on(tmp_path):
     assert runner._max_agents == config.max_agents
     assert runner._max_worker_cap == config.max_agents
     assert runner._max_verifier_cap == config.max_agents
+
+
+# ---------------------------------------------------------------------------
+# System-prompt split tests
+#
+# Each per-role _build_*_prompt now returns (system, user). The runner
+# routes ``system`` through Claude's --append-system-prompt-file flag so
+# the framework role + workflow scope live in the system role rather than
+# being prepended to every stdin user message. These tests pin the split.
+# ---------------------------------------------------------------------------
+
+
+def _system_split_target(target_id: str = "target-x") -> TargetRecord:
+    return TargetRecord(
+        target_id=target_id,
+        title=f"Inspect {target_id}",
+        kind="module-level",
+        priority=80,
+        status="queued",
+        source="captain",
+        scope_paths=["src/app.py"],
+        scope_symbols=["app"],
+        instructions=f"Look at {target_id}.",
+        depends_on_claim_ids=[],
+        spawn_reason="Test fixture.",
+        generation=1,
+        active_generation=1,
+        active_attempt_id=None,
+        deferred_until_turn=None,
+        pending_verification_ids=[],
+        accepted_claim_ids=[],
+        rejected_claim_ids=[],
+        created_at=1.0,
+        updated_at=1.0,
+    )
+
+
+def _system_split_attempt(attempt_id: str, target_id: str) -> WorkerAttempt:
+    return WorkerAttempt(
+        attempt_id=attempt_id,
+        target_id=target_id,
+        generation=1,
+        backend="claude",
+        session_id=None,
+        status="queued",
+        started_at=None,
+        completed_at=None,
+    )
+
+
+def _system_split_claim(claim_id: str, target_id: str) -> ClaimRecord:
+    loc = CodeLocation(path="src/app.py", line=10, symbol="app", role="sink")
+    return ClaimRecord(
+        claim_id=claim_id,
+        worker_claim_id="c1",
+        target_id=target_id,
+        attempt_id="attempt-x",
+        generation=1,
+        kind="memory-safety",
+        subcategory=None,
+        summary="Hypothetical OOB.",
+        assertion="Buffer copy past end.",
+        severity="medium",
+        worker_confidence="medium",
+        primary_location=loc,
+        locations=[loc],
+        preconditions=[],
+        candidate_code_refs=[],
+        related_claim_ids=[],
+        audit_artifact_id="art-1",
+        status="proposed",
+        verification_ids=[],
+        rejection_class=None,
+        verified_at=None,
+        rejected_at=None,
+    )
+
+
+def _system_split_verification(
+    claim_id: str, target_id: str, *, verifier_name: str, verifier_index: int
+) -> VerificationRecord:
+    return VerificationRecord(
+        verification_id=f"verif-{verifier_name}",
+        claim_id=claim_id,
+        target_id=target_id,
+        generation=1,
+        backend="claude",
+        verifier_role="default",
+        session_id=None,
+        status="pending",
+        disposition=None,
+        reason="",
+        rejection_class=None,
+        raw_output="",
+        started_at=None,
+        completed_at=None,
+        verifier_name=verifier_name,
+        verifier_index=verifier_index,
+    )
+
+
+def test_build_captain_prompt_first_turn_routes_role_and_mission_to_system(tmp_path):
+    """Turn 1 must put the captain role + mission into system_prompt;
+    user_prompt carries only the per-turn delta (turn index, mode, files)."""
+    config = AnalysisConfig()
+    runner = _make_unstarted_runner(tmp_path, config)
+    assert runner.state.captain.turn_index == 0
+
+    system_prompt, user_prompt = runner._build_captain_prompt()
+
+    assert "You are the captain for Juvenal's dynamic" in system_prompt
+    assert "Mission:" in system_prompt
+    assert "You are the captain for Juvenal's dynamic" not in user_prompt
+    assert "Mission:" not in user_prompt
+    assert "Captain turn: 1" in user_prompt
+    assert "frontier.json" in user_prompt
+
+
+def test_build_captain_prompt_subsequent_turn_returns_empty_system(tmp_path):
+    """On resume turns the system prompt is inherited from the original
+    run_agent call; the builder must return an empty system_prompt so the
+    runner does not double-apply it."""
+    config = AnalysisConfig()
+    runner = _make_unstarted_runner(tmp_path, config)
+    runner.state.captain.turn_index = 1
+
+    system_prompt, user_prompt = runner._build_captain_prompt()
+
+    assert system_prompt == ""
+    assert "You are the captain for Juvenal's dynamic" not in user_prompt
+    assert "Mission:" not in user_prompt
+    assert "Captain turn: 2" in user_prompt
+
+
+def test_build_worker_prompt_routes_role_and_workflow_scope_to_system(tmp_path):
+    """The worker system prompt must contain BOTH the framework role
+    (analysis-worker.md) AND the workflow's worker_prompt scope. Dynamic
+    task data (task packet, repo root) stays on stdin."""
+    config = AnalysisConfig(
+        worker_prompt="## Workflow worker scope\nHunt memory-safety bugs only.",
+    )
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "You are a scoped analysis worker for Juvenal's dynamic" in system_prompt
+    assert "Hunt memory-safety bugs only." in system_prompt
+    assert "Repository root:" in user_prompt
+    assert "Task packet:" in user_prompt
+    assert "You are a scoped analysis worker" not in user_prompt
+    assert "Hunt memory-safety bugs only." not in user_prompt
+
+
+def test_build_worker_prompt_omits_workflow_scope_when_unset(tmp_path):
+    """When the workflow defines no worker_prompt, the system prompt is
+    just the framework role — the empty workflow scope must not produce
+    spurious blank lines or stray scope markers."""
+    config = AnalysisConfig()
+    assert config.worker_prompt == ""
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "You are a scoped analysis worker" in system_prompt
+    # No trailing scope content — system prompt ends at the framework role.
+    assert system_prompt == runner._worker_role_prompt
+
+
+def test_build_verifier_prompt_routes_role_and_per_spec_scope_to_system(tmp_path):
+    """The verifier system prompt must include the framework verifier role
+    AND the per-spec scope (rendered from yaml). Dynamic claim data stays
+    on stdin."""
+    from juvenal.workflow import VerifierSpec
+
+    config = AnalysisConfig(
+        verifiers=[
+            VerifierSpec(name="attack-surface", backend="claude", prompt="Filter design critiques."),
+            VerifierSpec(name="poc", backend="claude", prompt="Reproduce on production."),
+        ],
+    )
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-x", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+    verification = _system_split_verification(
+        claim.claim_id, target.target_id, verifier_name="attack-surface", verifier_index=0
+    )
+
+    system_prompt, user_prompt = runner._build_verifier_prompt(target, claim, verification)
+
+    assert "You are an independent verifier for Juvenal's dynamic" in system_prompt
+    assert "Filter design critiques." in system_prompt
+    # The other verifier's scope must NOT leak into this system prompt.
+    assert "Reproduce on production." not in system_prompt
+    assert "Repository root:" in user_prompt
+    assert "Scrubbed claim packet:" in user_prompt
+    assert "You are an independent verifier" not in user_prompt
+    assert "Filter design critiques." not in user_prompt
+
+
+def test_build_reporter_prompt_routes_preamble_and_workflow_scope_to_system(tmp_path):
+    """The reporter system prompt holds the hardcoded preamble plus the
+    yaml reporter prompt. The dynamic claim packet ships via stdin."""
+    from juvenal.workflow import ReporterSpec
+
+    config = AnalysisConfig(
+        reporter=ReporterSpec(backend="claude", prompt="## Specialized reporter scope\nWrite for VRP triagers."),
+    )
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-x", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+
+    system_prompt, user_prompt = runner._build_reporter_prompt(claim, target)
+
+    assert "You are the reporter agent for Juvenal's dynamic" in system_prompt
+    assert "Write for VRP triagers." in system_prompt
+    # report_dir / bug_id directives belong in system (constant for this call).
+    assert "Report directory" in system_prompt
+    assert "Bug id:" in system_prompt
+    assert "Claim packet:" in user_prompt
+    assert "You are the reporter agent" not in user_prompt
+    assert "Write for VRP triagers." not in user_prompt

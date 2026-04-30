@@ -24,7 +24,9 @@ class DummyBackend(Backend):
     def name(self) -> str:
         return "dummy"
 
-    def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None):
+    def run_agent(
+        self, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None, system_prompt=None
+    ):
         raise NotImplementedError
 
 
@@ -331,6 +333,72 @@ class TestSubprocessStdinIsolation:
             backend.run_agent("hi", working_dir="/tmp")
         kwargs = popen.call_args.kwargs
         assert kwargs.get("stdin") is subprocess.PIPE
+
+
+class TestSystemPromptRouting:
+    """The system_prompt argument must land in the system role at session
+    creation, not duplicated into the user message via stdin. Claude does
+    this via --append-system-prompt-file pointing at .juvenal/prompts/<sid>.md;
+    Codex has no separate slot and folds it into the user message."""
+
+    def test_claude_run_agent_writes_system_prompt_file(self, tmp_path):
+        backend = ClaudeBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent(
+                "user message",
+                working_dir=str(tmp_path),
+                system_prompt="STATIC ROLE TEXT",
+            )
+
+        cmd = popen.call_args.args[0] if popen.call_args.args else popen.call_args.kwargs["args"]
+        assert "--append-system-prompt-file" in cmd
+        flag_index = cmd.index("--append-system-prompt-file")
+        prompt_path = cmd[flag_index + 1]
+        assert "/.juvenal/prompts/" in prompt_path
+        from pathlib import Path
+
+        assert Path(prompt_path).read_text(encoding="utf-8") == "STATIC ROLE TEXT"
+
+    def test_claude_run_agent_omits_flag_when_system_prompt_none(self, tmp_path):
+        backend = ClaudeBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent("user message", working_dir=str(tmp_path))
+        cmd = popen.call_args.args[0] if popen.call_args.args else popen.call_args.kwargs["args"]
+        assert "--append-system-prompt-file" not in cmd
+        # No file should have been created.
+        prompts_dir = tmp_path / ".juvenal" / "prompts"
+        assert not prompts_dir.exists() or not any(prompts_dir.iterdir())
+
+    def test_claude_run_agent_keeps_user_message_on_stdin(self, tmp_path):
+        backend = ClaudeBackend()
+        stub = _stub_popen()
+        with patch("juvenal.backends.subprocess.Popen", return_value=stub):
+            backend.run_agent(
+                "ONLY THE DYNAMIC PAYLOAD",
+                working_dir=str(tmp_path),
+                system_prompt="STATIC ROLE",
+            )
+        # The user message goes via stdin write; the system prompt must NOT
+        # also be written to stdin (else it would be duplicated user content).
+        write_calls = [c.args[0] for c in stub.stdin.write.call_args_list]
+        joined = "".join(write_calls)
+        assert "ONLY THE DYNAMIC PAYLOAD" in joined
+        assert "STATIC ROLE" not in joined
+
+    def test_codex_run_agent_folds_system_prompt_into_user_message(self, tmp_path):
+        backend = CodexBackend()
+        stub = _stub_popen()
+        with patch("juvenal.backends.subprocess.Popen", return_value=stub):
+            backend.run_agent(
+                "DYNAMIC PAYLOAD",
+                working_dir=str(tmp_path),
+                system_prompt="STATIC ROLE",
+            )
+        write_calls = [c.args[0] for c in stub.stdin.write.call_args_list]
+        joined = "".join(write_calls)
+        assert "STATIC ROLE" in joined
+        assert "DYNAMIC PAYLOAD" in joined
+        assert joined.index("STATIC ROLE") < joined.index("DYNAMIC PAYLOAD")
 
     def test_claude_run_agent_handles_prompt_larger_than_argv_limit(self):
         """A prompt larger than Linux's 128KB MAX_ARG_STRLEN must not be

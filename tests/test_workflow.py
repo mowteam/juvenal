@@ -142,6 +142,61 @@ phases:
         with pytest.raises(ValueError, match="continue_nudge must be a string"):
             load_workflow(yaml_path)
 
+    def test_yaml_analysis_phase_worker_prompt_round_trips(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      worker_prompt: |
+        ## Your role
+        You are a vulnerability researcher.
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        analysis = wf.phases[0].analysis
+        assert analysis is not None
+        assert "## Your role" in analysis.worker_prompt
+        assert "vulnerability researcher" in analysis.worker_prompt
+
+    def test_yaml_analysis_phase_worker_prompt_must_be_string(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      worker_prompt: 42
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        with pytest.raises(ValueError, match="worker_prompt must be a string"):
+            load_workflow(yaml_path)
+
+    def test_yaml_analysis_phase_worker_prompt_default_empty(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        analysis = wf.phases[0].analysis
+        assert analysis is not None
+        assert analysis.worker_prompt == ""
+
     def test_yaml_analysis_phase_defaults(self, tmp_path):
         yaml_content = """\
 name: test

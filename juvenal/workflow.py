@@ -382,6 +382,7 @@ class AnalysisConfig:
     max_premature_completes: int = 5
     verifiers: list[VerifierSpec] = field(default_factory=list)
     reporter: ReporterSpec | None = None
+    worker_prompt: str = ""
 
 
 _ANALYSIS_BACKENDS = {"claude", "codex"}
@@ -409,6 +410,7 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_premature_completes",
     "verifiers",
     "reporter",
+    "worker_prompt",
 }
 _VERIFIER_SPEC_KEYS = {"name", "backend", "model", "prompt", "prompt_file"}
 _VERIFIER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -684,6 +686,11 @@ def _parse_analysis_config(
         raise ValueError(f"Phase '{phase_id}': analysis.continue_nudge must be a string when set")
     continue_nudge = raw_nudge
 
+    raw_worker_prompt = raw.get("worker_prompt", defaults.worker_prompt)
+    if not isinstance(raw_worker_prompt, str):
+        raise ValueError(f"Phase '{phase_id}': analysis.worker_prompt must be a string")
+    worker_prompt = raw_worker_prompt
+
     verifiers: list[VerifierSpec] = []
     if "verifiers" in raw:
         verifiers = _parse_verifier_specs(
@@ -728,6 +735,7 @@ def _parse_analysis_config(
         max_premature_completes=max_premature_completes,
         verifiers=verifiers,
         reporter=reporter,
+        worker_prompt=worker_prompt,
     )
 
 

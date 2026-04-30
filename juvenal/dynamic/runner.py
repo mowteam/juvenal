@@ -292,6 +292,10 @@ class DynamicAnalysisRunner:
         if self._reporter_spec is not None and self._reporter_spec.prompt:
             self._rendered_reporter_prompt = apply_vars(self._reporter_spec.prompt, self.workflow.vars)
 
+        self._rendered_worker_prompt: str = ""
+        if self.config.worker_prompt:
+            self._rendered_worker_prompt = apply_vars(self.config.worker_prompt, self.workflow.vars)
+
     def run(self) -> PhaseResult:
         """Run the dynamic analysis loop to completion or deterministic failure."""
 
@@ -614,16 +618,18 @@ class DynamicAnalysisRunner:
 
     def _run_captain_turn(self) -> None:
         summary_only = self.state.control.wrap_requested and self.state.control.wrap_summary_pending
-        prompt = self._build_captain_prompt(summary_only=summary_only)
+        system_prompt, user_prompt = self._build_captain_prompt(summary_only=summary_only)
         backend = self._get_backend(self.config.captain_backend)
         session_id = self.state.captain.session_id
         display_callback = self._captain_chunk_callback()
 
         captain_model = _resolve_model(self.config.captain_backend, "captain", self.config.captain_model)
         if session_id:
+            # Resume turns inherit the system prompt set at the original
+            # run_agent call; only the per-turn delta ships via stdin.
             result = backend.resume_agent(
                 session_id,
-                prompt,
+                user_prompt,
                 working_dir=str(self.working_dir),
                 display_callback=display_callback,
                 timeout=self.phase.timeout,
@@ -632,12 +638,13 @@ class DynamicAnalysisRunner:
             )
         else:
             result = backend.run_agent(
-                prompt,
+                user_prompt,
                 working_dir=str(self.working_dir),
                 display_callback=display_callback,
                 timeout=self.phase.timeout,
                 env=self._role_env("captain"),
                 model=captain_model,
+                system_prompt=system_prompt or None,
             )
 
         if result.session_id:
@@ -799,8 +806,8 @@ class DynamicAnalysisRunner:
         scheduled = False
         for target in queued_targets[:available]:
             attempt = self._start_worker_attempt(target)
-            prompt = self._build_worker_prompt(target, attempt)
-            future = self._worker_executor.submit(self._execute_worker_attempt, attempt, prompt)
+            system_prompt, user_prompt = self._build_worker_prompt(target, attempt)
+            future = self._worker_executor.submit(self._execute_worker_attempt, attempt, user_prompt, system_prompt)
             self._worker_futures[future] = attempt.attempt_id
             scheduled = True
 
@@ -817,8 +824,8 @@ class DynamicAnalysisRunner:
                 if self._is_target_ignored(target):
                     continue
                 attempt = self._start_claim_retry_attempt(target, claim)
-                prompt = self._build_claim_retry_prompt(target, claim, attempt)
-                future = self._worker_executor.submit(self._execute_worker_attempt, attempt, prompt)
+                system_prompt, user_prompt = self._build_claim_retry_prompt(target, claim, attempt)
+                future = self._worker_executor.submit(self._execute_worker_attempt, attempt, user_prompt, system_prompt)
                 self._worker_futures[future] = attempt.attempt_id
                 scheduled = True
 
@@ -911,8 +918,8 @@ class DynamicAnalysisRunner:
             verification.status = "running"
             verification.started_at = time.time()
             self.state.save()
-            prompt = self._build_verifier_prompt(target, claim, verification)
-            future = self._verifier_executor.submit(self._execute_verifier, verification, prompt)
+            system_prompt, user_prompt = self._build_verifier_prompt(target, claim, verification)
+            future = self._verifier_executor.submit(self._execute_verifier, verification, user_prompt, system_prompt)
             self._verifier_futures[future] = verification.verification_id
             scheduled = True
         return changed or scheduled
@@ -1485,7 +1492,15 @@ class DynamicAnalysisRunner:
         payload["rejection_reason"] = self._latest_rejection_reason(claim)
         return payload
 
-    def _build_captain_prompt(self, *, summary_only: bool = False) -> str:
+    def _build_captain_prompt(self, *, summary_only: bool = False) -> tuple[str, str]:
+        """Return (system_prompt, user_prompt) for the next captain call.
+
+        ``system_prompt`` is non-empty only on the first turn (when the runner
+        will call ``run_agent`` to start a new session). On subsequent turns
+        the runner calls ``resume_agent``, which inherits the system prompt
+        set at session creation; the returned system_prompt is empty in that
+        case and only the dynamic per-turn payload ships via ``user_prompt``.
+        """
         nudge = self._pending_continue_nudge
         self._pending_continue_nudge = ""
         post_chat = self._post_chat_reprime
@@ -1531,9 +1546,8 @@ class DynamicAnalysisRunner:
         )
 
         if is_first_turn:
-            prompt = (
-                f"{self._captain_role_prompt}\n\n"
-                f"Mission:\n{mission}\n\n"
+            system_prompt = f"{self._captain_role_prompt}\n\nMission:\n{mission}"
+            user_prompt = (
                 f"Repository root: {self.working_dir}\n"
                 f"Captain turn: 1\n"
                 f"Mode: {mode_note}\n\n"
@@ -1542,7 +1556,8 @@ class DynamicAnalysisRunner:
                 f"{json.dumps(pending_directives, indent=2)}\n"
             )
         else:
-            prompt = (
+            system_prompt = ""
+            user_prompt = (
                 f"Captain turn: {self.state.captain.turn_index + 1}\n"
                 f"Mode: {mode_note}\n\n"
                 f"{files_block}\n"
@@ -1554,9 +1569,9 @@ class DynamicAnalysisRunner:
             )
 
         if nudge and not summary_only:
-            prompt = f"{nudge}\n\n{prompt}"
+            user_prompt = f"{nudge}\n\n{user_prompt}"
         if post_chat and not summary_only:
-            prompt = (
+            user_prompt = (
                 "## Resuming from free-form chat\n\n"
                 "The user just had a free-form interactive conversation with you in their "
                 "terminal. Acknowledge any directions they gave you in `message_to_user`, "
@@ -1564,10 +1579,17 @@ class DynamicAnalysisRunner:
                 "include exactly one CAPTAIN_JSON block as defined in the role prompt. Do "
                 "not respond conversationally; the runner only consumes structured output "
                 "going forward.\n\n"
-            ) + prompt
-        return prompt
+            ) + user_prompt
+        return system_prompt, user_prompt
 
-    def _build_worker_prompt(self, target: TargetRecord, attempt: WorkerAttempt) -> str:
+    def _worker_system_prompt(self) -> str:
+        """Static system prompt for the worker: framework role + workflow scope."""
+        if self._rendered_worker_prompt:
+            return f"{self._worker_role_prompt}\n\n{self._rendered_worker_prompt}"
+        return self._worker_role_prompt
+
+    def _build_worker_prompt(self, target: TargetRecord, attempt: WorkerAttempt) -> tuple[str, str]:
+        """Return (system_prompt, user_prompt) for an initial worker call."""
         task_packet = {
             "task_id": attempt.attempt_id,
             "target_id": target.target_id,
@@ -1581,8 +1603,7 @@ class DynamicAnalysisRunner:
             "spawn_reason": target.spawn_reason,
             "allow_repo_tools": self.config.allow_repo_tools,
         }
-        return (
-            f"{self._worker_role_prompt}\n\n"
+        user_prompt = (
             f"Repository root: `{self.working_dir}`\n\n"
             "Task packet:\n"
             f"```text\n{json.dumps(task_packet, indent=2)}\n```\n\n"
@@ -1593,16 +1614,22 @@ class DynamicAnalysisRunner:
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
         )
+        return self._worker_system_prompt(), user_prompt
 
-    def _build_verifier_prompt(self, target: TargetRecord, claim: ClaimRecord, verification: VerificationRecord) -> str:
+    def _build_verifier_prompt(
+        self, target: TargetRecord, claim: ClaimRecord, verification: VerificationRecord
+    ) -> tuple[str, str]:
+        """Return (system_prompt, user_prompt) for one verifier call.
+
+        ``system_prompt`` carries the framework-level verifier role plus the
+        per-spec workflow scope (both static across the call). ``user_prompt``
+        carries the dynamic per-claim payload.
+        """
         packet = asdict(claim_to_verifier_packet(claim))
         mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         chain_length = len(self._verifier_chain)
         spec = self._verifier_chain[verification.verifier_index]
         rendered_scope = self._rendered_verifier_prompts.get(spec.name, "")
-        scope_block = ""
-        if rendered_scope:
-            scope_block = f"Specialized verifier scope:\n```text\n{rendered_scope}\n```\n\n"
 
         passed_names: list[str] = []
         for v_id in claim.verification_ids:
@@ -1622,9 +1649,10 @@ class DynamicAnalysisRunner:
             "earlier_verifiers_passed": passed_names,
             "next_verifier": next_name if next_name else "(none — final verifier)",
         }
-        return (
-            f"{self._verifier_role_prompt}\n\n"
-            f"{scope_block}"
+        system_prompt = self._verifier_role_prompt
+        if rendered_scope:
+            system_prompt = f"{system_prompt}\n\n{rendered_scope}"
+        user_prompt = (
             f"Repository root: `{self.working_dir}`\n\n"
             "Chain context:\n"
             f"```text\n{json.dumps(chain_context, indent=2)}\n```\n\n"
@@ -1639,15 +1667,23 @@ class DynamicAnalysisRunner:
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
         )
+        return system_prompt, user_prompt
 
-    def _execute_worker_attempt(self, attempt: WorkerAttempt, prompt: str) -> _WorkerExecutionResult:
+    def _execute_worker_attempt(
+        self,
+        attempt: WorkerAttempt,
+        prompt: str,
+        system_prompt: str | None = None,
+    ) -> _WorkerExecutionResult:
         backend = self._get_backend(self.config.worker_backend)
         worker_model = _resolve_model(self.config.worker_backend, "worker", self.config.worker_model)
         if attempt.parent_session_id:
             # Claim retry: resume the prior worker's session so its context
             # (codebase reading, build state, prior reasoning) carries over
             # and the rejection feedback arrives as a continuation rather
-            # than a cold restart.
+            # than a cold restart. The system prompt was set at the parent
+            # session's run_agent call and is inherited; we do not re-apply
+            # it here.
             result = backend.resume_agent(
                 attempt.parent_session_id,
                 prompt,
@@ -1663,6 +1699,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("worker"),
                 model=worker_model,
+                system_prompt=system_prompt,
             )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -1693,7 +1730,12 @@ class DynamicAnalysisRunner:
             error=None,
         )
 
-    def _execute_verifier(self, verification: VerificationRecord, prompt: str) -> _VerifierExecutionResult:
+    def _execute_verifier(
+        self,
+        verification: VerificationRecord,
+        prompt: str,
+        system_prompt: str | None = None,
+    ) -> _VerifierExecutionResult:
         backend = self._get_backend(verification.backend)
         spec = self._verifier_chain[verification.verifier_index]
         result = backend.run_agent(
@@ -1702,6 +1744,7 @@ class DynamicAnalysisRunner:
             timeout=self.phase.timeout,
             env=self._role_env("verifier", verifier_name=verification.verifier_name),
             model=_resolve_model(spec.backend, "verifier", spec.model),
+            system_prompt=system_prompt,
         )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -1744,7 +1787,14 @@ class DynamicAnalysisRunner:
     def _report_dir_for_claim(self, claim: ClaimRecord) -> Path:
         return self.working_dir / "output" / self._bug_id_for_claim(claim)
 
-    def _build_reporter_prompt(self, claim: ClaimRecord, target: TargetRecord) -> str:
+    def _build_reporter_prompt(self, claim: ClaimRecord, target: TargetRecord) -> tuple[str, str]:
+        """Return (system_prompt, user_prompt) for one reporter call.
+
+        ``system_prompt`` carries the framework reporter role plus the workflow
+        scope and the per-claim output directives (report_dir, bug_id). These
+        are constant across the single call; the dynamic claim/artifact data
+        ships via ``user_prompt``.
+        """
         bug_id = self._bug_id_for_claim(claim)
         report_dir = self._report_dir_for_claim(claim)
         # Collect every passing verifier's structured output for the agent's reference.
@@ -1767,15 +1817,12 @@ class DynamicAnalysisRunner:
         packet = asdict(claim_to_verifier_packet(claim))
         worker_artifact = self.state.worker_artifacts.get(claim.audit_artifact_id)
         artifact_payload = asdict(worker_artifact) if worker_artifact is not None else None
-        scope_block = ""
-        if self._rendered_reporter_prompt:
-            scope_block = f"Specialized reporter scope:\n```text\n{self._rendered_reporter_prompt}\n```\n\n"
-        return (
+
+        system_prompt = (
             "You are the reporter agent for Juvenal's dynamic `analysis` phase.\n"
             "A claim has passed every verifier in the chain. Your job is to write a "
             "human-readable per-bug report and copy/include any PoC artifacts so the "
             "finding is durably captured on disk.\n\n"
-            f"{scope_block}"
             f"Repository root: `{self.working_dir}`\n"
             f"Report directory (you MUST create this and write into it): `{report_dir}`\n"
             f"Bug id: `{bug_id}`\n\n"
@@ -1796,7 +1843,12 @@ class DynamicAnalysisRunner:
             "Do NOT write outside the report directory except for transient working files. "
             "Do NOT modify project source. After writing, exit cleanly. No structured-output "
             "block is expected from you — the runner verifies success by checking that "
-            f"`{report_dir}/report.md` exists.\n\n"
+            f"`{report_dir}/report.md` exists."
+        )
+        if self._rendered_reporter_prompt:
+            system_prompt = f"{system_prompt}\n\n{self._rendered_reporter_prompt}"
+
+        user_prompt = (
             "Claim packet:\n"
             f"```text\n{json.dumps(packet, indent=2)}\n```\n\n"
             "Worker artifact (reasoning, trace, commands):\n"
@@ -1808,6 +1860,7 @@ class DynamicAnalysisRunner:
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
         )
+        return system_prompt, user_prompt
 
     def _schedule_reporters(self) -> bool:
         """Submit reporter agent runs for any verified-but-not-reported claims."""
@@ -1840,8 +1893,8 @@ class DynamicAnalysisRunner:
             if attempts >= _MAX_REPORTER_ATTEMPTS:
                 # Give up for this run; leave reported_at unset so resume can try again.
                 continue
-            prompt = self._build_reporter_prompt(claim, target)
-            future = self._reporter_executor.submit(self._execute_reporter, claim, prompt)
+            system_prompt, user_prompt = self._build_reporter_prompt(claim, target)
+            future = self._reporter_executor.submit(self._execute_reporter, claim, user_prompt, system_prompt)
             self._reporter_futures[future] = claim_id
             self._reporter_attempts[claim_id] = attempts + 1
             available -= 1
@@ -1850,7 +1903,12 @@ class DynamicAnalysisRunner:
         self._pending_reporter_claim_ids = remaining
         return scheduled
 
-    def _execute_reporter(self, claim: ClaimRecord, prompt: str) -> _ReporterExecutionResult:
+    def _execute_reporter(
+        self,
+        claim: ClaimRecord,
+        prompt: str,
+        system_prompt: str | None = None,
+    ) -> _ReporterExecutionResult:
         spec_backend = self._reporter_spec.backend if self._reporter_spec else "claude"
         spec_model = self._reporter_spec.model if self._reporter_spec else None
         backend = self._get_backend(spec_backend)
@@ -1860,6 +1918,7 @@ class DynamicAnalysisRunner:
             timeout=self.phase.timeout,
             env=self._role_env("reporter"),
             model=_resolve_model(spec_backend, "reporter", spec_model),
+            system_prompt=system_prompt,
         )
         if result.exit_code != 0:
             return _ReporterExecutionResult(
@@ -2329,8 +2388,17 @@ class DynamicAnalysisRunner:
         self.state.save()
         return attempt
 
-    def _build_claim_retry_prompt(self, target: TargetRecord, claim: ClaimRecord, attempt: WorkerAttempt) -> str:
-        """Build a worker prompt scoped to re-investigating a single rejected claim."""
+    def _build_claim_retry_prompt(
+        self, target: TargetRecord, claim: ClaimRecord, attempt: WorkerAttempt
+    ) -> tuple[str, str]:
+        """Build a worker prompt scoped to re-investigating a single rejected claim.
+
+        Returns (system_prompt, user_prompt). The system prompt is the same as
+        for an initial worker call (framework role + workflow worker scope) so
+        that fresh-session retries (no parent_session_id) still anchor the
+        worker's identity. Resume-based retries inherit the system prompt set
+        at the parent session and the executor will not re-apply it.
+        """
         rejection_reason = self._latest_rejection_reason(claim) or "No specific reason provided."
         rejection_chain = self._get_rejection_chain(claim)
         latest_verification = self._latest_rejection_verification(claim)
@@ -2363,8 +2431,7 @@ class DynamicAnalysisRunner:
             "retry_attempt": claim.retry_count + 1,
             "max_retries": self.config.max_worker_retries,
         }
-        return (
-            f"{self._worker_role_prompt}\n\n"
+        user_prompt = (
             f"Repository root: `{self.working_dir}`\n\n"
             "## CLAIM RETRY MODE — VERIFIER CHALLENGE\n\n"
             f"Your previous claim was REJECTED by the **{failing_verifier_name}** verifier "
@@ -2403,6 +2470,7 @@ class DynamicAnalysisRunner:
             '- If after honest re-examination the claim was genuinely false, report outcome: "no_findings"\n'
             "- Use the same WORKER_JSON_BEGIN/END output format\n"
         )
+        return self._worker_system_prompt(), user_prompt
 
     def _normalize_captain_targets(self, turn: CaptainTurn) -> list[TargetRecord]:
         now = time.time()

@@ -110,6 +110,10 @@ class MockBackend(Backend):
         self.model_calls: list[tuple[str | None, str | None]] = []
         # Records every (role, chunk_text) pair sent through a display_callback.
         self.chunk_calls: list[tuple[str | None, str]] = []
+        # Each run_agent call records (role, system_prompt) so tests can assert
+        # the system-prompt routing. resume_agent calls don't capture this
+        # (system prompt is fixed at session creation).
+        self.system_prompt_calls: list[tuple[str | None, str | None]] = []
 
     def add_role_chunks(self, role: str, chunks: list[str]) -> None:
         """Queue a list of streaming chunks delivered to the next display_callback
@@ -237,11 +241,14 @@ class MockBackend(Backend):
             except Exception:
                 pass
 
-    def run_agent(self, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
+    def run_agent(
+        self, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None, system_prompt=None
+    ):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
         self.role_calls.append((role, prompt))
         self.model_calls.append((role, model))
+        self.system_prompt_calls.append((role, system_prompt))
         self._consume_side_effect(role, prompt, env)
         self._emit_chunks(role, display_callback)
         return self._next_result(role)
