@@ -247,7 +247,8 @@ phases:
         - **Not redesigns.** If the fix would be "add authentication to layer
           X", "change protocol semantics", or "the spec should define Y", the
           report is a design critique. The implementation is doing what the
-          spec says.
+          spec — or, when no formal spec exists, the conventional design of
+          this kind of system — says.
         - **Real attack surface required.** Attacker input must reach the sink
           through an interface real attackers have — network packet, file,
           IPC, untrusted peripheral input. Calling private functions directly,
@@ -259,6 +260,39 @@ phases:
 
         Frame claims around the trust contract violated or the guard a real
         attacker bypasses, not around what your PoC manages to crash.
+
+        ## Spec-authority self-check (run before submitting non-memory-safety claims)
+
+        Most bug-bounty pipelines drown in within-trust-model claims —
+        peer-A spoofs peer-B when both hold the same credential, or "this
+        handler should authenticate the sender" on a protocol where the
+        spec/standard does not require sender authentication at that
+        layer. Before submitting, answer all four:
+
+        1. **What authority am I claiming the implementation should
+           enforce?** State it concretely ("sender must be the leader",
+           "TLV-claimed identity must equal CoAP source RLOC", etc.).
+        2. **Where does that authority requirement come from?** Acceptable
+           sources, in order: (a) an explicit spec / RFC / standard
+           sentence; (b) widely-known semantics of a named algorithm or
+           protocol the project implements (e.g. "TLS gives the server,
+           not the client, the certificate private key" — no spec quote
+           needed); (c) the project's own documented threat model /
+           SECURITY.md / inline comments. If your only source is "the
+           sibling handler does enforce this", you are doing **asymmetry
+           reasoning** — drop the claim.
+        3. **Is my impact narrative the only thing distinguishing this
+           from `within-trust-model`?** If yes — drop it. Dramatic impact
+           (KEK overwrite, eviction, cache poison) inside a credential
+           the attacker already holds is the protocol working as
+           designed.
+        4. **Would the maintainer's fix introduce a NEW authority
+           requirement** (gate the handler on sender role, add a
+           signature, restrict to leader)? That is a redesign; drop.
+
+        Memory safety bypasses this check entirely. Reachable
+        OOB/UAF/double-free on production code is in scope regardless
+        of attacker role.
 
         ## Bias toward memory safety and sanitizer output
 
@@ -380,9 +414,18 @@ phases:
 
             Many security reports for protocol stacks present design /
             spec critiques as vulnerabilities. Each tell on its own is
-            weak; **two or more in the same report → strong default
-            toward `within-trust-model`, regardless of severity label
-            or PoC quality.**
+            weak; **two or more in the same report → REJECT as
+            `within-trust-model` UNLESS the report supplies an explicit
+            spec / RFC / standard citation, OR a widely-known semantic
+            of the named algorithm or protocol the project implements,
+            that assigns the disputed authority to a NARROWER role than
+            the attacker holds.** Override of this default requires you
+            to quote that source verbatim in `summary` (or paraphrase it
+            tightly for well-known protocol semantics, naming the
+            protocol and the property). "The sibling handler enforces
+            X" is asymmetry reasoning, not a citation. "Intended
+            semantics" inferred from the legitimate-sender code path is
+            not a citation.
 
             1. **Attacker framing.** "Any joined / authenticated /
                credentialed [role] can ...", "Any device in possession
@@ -413,14 +456,47 @@ phases:
                device". One credential-holder disrupting another with
                the same credential is the model working as designed.
 
+            **Partial-fire override.** If any tells fire and you intend
+            to PASS, you MUST enumerate each tell that fired and state
+            which signal rebuts it. **"Impact exceeds role contract" is
+            NOT a valid rebuttal of tells 1, 2, 3, or 6** — those tells
+            fire precisely when within-trust-model attackers cause
+            dramatic impact. A valid rebuttal looks like: "spec section
+            X requires sender to be the leader, code path Y does not
+            check this" (rebuts 2, 5) or "asymmetry is intentional per
+            comment at file:line stating the alternate handler is
+            internal-only" (rebuts 4).
+
+            **Impact-narrative trap.** Workers will frame
+            within-trust-model bugs by maximizing impact ("KEK
+            overwrite", "PSKc disclosure", "router eviction", "cache
+            poisoning"). Dramatic impact is NOT evidence of bug class.
+            A spec-authorized message producing dramatic state changes
+            is the protocol working. Generalized within-trust-model
+            patterns to reject:
+
+            - "Any [authenticated peer / joined router /
+              credential-holder / cluster member] can spoof /
+              impersonate / evict / register-on-behalf-of /
+              poison-cache-of any other peer holding the same
+              credential" — and the spec does not assign a narrower role
+              for the operation.
+            - "Handler X should verify that the TLV-claimed identity
+              equals the transport source identity" — when no spec or
+              well-known protocol property requires that binding.
+            - "The attacker (already inside trust boundary B) achieves
+              dramatic effect E inside B" — when E is a documented or
+              conventional capability of role-inside-B.
+
             **Counter-pattern (what real bugs look like):** anonymous
             attacker below the trust boundary; cited code diverges from
-            spec; localized fix without spec change; impact exceeds the
-            role's contract (RCE, key extraction, cross-boundary
-            privilege escalation, secret disclosure); memory safety on
-            the production code path (memory-safety bugs default-pass
-            even when the attacker is privileged — they are not bound
-            to the trust-model conversation).
+            spec or from well-known semantics of the protocol/algorithm
+            the project implements; localized fix without spec change;
+            impact exceeds the role's contract (RCE, key extraction,
+            cross-boundary privilege escalation, secret disclosure);
+            memory safety on the production code path (memory-safety
+            bugs default-pass even when the attacker is privileged —
+            they are not bound to the trust-model conversation).
 
             ### Implicit trust models — apply general reasoning
 
@@ -568,6 +644,23 @@ phases:
                itself constitute crossing the documented trust boundary.
                If it does, the bug demonstrates behavior the model does
                not already grant.
+            5. **Spec-authority criterion (non-memory-safety bugs only).**
+               If the bug class is "missing source-authority binding",
+               "TLV-claimed identity not bound to sender", "spoof of one
+               peer by another peer holding the same credential", or
+               another shape where the implied fix introduces an
+               authority requirement, you must cite a source that
+               assigns the disputed authority to a NARROWER role than
+               the attacker holds. Acceptable sources: (a) explicit spec
+               / RFC / standard sentence; (b) widely-known semantic of
+               the named algorithm or protocol the project implements
+               (e.g. "TLS gives the server, not the client, the
+               certificate private key"); (c) the project's own
+               documented threat model / SECURITY.md / inline comment.
+               Asymmetry with sibling code, "intended semantics"
+               inferred from the legitimate-sender path, and impact
+               narrative are NOT acceptable sources. Memory-safety bugs
+               are exempt from this criterion.
 
             ### What's out of scope for THIS verifier
 
@@ -650,7 +743,21 @@ phases:
               non-shipping configuration, or injecting input through an
               internal API with no path from the documented attack
               surface. The crash is real; the attacker's path to it is
-              not.
+              not. **In-tree simulator / emulator harnesses** (Nexus,
+              ns-3 wrappers, host-side network simulators, in-tree
+              fuzz-driven multi-node setups) are NOT automatic passes
+              even though they link the project's real source. Reject
+              when the simulator setup pre-installs the credentials
+              that mediate the documented or conventional trust
+              boundary — for example, setup code that joins the attacker
+              as an authenticated peer, installs the network/cluster
+              key, pre-registers the attacker as commissioned, or
+              otherwise hands the attacker its starting position. The
+              PoC must either demonstrate the attacker ACQUIRING that
+              credential through a real attack path, OR the report must
+              establish that holding the credential is BELOW the trust
+              boundary the bug attacks. Otherwise the simulator setup
+              is the attack, not a witness to it.
             - **`poc-doesnt-reproduce`** — PoC won't build, won't run,
               or runs and does not produce the alleged effect. Cite the
               build error, runtime failure, or observed-vs-expected
@@ -785,9 +892,21 @@ phases:
             {{ BOUNTY_SCOPE }}
             ```
 
+            **Empty / blank scope handling.** If the bounty scope document
+            above renders blank, "(none)", whitespace-only, or otherwise
+            unspecified, treat the run as having NO explicit scope. In that
+            mode, apply the conservative default exclusions below: vendored
+            third-party code, test/example/fixture code, build / CI / devnet
+            tooling, debug-only flags, host-local-attacker file-system writes
+            on production-mode services, and anything outside the project's
+            documented user-facing API. Reject anything that lands in the
+            default-excluded buckets with `scope-too-broad` and tell the user
+            to populate `BOUNTY_SCOPE` for finer control.
+
             Pass criteria (ALL must hold):
             1. The cited code is in a component, package, or path that the bounty
-               scope document declares in-scope.
+               scope document declares in-scope (or, in the empty-scope mode
+               above, is not in a default-excluded bucket).
             2. The bug is triggerable by a realistic attacker. Real attack surface
                means: public-facing API, network handler, file-format parser
                consuming attacker-controlled files, IPC handler, environment
@@ -797,6 +916,14 @@ phases:
                (test code, build tooling, vendored third-party libraries, CI/devnet
                configuration, debug-only flags, etc., unless the scope overrides
                those defaults).
+            4. **Trust-model assumption check.** Identify the conventional trust
+               model of the system class the project belongs to (LAN protocol /
+               shared-credential mesh / coprocessor link / IPC / public web API /
+               etc.). State whether the bug attacks WITHIN that conventional model
+               or breaks OUT of it. If within and the project does not commit to
+               a stronger model, reject with `precondition-not-met` — even if
+               `attack-surface` already passed, surface the concern via
+               `follow_up_action` so the captain can see the disagreement.
 
             Reject criteria — pick the most accurate `rejection_class`:
             - In a path/component the scope explicitly excludes: `scope-too-broad`.
