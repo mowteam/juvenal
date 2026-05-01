@@ -156,10 +156,10 @@ phases:
       **Output:** brief bug description in `output/<bug-name>.md`; PoC artifact in
       `output/<bug-name>-poc`.
     analysis:
-      # Models default per role: claude → opus 4.7 1M for captain/worker,
-      # sonnet 4.6 for verifier/reporter; codex → CLI default.
-      # Override with `captain_model`, `worker_model`, `verifier_model`, or a
-      # per-spec `model:` field if needed.
+      # Models default per role: claude → captain opus 4.7 1M, worker opus 4.7
+      # (200K), verifier opus 4.6 (200K), reporter sonnet 4.6; codex → CLI
+      # default. Override with `captain_model`, `worker_model`,
+      # `verifier_model`, or a per-spec `model:` field if needed.
       captain_backend: claude
       worker_backend: claude
       # Shared budget: 12 total parallel agents drawn from one pool, with
@@ -168,7 +168,7 @@ phases:
       # become visible to the captain (and to variant-analysis fanout) faster
       # than under the legacy independent-pool design.
       shared_agent_budget: true
-      max_agents: 8
+      max_agents: 16
       # max_workers / max_verifiers are unused under shared_agent_budget: true.
       # Set shared_agent_budget: false (and uncomment below) to fall back to
       # legacy independent pools.

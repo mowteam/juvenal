@@ -1144,12 +1144,12 @@ def test_print_status_renders_chain_and_reporter(tmp_path):
 
 
 def test_resolve_model_defaults():
-    """Claude gets opus 4.7 1M for captain/worker, sonnet 4.6 for verifier/reporter; Codex stays None."""
+    """Captain opus 4.7 1M, worker opus 4.7 (200K), verifier opus 4.6 (200K), reporter sonnet 4.6; Codex None."""
     from juvenal.dynamic.runner import _resolve_model
 
     assert _resolve_model("claude", "captain", None) == "claude-opus-4-7[1m]"
-    assert _resolve_model("claude", "worker", None) == "claude-opus-4-7[1m]"
-    assert _resolve_model("claude", "verifier", None) == "claude-sonnet-4-6"
+    assert _resolve_model("claude", "worker", None) == "claude-opus-4-7"
+    assert _resolve_model("claude", "verifier", None) == "claude-opus-4-6"
     assert _resolve_model("claude", "reporter", None) == "claude-sonnet-4-6"
     assert _resolve_model("codex", "captain", None) is None
     assert _resolve_model("codex", "verifier", None) is None
@@ -1185,8 +1185,8 @@ def test_default_models_used_when_yaml_omits_them(tmp_path):
     reporter_models = [m for r, m in backend.model_calls if r == "reporter"]
 
     assert captain_models and all(m == "claude-opus-4-7[1m]" for m in captain_models)
-    assert worker_models and all(m == "claude-opus-4-7[1m]" for m in worker_models)
-    assert verifier_models and all(m == "claude-sonnet-4-6" for m in verifier_models)
+    assert worker_models and all(m == "claude-opus-4-7" for m in worker_models)
+    assert verifier_models and all(m == "claude-opus-4-6" for m in verifier_models)
     assert reporter_models and all(m == "claude-sonnet-4-6" for m in reporter_models)
 
 
@@ -1206,16 +1206,18 @@ def test_yaml_overrides_take_precedence(tmp_path):
         output=_captain_output(termination_state="complete", termination_reason="Done."),
     )
 
-    # Override at every layer.
+    # Override at every layer. Specs without an explicit `model` fall back to
+    # the role default (`claude-opus-4-6` for verifiers); the YAML parser is
+    # what propagates `verifier_model` onto specs, so direct construction hits
+    # the default unless the spec sets `model` itself.
     config = AnalysisConfig(
         max_workers=1,
         max_verifiers=1,
         max_worker_retries=1,
         captain_model="claude-opus-4-7",  # captain override
         worker_model="claude-opus-4-7",  # worker override
-        verifier_model="claude-sonnet-4-6",  # default for verifiers
         verifiers=[
-            VerifierSpec(name="poc", backend="claude", prompt="x"),  # inherits verifier_model
+            VerifierSpec(name="poc", backend="claude", prompt="x"),  # falls back to default
             VerifierSpec(name="scope", backend="claude", model="claude-haiku-4-5-20251001", prompt="x"),
             VerifierSpec(name="novelty", backend="claude", prompt="x"),
         ],
@@ -1232,9 +1234,9 @@ def test_yaml_overrides_take_precedence(tmp_path):
 
     assert all(m == "claude-opus-4-7" for m in captain)
     assert all(m == "claude-opus-4-7" for m in worker)
-    assert all(m == "claude-sonnet-4-6" for m in poc)  # inherits verifier_model
+    assert all(m == "claude-opus-4-6" for m in poc)  # role default
     assert all(m == "claude-haiku-4-5-20251001" for m in scope)  # per-spec override
-    assert all(m == "claude-sonnet-4-6" for m in novelty)
+    assert all(m == "claude-opus-4-6" for m in novelty)  # role default
     assert all(m == "claude-haiku-4-5-20251001" for m in reporter)
 
 

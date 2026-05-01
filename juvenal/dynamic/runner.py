@@ -118,15 +118,19 @@ _DEFAULT_CONTINUE_NUDGE = (
 
 # Per-backend, per-role default model. When the YAML does not specify a model
 # (and no role-level override is set), this picks the right tier so users
-# don't have to write model identifiers in every workflow. Captain and worker
-# get the strongest tier (long context, high reasoning); verifier and reporter
-# get a faster/cheaper tier since their tasks are more bounded. Codex uses
-# whatever the CLI defaults to — we don't pick a model on its behalf.
+# don't have to write model identifiers in every workflow. Captain gets opus
+# 4.7 with the 1M-context beta because it carries the longest accumulated
+# state; worker also runs opus 4.7 but on the default 200K context (no `[1m]`
+# suffix) to keep input-token cost down per attempt. Verifier runs opus 4.6
+# (200K) because the task — adversarial scrutiny of a single claim packet —
+# rewards reasoning capacity over speed. Reporter stays on sonnet 4.6 for
+# fast, low-cost report writing. Codex uses whatever the CLI defaults to —
+# we don't pick a model on its behalf.
 _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
     "claude": {
         "captain": "claude-opus-4-7[1m]",
-        "worker": "claude-opus-4-7[1m]",
-        "verifier": "claude-sonnet-4-6",
+        "worker": "claude-opus-4-7",
+        "verifier": "claude-opus-4-6",
         "reporter": "claude-sonnet-4-6",
     },
     "codex": {
