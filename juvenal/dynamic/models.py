@@ -169,6 +169,9 @@ class ClaimRecord:
     retry_claim_ids: list[str] = field(default_factory=list)
     failing_verifier_name: str | None = None
     reported_at: float | None = None
+    # Reporter session id, persisted so a reporter that crashed mid-call (rate
+    # limit, Ctrl-C) is resumed on the next retry rather than cold-restarted.
+    reporter_session_id: str | None = None
 
 
 @dataclass
@@ -218,6 +221,10 @@ class VerificationRecord:
     follow_up_strategy: str | None = None
     verifier_name: str = ""
     verifier_index: int = 0
+    # If set, the verifier executor resumes this Claude session instead of
+    # starting fresh — used to recover a verifier that crashed mid-call (rate
+    # limit, Ctrl-C) without paying the full prompt-replay cost again.
+    parent_session_id: str | None = None
 
 
 @dataclass

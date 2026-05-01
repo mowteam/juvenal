@@ -1360,3 +1360,80 @@ def test_initial_worker_attempt_does_not_resume(tmp_path):
     )
     initial_attempts = [a for a in state.worker_attempts.values() if a.retry_claim_id is None]
     assert initial_attempts and initial_attempts[0].parent_session_id is None
+    # Pre-allocated session id is persisted to state before the subprocess streams
+    # so a Ctrl-C / rate-limit kill mid-call leaves a recoverable id behind.
+    assert initial_attempts[0].session_id is not None
+
+
+def test_initial_worker_failure_seeds_resume_for_retry(tmp_path):
+    """When an initial worker crashes (not a claim retry), the next attempt resumes its session."""
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(enqueue_targets=[_target("target-1")]))
+    # First initial-worker call crashes (non-zero exit) — but its session_id is recorded.
+    backend.add_role_response("worker", exit_code=1, output="boom", session_id="worker-session-1")
+    backend.add_role_response("captain", output=_captain_output(termination_reason="Retry pending."))
+    # Re-queued initial-worker call returns no_findings cleanly.
+    backend.add_role_response(
+        "worker",
+        output=_no_findings_output("target-1-g1-attempt-2", "target-1"),
+        session_id="worker-session-1",
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    result, state, _ = _run_runner(tmp_path, backend, config=_three_verifier_config())
+
+    assert result.success is True
+    # The second initial-worker attempt landed on resume_agent with the prior session id.
+    resumed_session_ids = [sid for sid, _prompt in backend.resume_calls]
+    assert "worker-session-1" in resumed_session_ids
+    # And the new attempt's parent_session_id field reflects the inheritance.
+    initial_attempts = sorted(
+        [a for a in state.worker_attempts.values() if a.retry_claim_id is None],
+        key=lambda a: a.started_at or 0.0,
+    )
+    assert len(initial_attempts) == 2
+    assert initial_attempts[1].parent_session_id == "worker-session-1"
+
+
+def test_verifier_error_retry_resumes_session(tmp_path):
+    """When a verifier crashes mid-call, the retry resumes the same Claude session."""
+    backend = MockBackend()
+    backend.add_role_response("captain", output=_captain_output(enqueue_targets=[_target("target-1")]))
+    backend.add_role_response("worker", output=_claim_output("target-1-g1-attempt-1", "target-1"))
+    # First verifier call crashes — its session id is recorded on the verification.
+    backend.add_role_response("verifier:poc", exit_code=1, output="boom", session_id="verifier-session-1")
+    backend.add_role_response("captain", output=_captain_output(termination_reason="Retry pending."))
+    # Retry verifier passes.
+    backend.add_role_response(
+        "verifier:poc",
+        output=_verification_output("target-1-g1-claim-c1", "target-1", disposition="verified"),
+    )
+    backend.add_role_response(
+        "verifier:scope",
+        output=_verification_output("target-1-g1-claim-c1", "target-1", disposition="verified"),
+    )
+    backend.add_role_response(
+        "verifier:novelty",
+        output=_verification_output("target-1-g1-claim-c1", "target-1", disposition="verified"),
+    )
+    backend.add_role_response(
+        "captain",
+        output=_captain_output(termination_state="complete", termination_reason="Done."),
+    )
+
+    result, state, _ = _run_runner(tmp_path, backend, config=_three_verifier_config())
+
+    assert result.success is True
+    # The retry verifier call landed on resume_agent with the prior session id.
+    resumed_session_ids = [sid for sid, _prompt in backend.resume_calls]
+    assert "verifier-session-1" in resumed_session_ids
+    # And the retry VerificationRecord's parent_session_id reflects the inheritance.
+    poc_verifications = sorted(
+        [v for v in state.verifications.values() if v.verifier_name == "poc"],
+        key=lambda v: v.verification_id,
+    )
+    assert len(poc_verifications) == 2
+    assert poc_verifications[1].parent_session_id == "verifier-session-1"

@@ -85,6 +85,7 @@ class Backend(ABC):
         env: dict[str, str] | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> AgentResult:
         """Run an agent with the given prompt. Returns AgentResult.
 
@@ -97,6 +98,12 @@ class Backend(ABC):
         ``.juvenal/prompts/<session_id>.md`` and passes ``--append-system-prompt-file``.
         ``prompt`` (the user message via stdin) carries only dynamic per-call
         content. Backends that don't support a separate system prompt may ignore
+        this argument.
+
+        ``session_id`` lets the caller pre-allocate the session id so it can be
+        persisted to state before the subprocess starts streaming, surviving a
+        Ctrl-C or crash mid-call. When ``None`` the backend generates one.
+        Backends that don't accept an externally chosen session id may ignore
         this argument.
         """
         ...
@@ -200,8 +207,10 @@ class ClaudeBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> AgentResult:
-        session_id = str(uuid.uuid4())
+        if session_id is None:
+            session_id = str(uuid.uuid4())
         cmd = [
             "claude",
             "-p",
@@ -430,7 +439,11 @@ class CodexBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> AgentResult:
+        # Codex assigns its own thread_id post-hoc; the externally chosen
+        # session_id parameter is accepted for interface parity and ignored.
+        del session_id
         # Codex does not currently expose a separate system-prompt slot; if a
         # caller passes one, fold it into the user message so the content is
         # not silently dropped.

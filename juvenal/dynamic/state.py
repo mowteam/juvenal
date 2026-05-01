@@ -219,7 +219,11 @@ class DynamicSessionState:
                 if verification.status != "running":
                     continue
                 verification.status = "pending"
-                verification.session_id = None
+                # Preserve the session id and route the next attempt through
+                # resume_agent so the verifier picks up where the interrupted
+                # call left off rather than cold-restarting.
+                if verification.session_id and not verification.parent_session_id:
+                    verification.parent_session_id = verification.session_id
                 verification.started_at = None
                 verification.completed_at = None
                 verification.error = "requeued-after-interrupted-verification"

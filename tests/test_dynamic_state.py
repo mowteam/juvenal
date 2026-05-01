@@ -248,7 +248,10 @@ def test_resume_normalization_rewrites_running_verifications_to_pending(tmp_path
 
     verification = loaded.verifications["verify-1"]
     assert verification.status == "pending"
-    assert verification.session_id is None
+    # Session id is preserved and routed through parent_session_id so the
+    # next verifier attempt resumes that Claude session via resume_agent.
+    assert verification.session_id == "verify-session"
+    assert verification.parent_session_id == "verify-session"
     assert verification.started_at is None
     assert verification.completed_at is None
     assert verification.disposition is None

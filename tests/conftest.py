@@ -242,7 +242,15 @@ class MockBackend(Backend):
                 pass
 
     def run_agent(
-        self, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None, system_prompt=None
+        self,
+        prompt,
+        working_dir,
+        display_callback=None,
+        timeout=None,
+        env=None,
+        model=None,
+        system_prompt=None,
+        session_id=None,
     ):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
@@ -251,7 +259,10 @@ class MockBackend(Backend):
         self.system_prompt_calls.append((role, system_prompt))
         self._consume_side_effect(role, prompt, env)
         self._emit_chunks(role, display_callback)
-        return self._next_result(role)
+        result = self._next_result(role)
+        if session_id is not None and result.session_id is None:
+            result.session_id = session_id
+        return result
 
     def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
         role = self._detect_role(prompt, env)

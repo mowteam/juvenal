@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -876,7 +877,7 @@ class DynamicAnalysisRunner:
                 generation=claim.generation,
                 backend=spec.backend,
                 verifier_role="analysis-verifier",
-                session_id=None,
+                session_id=str(uuid.uuid4()),
                 status="pending",
                 disposition=None,
                 reason="",
@@ -1709,6 +1710,7 @@ class DynamicAnalysisRunner:
                 env=self._role_env("worker"),
                 model=worker_model,
                 system_prompt=system_prompt,
+                session_id=attempt.session_id,
             )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -1747,14 +1749,25 @@ class DynamicAnalysisRunner:
     ) -> _VerifierExecutionResult:
         backend = self._get_backend(verification.backend)
         spec = self._verifier_chain[verification.verifier_index]
-        result = backend.run_agent(
-            prompt,
-            working_dir=str(self.working_dir),
-            timeout=self.phase.timeout,
-            env=self._role_env("verifier", verifier_name=verification.verifier_name),
-            model=_resolve_model(spec.backend, "verifier", spec.model),
-            system_prompt=system_prompt,
-        )
+        if verification.parent_session_id:
+            result = backend.resume_agent(
+                verification.parent_session_id,
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("verifier", verifier_name=verification.verifier_name),
+                model=_resolve_model(spec.backend, "verifier", spec.model),
+            )
+        else:
+            result = backend.run_agent(
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("verifier", verifier_name=verification.verifier_name),
+                model=_resolve_model(spec.backend, "verifier", spec.model),
+                system_prompt=system_prompt,
+                session_id=verification.session_id,
+            )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
                 verification_id=verification.verification_id,
@@ -1906,8 +1919,19 @@ class DynamicAnalysisRunner:
             if attempts >= _MAX_REPORTER_ATTEMPTS:
                 # Give up for this run; leave reported_at unset so resume can try again.
                 continue
+            # Pre-allocate the reporter session id so a Ctrl-C / rate-limit
+            # crash mid-call leaves a recoverable id on the claim. If the id
+            # is already set on entry, this scheduling call is either an
+            # in-process retry or a resume after a prior killed run — both
+            # need resume_agent to continue the existing session.
+            if claim.reporter_session_id:
+                is_retry = True
+            else:
+                claim.reporter_session_id = str(uuid.uuid4())
+                self.state.save()
+                is_retry = False
             system_prompt, user_prompt = self._build_reporter_prompt(claim, target)
-            future = self._reporter_executor.submit(self._execute_reporter, claim, user_prompt, system_prompt)
+            future = self._reporter_executor.submit(self._execute_reporter, claim, user_prompt, system_prompt, is_retry)
             self._reporter_futures[future] = claim_id
             self._reporter_attempts[claim_id] = attempts + 1
             available -= 1
@@ -1921,18 +1945,30 @@ class DynamicAnalysisRunner:
         claim: ClaimRecord,
         prompt: str,
         system_prompt: str | None = None,
+        is_retry: bool = False,
     ) -> _ReporterExecutionResult:
         spec_backend = self._reporter_spec.backend if self._reporter_spec else "claude"
         spec_model = self._reporter_spec.model if self._reporter_spec else None
         backend = self._get_backend(spec_backend)
-        result = backend.run_agent(
-            prompt,
-            working_dir=str(self.working_dir),
-            timeout=self.phase.timeout,
-            env=self._role_env("reporter"),
-            model=_resolve_model(spec_backend, "reporter", spec_model),
-            system_prompt=system_prompt,
-        )
+        if is_retry and claim.reporter_session_id:
+            result = backend.resume_agent(
+                claim.reporter_session_id,
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("reporter"),
+                model=_resolve_model(spec_backend, "reporter", spec_model),
+            )
+        else:
+            result = backend.run_agent(
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("reporter"),
+                model=_resolve_model(spec_backend, "reporter", spec_model),
+                system_prompt=system_prompt,
+                session_id=claim.reporter_session_id,
+            )
         if result.exit_code != 0:
             return _ReporterExecutionResult(
                 claim_id=claim.claim_id,
@@ -2338,15 +2374,34 @@ class DynamicAnalysisRunner:
 
     def _start_worker_attempt(self, target: TargetRecord) -> WorkerAttempt:
         generation = target.active_generation or target.generation or 1
+        # If a prior initial-worker attempt on this target+generation crashed
+        # (rate-limit, Ctrl-C mid-stream, malformed output), inherit its session
+        # so the new attempt resumes that conversation rather than cold-starting.
+        # Only initial attempts are considered here — claim-retry attempts have
+        # their own resume path in _start_claim_retry_attempt.
+        parent_session_id: str | None = None
+        prior = [
+            a
+            for a in self.state.worker_attempts.values()
+            if a.target_id == target.target_id
+            and a.generation == generation
+            and a.retry_claim_id is None
+            and a.status == "failed"
+            and a.session_id
+        ]
+        if prior:
+            most_recent = max(prior, key=lambda a: a.started_at or 0.0)
+            parent_session_id = most_recent.session_id
         attempt = WorkerAttempt(
             attempt_id=self._next_attempt_id(target.target_id, generation),
             target_id=target.target_id,
             generation=generation,
             backend=self.config.worker_backend,
-            session_id=None,
+            session_id=str(uuid.uuid4()) if parent_session_id is None else parent_session_id,
             status="running",
             started_at=time.time(),
             completed_at=None,
+            parent_session_id=parent_session_id,
         )
         target.status = "running"
         target.active_attempt_id = attempt.attempt_id
@@ -2387,7 +2442,7 @@ class DynamicAnalysisRunner:
             target_id=target.target_id,
             generation=generation,
             backend=self.config.worker_backend,
-            session_id=None,
+            session_id=parent_session_id if parent_session_id else str(uuid.uuid4()),
             status="running",
             started_at=time.time(),
             completed_at=None,
@@ -2727,6 +2782,11 @@ class DynamicAnalysisRunner:
         if verification.verification_id in target.pending_verification_ids:
             target.pending_verification_ids.remove(verification.verification_id)
         if target.error_retry_count <= self.config.max_worker_retries:
+            # Resume the prior verifier session if it had time to register one
+            # (i.e., the subprocess started). The verifier's `session_id` is
+            # pre-allocated at VerificationRecord construction so even a
+            # Ctrl-C-mid-stream crash leaves a usable id behind.
+            resume_from = verification.session_id
             new_verification = VerificationRecord(
                 verification_id=self._next_verification_id(claim.claim_id),
                 claim_id=claim.claim_id,
@@ -2734,7 +2794,7 @@ class DynamicAnalysisRunner:
                 generation=verification.generation,
                 backend=verification.backend,
                 verifier_role=verification.verifier_role,
-                session_id=None,
+                session_id=resume_from if resume_from else str(uuid.uuid4()),
                 status="pending",
                 disposition=None,
                 reason="",
@@ -2744,6 +2804,7 @@ class DynamicAnalysisRunner:
                 completed_at=None,
                 verifier_name=verification.verifier_name,
                 verifier_index=verification.verifier_index,
+                parent_session_id=resume_from,
             )
             self.state.verifications[new_verification.verification_id] = new_verification
             claim.verification_ids.append(new_verification.verification_id)
