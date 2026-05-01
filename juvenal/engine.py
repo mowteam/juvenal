@@ -560,6 +560,7 @@ class Engine:
             display=self.display,
             interactive=self.interactive,
             failure_context=failure_context,
+            pipeline_state=self.state,
         )
         self._active_dynamic_runner = runner
         try:

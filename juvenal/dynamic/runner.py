@@ -200,6 +200,7 @@ class DynamicAnalysisRunner:
         failure_context: str = "",
         interaction_channel: UserInteractionChannel | None = None,
         chat_dashboard: Any = None,
+        pipeline_state: Any = None,
     ) -> None:
         self.phase = phase
         self.workflow = workflow
@@ -211,6 +212,10 @@ class DynamicAnalysisRunner:
         self.config = phase.analysis or AnalysisConfig()
         self.working_dir = Path(workflow.working_dir).resolve()
         self._injected_chat_dashboard: Any = chat_dashboard
+        # Parent pipeline state, used to pause this phase's active-runtime
+        # accumulator across rate-limit sleeps so `juvenal status` Duration
+        # reflects time actually running.
+        self._pipeline_state: Any = pipeline_state
 
         self.state = (
             DynamicSessionState.load(self.state_file) if run_mode == "resume" else DynamicSessionState(self.state_file)
@@ -2937,11 +2942,32 @@ class DynamicAnalysisRunner:
         # Use a threading.Event so kill_active / Ctrl-C can interrupt this
         # sleep on a background executor thread (time.sleep is uninterruptible
         # from outside the thread; Event.wait is not).
-        if self._sleep_with_shutdown(delay):
+        self._pause_pipeline_active_timer()
+        try:
+            interrupted = self._sleep_with_shutdown(delay)
+        finally:
+            self._resume_pipeline_active_timer()
+        if interrupted:
             self._total_backoff_seconds += delay
             return
         self._total_backoff_seconds += delay
         self._consecutive_errors = 0
+
+    def _pause_pipeline_active_timer(self) -> None:
+        if self._pipeline_state is None:
+            return
+        try:
+            self._pipeline_state.pause_active(self.phase.id)
+        except AttributeError:
+            pass
+
+    def _resume_pipeline_active_timer(self) -> None:
+        if self._pipeline_state is None:
+            return
+        try:
+            self._pipeline_state.resume_active(self.phase.id)
+        except AttributeError:
+            pass
 
     def _sleep_with_shutdown(self, seconds: float) -> bool:
         """Sleep up to `seconds`. Returns True if the shutdown event fires

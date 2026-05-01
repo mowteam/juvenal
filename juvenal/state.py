@@ -70,6 +70,13 @@ class PhaseState:
     baseline_sha: str | None = None  # git HEAD before first implement run
     phase_type: str | None = None  # "implement", "check", "workflow", "analysis"
     analysis_state_file: str | None = None  # child state file for analysis phases
+    # Active-runtime accounting. `active_seconds` accumulates wall-clock time the
+    # phase actually spent running; `active_started_at` is the open-interval anchor
+    # — None whenever the phase is paused (pending, completed, killed, sleeping in
+    # a rate-limit backoff). save() rolls forward an open interval and re-anchors,
+    # so a kill+resume gap is naturally excluded.
+    active_seconds: float = 0.0
+    active_started_at: float | None = None
 
 
 @dataclass
@@ -87,13 +94,17 @@ class PipelineState:
             ps = self._ensure_phase(phase_id)
             ps.attempt = attempt
             ps.status = "running"
+            now = time.time()
             if ps.started_at is None:
-                ps.started_at = time.time()
+                ps.started_at = now
+            if ps.active_started_at is None:
+                ps.active_started_at = now
             self.save()
 
     def mark_completed(self, phase_id: str) -> None:
         with self._lock:
             ps = self._ensure_phase(phase_id)
+            self._close_active_interval(ps)
             ps.status = "completed"
             ps.completed_at = time.time()
             self.save()
@@ -101,9 +112,34 @@ class PipelineState:
     def mark_failed(self, phase_id: str) -> None:
         with self._lock:
             ps = self._ensure_phase(phase_id)
+            self._close_active_interval(ps)
             ps.status = "failed"
             ps.completed_at = time.time()
             self.save()
+
+    def pause_active(self, phase_id: str) -> None:
+        """Close the open active-runtime interval (e.g., before a rate-limit sleep)."""
+        with self._lock:
+            ps = self.phases.get(phase_id)
+            if ps is None:
+                return
+            self._close_active_interval(ps)
+            self.save()
+
+    def resume_active(self, phase_id: str) -> None:
+        """Re-open the active-runtime interval (e.g., after a rate-limit sleep)."""
+        with self._lock:
+            ps = self.phases.get(phase_id)
+            if ps is None or ps.active_started_at is not None:
+                return
+            ps.active_started_at = time.time()
+
+    @staticmethod
+    def _close_active_interval(ps: PhaseState) -> None:
+        if ps.active_started_at is None:
+            return
+        ps.active_seconds += max(0.0, time.time() - ps.active_started_at)
+        ps.active_started_at = None
 
     def set_failure_context(self, phase_id: str, context: str, attempt: int | None = None) -> None:
         with self._lock:
@@ -177,6 +213,8 @@ class PipelineState:
                     ps.status = "pending"
                     ps.started_at = None
                     ps.completed_at = None
+                    ps.active_seconds = 0.0
+                    ps.active_started_at = None
             self.save()
 
     def get_resume_phase_index(self, phases: list) -> int:
@@ -192,8 +230,15 @@ class PipelineState:
 
         Thread-safe: acquires _lock if not already held (RLock is reentrant,
         so callers that already hold the lock can call save() safely).
+        Rolls forward any open active-runtime interval and re-anchors so a
+        crash loses at most the seconds since the last save.
         """
         with self._lock:
+            now = time.time()
+            for ps in self.phases.values():
+                if ps.active_started_at is not None:
+                    ps.active_seconds += max(0.0, now - ps.active_started_at)
+                    ps.active_started_at = now
             data = self._to_dict()
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = self.state_file.with_name(f"{self.state_file.name}.tmp")
@@ -233,6 +278,11 @@ class PipelineState:
                     baseline_sha=pdata.get("baseline_sha"),
                     phase_type=pdata.get("phase_type"),
                     analysis_state_file=pdata.get("analysis_state_file"),
+                    active_seconds=pdata.get("active_seconds", 0.0),
+                    # Drop any in-flight anchor across a load — the resume gap
+                    # should not count toward active runtime. set_attempt() will
+                    # re-anchor when the engine next picks up this phase.
+                    active_started_at=None,
                 )
         return state
 
@@ -250,12 +300,13 @@ class PipelineState:
                 ps.status, "dim"
             )
             duration = ""
-            if ps.started_at and ps.completed_at:
-                dur = ps.completed_at - ps.started_at
-                duration = f"{dur:.1f}s"
-            elif ps.started_at:
-                dur = time.time() - ps.started_at
-                duration = f"{dur:.1f}s (running)"
+            active = ps.active_seconds
+            if ps.active_started_at is not None:
+                active += max(0.0, time.time() - ps.active_started_at)
+            if ps.completed_at is not None:
+                duration = f"{active:.1f}s"
+            elif ps.started_at is not None:
+                duration = f"{active:.1f}s (running)"
             table.add_row(pid, f"[{status_style}]{ps.status}[/]", str(ps.attempt), duration)
 
         console.print(table)
@@ -441,6 +492,7 @@ class PipelineState:
                     "baseline_sha": ps.baseline_sha,
                     "phase_type": ps.phase_type,
                     "analysis_state_file": ps.analysis_state_file,
+                    "active_seconds": ps.active_seconds,
                 }
                 for pid, ps in self.phases.items()
             },

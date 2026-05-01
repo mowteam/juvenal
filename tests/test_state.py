@@ -309,6 +309,63 @@ class TestTokenAccumulation:
         assert state.total_tokens() == (0, 0)
 
 
+class TestActiveRuntime:
+    """`active_seconds` should reflect time the phase was actually running."""
+
+    def test_active_excludes_rate_limit_sleep(self, tmp_path, monkeypatch):
+        clock = [1_000_000.0]
+        monkeypatch.setattr("juvenal.state.time.time", lambda: clock[0])
+
+        state = PipelineState(state_file=tmp_path / "state.json")
+        state.set_attempt("hunt", 1)
+        clock[0] += 10  # 10s of real work
+
+        state.pause_active("hunt")
+        clock[0] += 100  # 100s of "rate-limit" sleep — should not count
+        state.resume_active("hunt")
+
+        clock[0] += 5  # 5s more of real work
+        state.mark_completed("hunt")
+
+        active = state.phases["hunt"].active_seconds
+        assert 14.5 <= active <= 15.5, f"expected ~15s active, got {active}"
+
+    def test_active_excludes_resume_gap(self, tmp_path, monkeypatch):
+        clock = [1_000_000.0]
+        monkeypatch.setattr("juvenal.state.time.time", lambda: clock[0])
+
+        state_file = tmp_path / "state.json"
+        state = PipelineState(state_file=state_file)
+        state.set_attempt("hunt", 1)
+        clock[0] += 30  # 30s of real work
+        state.save()  # snapshot before "kill"
+
+        # Process killed; user comes back hours later.
+        clock[0] += 3600
+        loaded = PipelineState.load(state_file)
+        loaded.set_attempt("hunt", 2)  # resume
+        clock[0] += 5  # 5s of real work post-resume
+        loaded.mark_completed("hunt")
+
+        active = loaded.phases["hunt"].active_seconds
+        assert 34.5 <= active <= 35.5, f"expected ~35s active, got {active}"
+
+    def test_active_seconds_default_for_legacy_state_json(self, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "started_at": None,
+                    "completed_at": None,
+                    "phases": {"build": {"status": "completed", "attempt": 1}},
+                }
+            )
+        )
+        loaded = PipelineState.load(state_file)
+        assert loaded.phases["build"].active_seconds == 0.0
+        assert loaded.phases["build"].active_started_at is None
+
+
 class TestCorruptedState:
     def test_load_malformed_json(self, tmp_path):
         """Malformed JSON state file raises an error."""
