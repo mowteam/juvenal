@@ -257,6 +257,10 @@ class DynamicAnalysisRunner:
         self._consecutive_errors = 0
         self._backoff_count = 0
         self._total_backoff_seconds = 0.0
+        # Wall-clock timestamp of the most recent observed Claude CLI 429.
+        # When set, _rate_limit_backoff switches from exponential backoff to a
+        # fixed probe cadence keyed off the typical 5h reset window.
+        self._last_observed_rate_limit_at: float | None = None
         # Set on shutdown (Ctrl-C, kill_active). Background threads in
         # _rate_limit_backoff use this to interrupt their sleep loop so the
         # process can exit promptly instead of waiting up to an hour for a
@@ -662,6 +666,7 @@ class DynamicAnalysisRunner:
             self.state.save()
 
         self._add_tokens(result)
+        self._note_agent_result(result)
         if result.exit_code != 0:
             # Captain crash — likely rate limit. Backoff and retry on next loop iteration.
             self._consecutive_errors += 1
@@ -736,6 +741,7 @@ class DynamicAnalysisRunner:
                 self.state.captain.session_id = result.session_id
                 self.state.save()
             self._add_tokens(result)
+            self._note_agent_result(result)
             if result.exit_code != 0:
                 # Captain repair crash — likely rate limit
                 self._consecutive_errors += 1
@@ -1996,6 +2002,7 @@ class DynamicAnalysisRunner:
 
     def _apply_reporter_result(self, result: _ReporterExecutionResult) -> None:
         self._add_tokens(result.agent_result)
+        self._note_agent_result(result.agent_result)
         claim = self.state.claims.get(result.claim_id)
         if claim is None:
             return
@@ -2023,6 +2030,7 @@ class DynamicAnalysisRunner:
 
     def _apply_worker_result(self, result: _WorkerExecutionResult) -> None:
         self._add_tokens(result.agent_result)
+        self._note_agent_result(result.agent_result)
         attempt = self.state.worker_attempts.get(result.attempt_id)
         target = self.state.targets.get(result.target_id)
         if attempt is None or target is None:
@@ -2183,6 +2191,7 @@ class DynamicAnalysisRunner:
 
     def _apply_verifier_result(self, result: _VerifierExecutionResult) -> None:
         self._add_tokens(result.agent_result)
+        self._note_agent_result(result.agent_result)
         verification = self.state.verifications.get(result.verification_id)
         claim = self.state.claims.get(result.claim_id)
         target = self.state.targets.get(result.target_id)
@@ -2957,26 +2966,42 @@ class DynamicAnalysisRunner:
         """Track a worker/verifier infrastructure failure (crash, malformed output, non-zero exit).
 
         Does NOT count verifier rejections — those are normal operation.
-        When consecutive errors hit the threshold, saves state and sleeps with
-        exponential backoff (likely rate limit or API outage), then resets and continues.
+        When consecutive errors hit the threshold, save state and either probe
+        the Claude rate limit on a fixed cadence (when a 429 was observed
+        recently) or fall back to exponential backoff for generic crashes.
         """
         self._consecutive_errors += 1
         if self._consecutive_errors >= self.config.max_consecutive_errors:
             self._rate_limit_backoff()
 
-    def _rate_limit_backoff(self) -> None:
-        """Sleep with exponential backoff, save state, then reset error counter to continue.
+    def _note_agent_result(self, agent_result: AgentResult | None) -> None:
+        """Record observable signals from a finished agent result for downstream backoff decisions."""
+        if agent_result is None:
+            return
+        if agent_result.rate_limit_status == 429:
+            self._last_observed_rate_limit_at = time.time()
 
-        Starts at 60s and doubles each consecutive backoff (60, 120, 240, ...) up to 1 hour
-        per wait. Cumulative wait time across the run is capped at 5 hours; once that budget
-        is exhausted the run gives up rather than waiting longer (the upstream rate limit
-        resets at most every 5 hours, so further sleeping is wasted time).
-        Resets on the next successful operation. The user can Ctrl+C at any time during the
-        sleep — state is already saved so --resume will pick up where it left off.
+    def _rate_limit_backoff(self) -> None:
+        """Sleep until the agent CLI is available again, then resume.
+
+        Two cadences. When the most recent agent result observed a Claude 429
+        (the CLI surfaced an upstream rate limit), sleep on a fixed probe
+        schedule keyed off the typical 5-hour Anthropic reset window — quick
+        early checks, then hourly, with a guaranteed probe a few minutes after
+        the 5h mark. Each probe is a one-shot `claude --print 'ok'` so the
+        token cost is negligible.
+
+        For generic crashes (no 429 observed) fall back to exponential
+        backoff (60s → 1h doubling), since the cause may not be a rate limit
+        and probing won't help.
+
+        Cumulative sleep is capped at `max_total_backoff_seconds`; once
+        exhausted the run gives up rather than waiting longer. The user can
+        Ctrl+C at any time during the sleep — state is already saved so
+        --resume picks up where it left off.
         """
         self.state.save()
         max_total = self.config.max_total_backoff_seconds
-        max_single = self.config.max_single_backoff_seconds
         remaining_budget = max_total - self._total_backoff_seconds
         if remaining_budget <= 0:
             self._terminal_failure = (
@@ -2988,11 +3013,22 @@ class DynamicAnalysisRunner:
             print(f"\n[juvenal] {self._terminal_failure}", flush=True)
             return
 
+        observed = self._last_observed_rate_limit_at
+        # Use the probe schedule when we saw a 429 within the cumulative cap;
+        # otherwise stale signals shouldn't keep us probing forever.
+        if observed is not None and (time.time() - observed) <= max_total:
+            self._probe_backoff(observed_at=observed, remaining_budget=remaining_budget)
+        else:
+            self._exponential_backoff(remaining_budget=remaining_budget)
+
+    def _exponential_backoff(self, *, remaining_budget: float) -> None:
+        max_single = self.config.max_single_backoff_seconds
         delay = min(60 * (2**self._backoff_count), max_single)
         delay = min(delay, remaining_budget)
         self._backoff_count += 1
         minutes = delay / 60
         cumulative_minutes = (self._total_backoff_seconds + delay) / 60
+        max_total = self.config.max_total_backoff_seconds
         print(
             f"\n[juvenal] {self._consecutive_errors} consecutive errors — "
             f"likely rate limit. Sleeping {minutes:.0f}m before retrying "
@@ -3000,9 +3036,6 @@ class DynamicAnalysisRunner:
             "State saved (Ctrl+C to exit, --resume to continue later).",
             flush=True,
         )
-        # Use a threading.Event so kill_active / Ctrl-C can interrupt this
-        # sleep on a background executor thread (time.sleep is uninterruptible
-        # from outside the thread; Event.wait is not).
         self._pause_pipeline_active_timer()
         try:
             interrupted = self._sleep_with_shutdown(delay)
@@ -3013,6 +3046,88 @@ class DynamicAnalysisRunner:
             return
         self._total_backoff_seconds += delay
         self._consecutive_errors = 0
+
+    # Probe cadence keyed off the typical 5-hour Anthropic rate-limit reset.
+    # Quick checks the first half hour, then hourly, then a guaranteed probe
+    # 3 minutes past the 5h mark, then hourly indefinitely (capped by the
+    # cumulative max_total_backoff_seconds budget).
+    _RATE_LIMIT_PROBE_SCHEDULE: tuple[float, ...] = (
+        300.0,  # 5 min
+        600.0,  # 10 min
+        1800.0,  # 30 min
+        3600.0,  # 1 h
+        7200.0,  # 2 h
+        10800.0,  # 3 h
+        14400.0,  # 4 h
+        18000.0 + 180.0,  # 5h 3min — safety margin past typical reset
+    )
+    _RATE_LIMIT_PROBE_INTERVAL_AFTER_SCHEDULE: float = 3600.0  # then hourly
+
+    def _probe_backoff(self, *, observed_at: float, remaining_budget: float) -> None:
+        backend = self._claude_probe_backend()
+        if backend is None:
+            # No Claude backend in this configuration — fall back to exponential.
+            self._exponential_backoff(remaining_budget=remaining_budget)
+            return
+        env = self._role_env("worker") if self.config.worker_backend == "claude" else self._role_env("captain")
+        elapsed = time.time() - observed_at
+        marks = list(self._RATE_LIMIT_PROBE_SCHEDULE)
+        # Generate hourly marks past the schedule; loop emits one mark per probe.
+        next_extra_mark = self._RATE_LIMIT_PROBE_SCHEDULE[-1] + self._RATE_LIMIT_PROBE_INTERVAL_AFTER_SCHEDULE
+        print(
+            f"\n[juvenal] {self._consecutive_errors} consecutive errors — Claude rate limit (HTTP 429) "
+            f"observed at +{int(elapsed)}s. Probing on schedule keyed off the typical 5h reset. "
+            "State saved (Ctrl+C to exit, --resume to continue later).",
+            flush=True,
+        )
+        self._pause_pipeline_active_timer()
+        try:
+            while True:
+                if marks:
+                    next_mark = marks.pop(0)
+                else:
+                    next_mark = next_extra_mark
+                    next_extra_mark += self._RATE_LIMIT_PROBE_INTERVAL_AFTER_SCHEDULE
+                wait_until = observed_at + next_mark
+                sleep_seconds = wait_until - time.time()
+                if sleep_seconds > 0:
+                    if sleep_seconds > remaining_budget:
+                        sleep_seconds = remaining_budget
+                    if self._sleep_with_shutdown(sleep_seconds):
+                        self._total_backoff_seconds += sleep_seconds
+                        return
+                    remaining_budget -= sleep_seconds
+                    self._total_backoff_seconds += sleep_seconds
+                if remaining_budget <= 0:
+                    return
+                if self._shutdown_event.is_set():
+                    return
+                elapsed_minutes = (time.time() - observed_at) / 60
+                print(
+                    f"[juvenal] probing rate limit at +{elapsed_minutes:.0f}m...",
+                    flush=True,
+                )
+                cleared = False
+                try:
+                    cleared = backend.probe_rate_limit(working_dir=str(self.working_dir), env=env)
+                except Exception as exc:  # noqa: BLE001 - probe is best-effort
+                    print(f"[juvenal] probe raised {type(exc).__name__}: {exc}; continuing schedule", flush=True)
+                if cleared:
+                    print(f"[juvenal] rate limit cleared at +{elapsed_minutes:.0f}m — resuming", flush=True)
+                    self._consecutive_errors = 0
+                    self._last_observed_rate_limit_at = None
+                    return
+        finally:
+            self._resume_pipeline_active_timer()
+
+    def _claude_probe_backend(self) -> Backend | None:
+        """Return a Claude backend instance suitable for rate-limit probing, or None."""
+        for backend_name in (self.config.worker_backend, self.config.captain_backend):
+            if backend_name == "claude":
+                backend = self._get_backend(backend_name)
+                if hasattr(backend, "probe_rate_limit"):
+                    return backend
+        return None
 
     def _pause_pipeline_active_timer(self) -> None:
         if self._pipeline_state is None:

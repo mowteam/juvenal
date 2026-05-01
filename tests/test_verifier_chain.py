@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import patch
 
 import pytest
@@ -578,6 +579,41 @@ def test_rate_limit_backoff_resets_on_record_success(tmp_path):
         assert runner._total_backoff_seconds == 0
         assert runner._backoff_count == 0
         assert runner._consecutive_errors == 0
+
+
+def test_rate_limit_backoff_uses_probe_when_429_observed(tmp_path):
+    """When a Claude 429 was observed, _rate_limit_backoff probes on schedule
+    until the probe says the limit cleared, instead of running exponential backoff."""
+    runner = _make_runner(tmp_path)
+
+    backend = runner._get_backend("claude")
+    probe_calls: list[float] = []
+    cleared_after = 3  # third probe returns True
+
+    def fake_probe(working_dir, env=None, timeout=60):
+        probe_calls.append(time.time())
+        return len(probe_calls) >= cleared_after
+
+    backend.probe_rate_limit = fake_probe  # type: ignore[attr-defined]
+
+    sleeps: list[float] = []
+
+    def fake_sleep(d):
+        sleeps.append(d)
+        return False
+
+    runner._last_observed_rate_limit_at = time.time()
+    with patch.object(runner, "_sleep_with_shutdown", side_effect=fake_sleep):
+        runner._rate_limit_backoff()
+
+    # The probe path was taken — exponential backoff_count is unchanged.
+    assert runner._backoff_count == 0
+    # We probed on the early schedule (5min, 10min, 30min) and stopped after
+    # the third probe reported cleared.
+    assert len(probe_calls) == cleared_after
+    # On clear, the runner zeros consecutive_errors and the 429 timestamp.
+    assert runner._consecutive_errors == 0
+    assert runner._last_observed_rate_limit_at is None
 
 
 def test_rate_limit_backoff_caps_use_analysis_config(tmp_path):

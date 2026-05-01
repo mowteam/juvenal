@@ -25,6 +25,11 @@ class AgentResult:
     input_tokens: int = 0
     output_tokens: int = 0
     session_id: str | None = None
+    # Set when the Claude CLI surfaces a 429 in the final `result` event
+    # (api_error_status). The runner uses this to distinguish a real upstream
+    # rate limit from a generic crash so backoff cadence only fires when
+    # warranted.
+    rate_limit_status: int | None = None
 
 
 @dataclass
@@ -198,6 +203,34 @@ class ClaudeBackend(Backend):
     def name(self) -> str:
         return "claude"
 
+    def probe_rate_limit(self, working_dir: str, env: dict[str, str] | None = None, timeout: int = 60) -> bool:
+        """Run a one-shot probe to check whether the Claude rate limit has cleared.
+
+        Returns True when the probe succeeds (limit cleared), False on a 429.
+        Used by the runner to wake from rate-limit backoff with a real signal
+        instead of a fixed-time guess. The probe is small ("ok") so its token
+        cost is negligible.
+        """
+        cmd = [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--dangerously-skip-permissions",
+            "--verbose",
+            "--max-turns",
+            "1",
+        ]
+        result = self._run_claude_process(
+            cmd,
+            working_dir=working_dir,
+            display_callback=None,
+            timeout=timeout,
+            env=env,
+            stdin_input="ok",
+        )
+        return result.exit_code == 0 and result.rate_limit_status != 429
+
     def run_agent(
         self,
         prompt: str,
@@ -351,6 +384,7 @@ class ClaudeBackend(Backend):
         assistant_messages: list[str] = []
         total_input_tokens = 0
         total_output_tokens = 0
+        rate_limit_status: int | None = None
 
         try:
             for raw_line in proc.stdout:
@@ -374,6 +408,12 @@ class ClaudeBackend(Backend):
                     inp, out = _extract_claude_tokens(event)
                     total_input_tokens += inp
                     total_output_tokens += out
+                    if (
+                        event.get("type") == "result"
+                        and event.get("is_error")
+                        and isinstance(event.get("api_error_status"), int)
+                    ):
+                        rate_limit_status = event["api_error_status"]
                     if display_text:
                         transcript_lines.append(display_text)
                         if display_callback:
@@ -408,6 +448,7 @@ class ClaudeBackend(Backend):
             duration=duration,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            rate_limit_status=rate_limit_status,
         )
 
 
