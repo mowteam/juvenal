@@ -153,8 +153,12 @@ phases:
       at parser.c:142") — the verifier will attempt to run it. A claim with no PoC is incomplete:
       report `confidence: low` with a `reasoning` note explaining why.
 
-      **Output:** brief bug description in `output/<bug-name>.md`; PoC artifact in
-      `output/<bug-name>-poc`.
+      **Output:** every finding lives in its own per-bug directory at
+      `output/<bug-id>/`, where `<bug-id>` is `<target_id>-g<generation>-claim-<worker_claim_id>`
+      (target_id and generation come from the worker's task packet; worker_claim_id is the
+      slug the worker assigns to the claim). Place the brief bug description and the PoC
+      artifact(s) inside that directory; do NOT write loose files at the top of `output/`.
+      The reporter will add `report.md` to the same directory once verifiers pass.
     analysis:
       # Models default per role: claude → captain opus 4.7 1M, worker opus 4.7
       # (200K), verifier opus 4.6 (200K), reporter sonnet 4.6; codex → CLI
@@ -292,8 +296,21 @@ phases:
 
         ## Output
 
-        - Brief bug description in `output/<bug-name>.md`.
-        - PoC artifact in `output/<bug-name>-poc`.
+        Each finding goes in its own directory at `output/<bug-id>/`,
+        where `<bug-id>` = `<target_id>-g<generation>-claim-<worker_claim_id>`.
+        `target_id` and `generation` come from your task packet; pick a
+        descriptive `worker_claim_id` slug for the claim. Inside that
+        directory write:
+
+        - `<bug-id>.md` — brief bug description (one or two paragraphs).
+        - `poc.<ext>` — your PoC trigger (script, source file, input
+          file). Use a sensible extension. Add additional supporting
+          files alongside if needed.
+
+        Do NOT write loose files at the top level of `output/`. The
+        reporter will overlay `report.md` in the same directory once
+        verifiers pass — your artifacts and the report will live
+        side-by-side.
       verifiers:
         - name: attack-surface
           backend: claude
