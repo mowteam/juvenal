@@ -310,6 +310,16 @@ class DynamicAnalysisRunner:
         if self.config.worker_prompt:
             self._rendered_worker_prompt = apply_vars(self.config.worker_prompt, self.workflow.vars)
 
+        # Persist the rendered mission text once, then reference it by path
+        # from per-call verifier prompts instead of inlining ~6KB into every
+        # call (5 verifiers × hundreds of claims). The captain still inlines
+        # mission via its own prompt builder; verifiers Read this file on
+        # demand if their per-spec scope is insufficient.
+        rendered_mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
+        self._mission_file = self.working_dir / ".juvenal" / f"{self.phase.id}-mission.md"
+        self._mission_file.parent.mkdir(parents=True, exist_ok=True)
+        self._mission_file.write_text(rendered_mission, encoding="utf-8")
+
     def run(self) -> PhaseResult:
         """Run the dynamic analysis loop to completion or deterministic failure."""
 
@@ -1642,7 +1652,6 @@ class DynamicAnalysisRunner:
         carries the dynamic per-claim payload.
         """
         packet = asdict(claim_to_verifier_packet(claim))
-        mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         chain_length = len(self._verifier_chain)
         spec = self._verifier_chain[verification.verifier_index]
         rendered_scope = self._rendered_verifier_prompts.get(spec.name, "")
@@ -1668,12 +1677,16 @@ class DynamicAnalysisRunner:
         system_prompt = self._verifier_role_prompt
         if rendered_scope:
             system_prompt = f"{system_prompt}\n\n{rendered_scope}"
+        try:
+            mission_path = self._mission_file.relative_to(self.working_dir)
+        except ValueError:
+            mission_path = self._mission_file
         user_prompt = (
             f"Repository root: `{self.working_dir}`\n\n"
             "Chain context:\n"
             f"```text\n{json.dumps(chain_context, indent=2)}\n```\n\n"
-            "Mission scope and context (from the analysis phase configuration):\n"
-            f"```text\n{mission}\n```\n\n"
+            f"Mission file (read with the Read tool only if your per-spec scope is insufficient): "
+            f"`{mission_path}`\n\n"
             "Target context:\n"
             f"```text\n{json.dumps(self._target_prompt_summary(target), indent=2)}\n```\n\n"
             "Verified dependencies:\n"

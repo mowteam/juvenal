@@ -581,6 +581,51 @@ def test_rate_limit_backoff_resets_on_record_success(tmp_path):
         assert runner._consecutive_errors == 0
 
 
+def test_verifier_user_prompt_excludes_inline_mission(tmp_path):
+    """The mission text should not be inlined into the verifier user prompt.
+    It's written once to .juvenal/<phase>-mission.md and referenced by path,
+    saving ~mission_size bytes on every verifier call (5 verifiers per claim)."""
+    from tests.test_dynamic_state import make_claim, make_target, make_verification
+
+    # Use a long, distinctive mission so any inlining is obvious.
+    mission_text = "MISSION_SENTINEL_" + ("X" * 4000)
+    config = AnalysisConfig(
+        max_workers=1,
+        max_verifiers=1,
+        verifiers=[VerifierSpec(name="poc", backend="claude", prompt="poc-scope")],
+    )
+    phase = Phase(id="analyze", type="analysis", prompt=mission_text, analysis=config)
+    workflow = Workflow(name="analysis", phases=[phase], working_dir=str(tmp_path))
+    state_file = tmp_path / "analysis-state.json"
+    backend = MockBackend()
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        runner = DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=False,
+        )
+
+    # Mission file is materialized at runner start.
+    assert runner._mission_file.is_file()
+    assert "MISSION_SENTINEL_" in runner._mission_file.read_text()
+
+    target = make_target(status="verifying")
+    claim = make_claim(status="verifying")
+    verification = make_verification(session_id="vs1")
+    runner.state.targets[target.target_id] = target
+    runner.state.claims[claim.claim_id] = claim
+    runner.state.verifications[verification.verification_id] = verification
+
+    _system, user_prompt = runner._build_verifier_prompt(target, claim, verification)
+
+    assert "MISSION_SENTINEL_" not in user_prompt, "mission text leaked into verifier user prompt"
+    # The pointer should still be there so the verifier can Read it on demand.
+    assert "mission.md" in user_prompt.lower() or str(runner._mission_file) in user_prompt
+
+
 def test_rate_limit_backoff_uses_probe_when_429_observed(tmp_path):
     """When a Claude 429 was observed, _rate_limit_backoff probes on schedule
     until the probe says the limit cleared, instead of running exponential backoff."""
