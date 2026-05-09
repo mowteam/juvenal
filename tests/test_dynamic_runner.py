@@ -2484,3 +2484,129 @@ def test_claim_retry_no_findings_does_not_requeue_when_budget_exhausted(tmp_path
     assert runner._pending_claim_retries == []
     # And the target rolls up to exhausted via _refresh_target_after_verification.
     assert runner.state.targets[target.target_id].status == "exhausted"
+
+
+def test_sweep_dead_dep_targets_blocks_when_dep_exhausted(tmp_path):
+    """A queued target whose dep claim is rejected with no retry budget AND
+    no live retry chain is unsatisfiable — the sweep must mark it blocked
+    so the frontier doesn't carry permanent garbage. Production regression:
+    in the openthread run, 55 captain-enqueued PoC/build targets sat queued
+    forever waiting for parent claims that exhausted their retry budget
+    without ever reaching `verified`."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    parent = _system_split_target("target-parent")
+    parent.status = "exhausted"
+    runner.state.targets[parent.target_id] = parent
+    parent_claim = _system_split_claim("claim-parent", parent.target_id)
+    parent_claim.status = "rejected"
+    parent_claim.retry_count = 2  # budget == max
+    runner.state.claims[parent_claim.claim_id] = parent_claim
+
+    dependent = _system_split_target("target-dependent")
+    dependent.status = "queued"
+    dependent.depends_on_claim_ids = [parent_claim.claim_id]
+    runner.state.targets[dependent.target_id] = dependent
+
+    progressed = runner._sweep_dead_dep_targets()
+
+    assert progressed is True
+    blocked = runner.state.targets[dependent.target_id]
+    assert blocked.status == "blocked"
+    # Event recorded so the captain sees the blocker on the next delta.
+    blocker_events = [
+        e for e in runner.state.events if e.event_type == "target.blocked" and e.target_id == "target-dependent"
+    ]
+    assert len(blocker_events) == 1
+    assert "claim-parent" in blocker_events[0].payload.get("blocker", "")
+
+
+def test_sweep_dead_dep_targets_leaves_alive_dep_alone(tmp_path):
+    """If the dep claim is rejected but still has retry budget OR is
+    actively being retried, the dep is NOT yet unverifiable — the
+    dependent target stays queued so the next retry can resolve it."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=10)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    parent = _system_split_target("target-parent")
+    runner.state.targets[parent.target_id] = parent
+    parent_claim = _system_split_claim("claim-parent", parent.target_id)
+    parent_claim.status = "rejected"
+    parent_claim.retry_count = 5  # well below max=10
+    runner.state.claims[parent_claim.claim_id] = parent_claim
+
+    dependent = _system_split_target("target-dependent")
+    dependent.status = "queued"
+    dependent.depends_on_claim_ids = [parent_claim.claim_id]
+    runner.state.targets[dependent.target_id] = dependent
+
+    progressed = runner._sweep_dead_dep_targets()
+
+    assert progressed is False
+    assert runner.state.targets[dependent.target_id].status == "queued"
+
+
+def test_sweep_dead_dep_targets_walks_retry_chain(tmp_path):
+    """A dep is satisfied (alive) if any descendant in its retry chain is
+    still verifiable. The sweep must walk `retry_claim_ids` before deciding
+    the dep is dead, mirroring the satisfaction walk in
+    `_dependencies_satisfied`."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    parent = _system_split_target("target-parent")
+    runner.state.targets[parent.target_id] = parent
+
+    # Original dep claim: rejected, exhausted budget — would be dead alone.
+    original = _system_split_claim("claim-original", parent.target_id)
+    original.status = "rejected"
+    original.retry_count = 2  # at max
+    # ...but a retry claim is still proposed and pending verification.
+    original.retry_claim_ids = ["claim-retry"]
+    runner.state.claims[original.claim_id] = original
+
+    retry = _system_split_claim("claim-retry", parent.target_id)
+    retry.worker_claim_id = "c-retry"
+    retry.status = "proposed"
+    retry.retry_of_claim_id = original.claim_id
+    runner.state.claims[retry.claim_id] = retry
+
+    dependent = _system_split_target("target-dependent")
+    dependent.status = "queued"
+    dependent.depends_on_claim_ids = [original.claim_id]
+    runner.state.targets[dependent.target_id] = dependent
+
+    progressed = runner._sweep_dead_dep_targets()
+
+    assert progressed is False
+    assert runner.state.targets[dependent.target_id].status == "queued"
+
+
+def test_sweep_dead_dep_targets_respects_pending_retry_queue(tmp_path):
+    """If the dep claim is exhausted on disk but is sitting in the runtime
+    retry queue (e.g. just re-queued by a no_findings retry result before
+    the next dispatch tick), the sweep must NOT block — there's still a
+    pending attempt that may produce a verified retry claim."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    parent = _system_split_target("target-parent")
+    runner.state.targets[parent.target_id] = parent
+    parent_claim = _system_split_claim("claim-parent", parent.target_id)
+    parent_claim.status = "rejected"
+    parent_claim.retry_count = 2  # at max
+    runner.state.claims[parent_claim.claim_id] = parent_claim
+
+    dependent = _system_split_target("target-dependent")
+    dependent.status = "queued"
+    dependent.depends_on_claim_ids = [parent_claim.claim_id]
+    runner.state.targets[dependent.target_id] = dependent
+
+    # Sitting in the runtime queue, hasn't dispatched yet.
+    runner._pending_claim_retries = [(parent.target_id, parent_claim.claim_id)]
+
+    progressed = runner._sweep_dead_dep_targets()
+
+    assert progressed is False
+    assert runner.state.targets[dependent.target_id].status == "queued"

@@ -481,6 +481,7 @@ class DynamicAnalysisRunner:
 
                 made_progress = False
                 made_progress |= self._drain_completed_futures()
+                made_progress |= self._sweep_dead_dep_targets()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
                 made_progress |= self._schedule_reporters()
@@ -552,6 +553,7 @@ class DynamicAnalysisRunner:
 
                 made_progress = False
                 made_progress |= self._drain_completed_futures()
+                made_progress |= self._sweep_dead_dep_targets()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
                 made_progress |= self._schedule_reporters()
@@ -3657,6 +3659,81 @@ class DynamicAnalysisRunner:
             return any(verified_via_retries(rid, seen) for rid in claim.retry_claim_ids)
 
         return all(verified_via_retries(dep_id, set()) for dep_id in target.depends_on_claim_ids)
+
+    def _dep_claim_unverifiable(self, claim_id: str) -> bool:
+        """Walk a dep claim's retry chain. Return True iff no claim in the
+        chain is verified AND no path to verification remains: every claim
+        in the chain is rejected with no retry budget, no live verification,
+        and no descendant retry claim that's still alive.
+
+        Used by `_sweep_dead_dep_targets` to short-circuit queued targets
+        whose deps can never resolve, so they don't squat on the frontier
+        forever waiting for a parent claim that will never verify.
+        """
+        pending_retry_keys = {(t, c) for t, c in self._pending_claim_retries}
+        seen: set[str] = set()
+        stack = [claim_id]
+        while stack:
+            cid = stack.pop()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            claim = self.state.claims.get(cid)
+            if claim is None:
+                # Defensive: a missing dep is not a known dead-end. Don't
+                # block targets on what might be a future claim.
+                return False
+            if claim.status == "verified":
+                return False
+            if claim.status in ("proposed", "verifying"):
+                return False
+            if claim.status == "rejected":
+                if claim.retry_count < self.config.max_worker_retries:
+                    return False
+                if (claim.target_id, claim.claim_id) in pending_retry_keys:
+                    return False
+            for rid in claim.retry_claim_ids:
+                stack.append(rid)
+        return True
+
+    def _sweep_dead_dep_targets(self) -> bool:
+        """Mark queued targets blocked when at least one dep claim is
+        terminally unverifiable (see `_dep_claim_unverifiable`).
+
+        Without this sweep, captain-enqueued targets that pre-declared a
+        dep on a future claim wedge in the frontier when the parent claim
+        ultimately rejects with no successful retry — invisible to
+        `_schedule_workers` (deps unsatisfied) and never resolved by any
+        downstream event. The captain's frontier would grow without bound
+        and the worker pool starves with no schedulable work.
+        """
+        progressed = False
+        now = time.time()
+        for target in self.state.targets.values():
+            if target.status != "queued":
+                continue
+            if self._is_target_ignored(target):
+                continue
+            if not target.depends_on_claim_ids:
+                continue
+            dead = next(
+                (dep_id for dep_id in target.depends_on_claim_ids if self._dep_claim_unverifiable(dep_id)),
+                None,
+            )
+            if dead is None:
+                continue
+            target.status = "blocked"
+            target.updated_at = now
+            self.state.append_event(
+                "target.blocked",
+                target_id=target.target_id,
+                generation=target.active_generation,
+                blocker=f"dependency claim {dead} is unverifiable (rejected, retry budget exhausted)",
+            )
+            progressed = True
+        if progressed:
+            self.state.save()
+        return progressed
 
     def _next_attempt_id(self, target_id: str, generation: int) -> str:
         existing = [
