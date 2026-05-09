@@ -2576,6 +2576,65 @@ def test_sweep_dead_dep_targets_walks_retry_chain(tmp_path):
     assert runner.state.targets[dependent.target_id].status == "queued"
 
 
+def test_should_terminate_succeeds_when_some_exhausted_but_claims_verified(tmp_path):
+    """All-terminal frontier with at least one verified claim is a SUCCESS,
+    even if some targets exhausted along the way. Production regression: in
+    the openthread run, 23 completed targets + 28 verified claims + 11
+    exhausted targets exited with `analysis exhausted retry budget across
+    all targets` because the failure check tripped on the exhausted count
+    before the all-terminal-success check could fire."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    # Bump captain past turn 0 so the secondary all-terminal check is reachable.
+    runner.state.captain.turn_index = 5
+    runner._last_captain_snapshot = runner._captain_snapshot()
+
+    completed = _system_split_target("target-completed")
+    completed.status = "completed"
+    runner.state.targets[completed.target_id] = completed
+    verified_claim = _system_split_claim("claim-verified", completed.target_id)
+    verified_claim.status = "verified"
+    runner.state.claims[verified_claim.claim_id] = verified_claim
+
+    exhausted = _system_split_target("target-exhausted")
+    exhausted.status = "exhausted"
+    runner.state.targets[exhausted.target_id] = exhausted
+
+    # Captain has consumed everything (no pending delta).
+    runner.state.captain.last_delivered_event_seq = max((e.seq for e in runner.state.events), default=0)
+
+    terminate, success, reason = runner._should_terminate()
+
+    assert terminate is True
+    assert success is True
+    assert reason == ""
+
+
+def test_should_terminate_fails_when_no_verified_claims(tmp_path):
+    """A run where every target hits terminal AND no claim was ever
+    verified is a genuine failure — the analysis produced nothing."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    runner.state.captain.turn_index = 5
+    runner._last_captain_snapshot = runner._captain_snapshot()
+
+    exhausted = _system_split_target("target-exhausted")
+    exhausted.status = "exhausted"
+    runner.state.targets[exhausted.target_id] = exhausted
+    rejected_claim = _system_split_claim("claim-rejected", exhausted.target_id)
+    rejected_claim.status = "rejected"
+    rejected_claim.retry_count = 10
+    runner.state.claims[rejected_claim.claim_id] = rejected_claim
+
+    runner.state.captain.last_delivered_event_seq = max((e.seq for e in runner.state.events), default=0)
+
+    terminate, success, reason = runner._should_terminate()
+
+    assert terminate is True
+    assert success is False
+    assert "exhausted retry budget" in reason
+
+
 def test_sweep_dead_dep_targets_treats_terminal_target_claim_as_dead(tmp_path):
     """A rejected dep claim with retry budget remaining is functionally dead
     if its target is in a terminal status (blocked/exhausted/no_findings/

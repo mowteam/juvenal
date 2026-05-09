@@ -1706,6 +1706,7 @@ class DynamicAnalysisRunner:
             if (
                 all_terminal
                 and any(target.status == "exhausted" for target in self.state.targets.values())
+                and not any(claim.status == "verified" for claim in self.state.claims.values())
                 and not (
                     delta.verified_claim_ids
                     or delta.rejected_claim_ids
@@ -1715,6 +1716,11 @@ class DynamicAnalysisRunner:
                     or delta.pending_directive_ids
                 )
             ):
+                # Genuine retry-budget failure: every target reached terminal,
+                # at least one was exhausted, AND no claim ever verified.
+                # If even one claim verified, the run produced real output —
+                # exhausted targets are normal noise on a real run, so the
+                # all-terminal success path below should handle it.
                 return True, False, "analysis exhausted retry budget across all targets"
 
             if (
