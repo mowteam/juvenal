@@ -2760,10 +2760,26 @@ class DynamicAnalysisRunner:
         original_claim = self.state.claims.get(attempt.retry_claim_id or "")
 
         if report.outcome in ("no_findings", "blocked"):
-            # Retry worker confirms the claim was false or can't determine — original rejection stands
-            # Consume the retry budget so _refresh_target_after_verification sees it as exhausted
+            # Retry worker confirms the claim was false or can't determine.
+            # Consume one unit of the retry budget. If budget remains, re-queue
+            # the original claim so the next attempt actually fires — without
+            # this, _refresh_target_after_verification sets target.status
+            # back to "queued" but _pending_claim_retries stays empty, and
+            # the target wedges (queued, but invisible to both initial
+            # dispatch (deps unsatisfied) and retry dispatch (not in queue))
+            # until the next --resume rebuilds the queue from disk state.
             if original_claim is not None:
                 original_claim.retry_count += 1
+                if original_claim.retry_count < self.config.max_worker_retries and not self._has_pending_retry(
+                    original_claim
+                ):
+                    self._pending_claim_retries.append((target.target_id, original_claim.claim_id))
+                    self.state.append_event(
+                        "claim.retry_scheduled",
+                        target_id=target.target_id,
+                        claim_id=original_claim.claim_id,
+                        generation=attempt.generation,
+                    )
             self._refresh_target_after_verification(target)
             self.state.save()
             return

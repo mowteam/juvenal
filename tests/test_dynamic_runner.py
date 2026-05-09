@@ -2367,3 +2367,120 @@ def test_reconcile_orphaned_running_target_blocks_after_budget_exhausted(tmp_pat
     recovered = runner.state.targets[target.target_id]
     assert recovered.status == "blocked"
     assert recovered.active_attempt_id is None
+
+
+def test_claim_retry_no_findings_requeues_when_budget_remains(tmp_path):
+    """When a retry worker returns `no_findings` (or `blocked`), the original
+    claim's retry_count is incremented but the claim must also be re-added
+    to `_pending_claim_retries` if budget remains. Without the re-queue, the
+    target gets set back to `status="queued"` by
+    `_refresh_target_after_verification` but the runtime queue stays empty,
+    so the next retry attempt never fires — targets wedge with rejected
+    claims that still have retry budget. Production regression: in the
+    openthread bug-bounty run, 14 claims sat at retry_count between 2/10
+    and 9/10 without dispatching, while the worker pool ran at 1/8."""
+    from juvenal.backends import AgentResult
+    from juvenal.dynamic.models import WorkerReport
+    from juvenal.dynamic.runner import _WorkerExecutionResult
+
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=10)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-rq")
+    target.status = "running"
+    runner.state.targets[target.target_id] = target
+
+    claim = _system_split_claim("claim-rq", target.target_id)
+    claim.status = "rejected"
+    claim.retry_count = 5
+    runner.state.claims[claim.claim_id] = claim
+
+    attempt = _system_split_attempt("attempt-retry-rq", target.target_id)
+    attempt.status = "running"
+    attempt.retry_claim_id = claim.claim_id
+    target.active_attempt_id = attempt.attempt_id
+    runner.state.worker_attempts[attempt.attempt_id] = attempt
+
+    result = _WorkerExecutionResult(
+        attempt_id=attempt.attempt_id,
+        target_id=target.target_id,
+        generation=attempt.generation,
+        report=WorkerReport(
+            schema_version=1,
+            task_id=attempt.attempt_id,
+            target_id=target.target_id,
+            outcome="no_findings",
+            summary="Could not reproduce.",
+            claims=[],
+            blocker=None,
+            follow_up_hints=[],
+        ),
+        agent_result=AgentResult(
+            exit_code=0, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0, session_id="s"
+        ),
+        error="",
+    )
+
+    assert runner._pending_claim_retries == []
+
+    runner._apply_worker_result(result)
+
+    # Budget consumed by 1.
+    assert runner.state.claims[claim.claim_id].retry_count == 6
+    # And the next retry is queued so it actually fires.
+    assert (target.target_id, claim.claim_id) in runner._pending_claim_retries
+    # Target is back to a re-schedulable shape.
+    assert runner.state.targets[target.target_id].status == "queued"
+
+
+def test_claim_retry_no_findings_does_not_requeue_when_budget_exhausted(tmp_path):
+    """When retry_count reaches max_worker_retries after a no_findings retry,
+    the claim must NOT be re-queued — it's exhausted. Without this guard the
+    fix above would loop forever past the budget cap."""
+    from juvenal.backends import AgentResult
+    from juvenal.dynamic.models import WorkerReport
+    from juvenal.dynamic.runner import _WorkerExecutionResult
+
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-exh")
+    target.status = "running"
+    runner.state.targets[target.target_id] = target
+
+    claim = _system_split_claim("claim-exh", target.target_id)
+    claim.status = "rejected"
+    claim.retry_count = 1  # next bump pushes to max=2
+    runner.state.claims[claim.claim_id] = claim
+
+    attempt = _system_split_attempt("attempt-exh", target.target_id)
+    attempt.status = "running"
+    attempt.retry_claim_id = claim.claim_id
+    target.active_attempt_id = attempt.attempt_id
+    runner.state.worker_attempts[attempt.attempt_id] = attempt
+
+    result = _WorkerExecutionResult(
+        attempt_id=attempt.attempt_id,
+        target_id=target.target_id,
+        generation=attempt.generation,
+        report=WorkerReport(
+            schema_version=1,
+            task_id=attempt.attempt_id,
+            target_id=target.target_id,
+            outcome="blocked",
+            summary="Blocked.",
+            claims=[],
+            blocker="missing context",
+            follow_up_hints=[],
+        ),
+        agent_result=AgentResult(
+            exit_code=0, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0, session_id="s"
+        ),
+        error="",
+    )
+
+    runner._apply_worker_result(result)
+
+    assert runner.state.claims[claim.claim_id].retry_count == 2
+    # No re-queue because budget is exhausted.
+    assert runner._pending_claim_retries == []
+    # And the target rolls up to exhausted via _refresh_target_after_verification.
+    assert runner.state.targets[target.target_id].status == "exhausted"
