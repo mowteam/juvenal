@@ -2576,6 +2576,38 @@ def test_sweep_dead_dep_targets_walks_retry_chain(tmp_path):
     assert runner.state.targets[dependent.target_id].status == "queued"
 
 
+def test_sweep_dead_dep_targets_treats_terminal_target_claim_as_dead(tmp_path):
+    """A rejected dep claim with retry budget remaining is functionally dead
+    if its target is in a terminal status (blocked/exhausted/no_findings/
+    completed) — `_rebuild_pending_claim_retries` excludes terminal-target
+    claims from the retry queue, so the budget is unreachable. The sweep
+    must treat such claims as dead so dependents can be blocked instead of
+    deadlocking the queue. Production regression: in the openthread run,
+    27 queued targets sat with 0 workers in flight because their dep
+    claims showed retry_count=4/10 (looked alive) but the claims' targets
+    were already blocked (so no retry would ever fire)."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=10)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    parent = _system_split_target("target-parent")
+    parent.status = "blocked"  # terminal — its claims are stranded
+    runner.state.targets[parent.target_id] = parent
+    parent_claim = _system_split_claim("claim-parent", parent.target_id)
+    parent_claim.status = "rejected"
+    parent_claim.retry_count = 4  # well below max=10, looks alive
+    runner.state.claims[parent_claim.claim_id] = parent_claim
+
+    dependent = _system_split_target("target-dependent")
+    dependent.status = "queued"
+    dependent.depends_on_claim_ids = [parent_claim.claim_id]
+    runner.state.targets[dependent.target_id] = dependent
+
+    progressed = runner._sweep_dead_dep_targets()
+
+    assert progressed is True
+    assert runner.state.targets[dependent.target_id].status == "blocked"
+
+
 def test_sweep_dead_dep_targets_respects_pending_retry_queue(tmp_path):
     """If the dep claim is exhausted on disk but is sitting in the runtime
     retry queue (e.g. just re-queued by a no_findings retry result before

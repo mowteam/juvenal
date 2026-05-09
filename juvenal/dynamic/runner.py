@@ -3678,10 +3678,20 @@ class DynamicAnalysisRunner:
             if claim.status in ("proposed", "verifying"):
                 return False
             if claim.status == "rejected":
-                if claim.retry_count < self.config.max_worker_retries:
-                    return False
-                if (claim.target_id, claim.claim_id) in pending_retry_keys:
-                    return False
+                # A claim is only retryable if its target isn't terminal —
+                # `_rebuild_pending_claim_retries` filters out claims whose
+                # target is in a terminal status, so retry_count alone is
+                # not enough. Without this guard, dependents wedge waiting
+                # on stranded mid-budget claims that can never re-dispatch
+                # (target was blocked/exhausted/no_findings via some other
+                # path while the claim still had budget).
+                target = self.state.targets.get(claim.target_id)
+                target_terminal = target is not None and target.status in _TERMINAL_TARGET_STATUSES
+                if not target_terminal:
+                    if claim.retry_count < self.config.max_worker_retries:
+                        return False
+                    if (claim.target_id, claim.claim_id) in pending_retry_keys:
+                        return False
             for rid in claim.retry_claim_ids:
                 stack.append(rid)
         return True
