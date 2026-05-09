@@ -48,6 +48,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
         "target.blocked",
         "target.exhausted",
         "directive.received",
+        "captain.proposal_dropped",
     }
 )
 _NON_TERMINAL_STATUSES = frozenset({"queued", "running", "verifying", "deferred", "requeue_pending"})
@@ -66,6 +67,7 @@ _DASHBOARD_EVENT_KINDS = frozenset(
         "target.deferred",
         "directive.received",
         "directive.acknowledged",
+        "captain.proposal_dropped",
     }
 )
 _IDLE_SLEEP_SECONDS = 0.05
@@ -759,6 +761,7 @@ class DynamicAnalysisRunner:
             or delta.blocked_target_ids
             or delta.exhausted_target_ids
             or delta.pending_directive_ids
+            or delta.dropped_proposals
         ):
             return True
 
@@ -1714,6 +1717,7 @@ class DynamicAnalysisRunner:
                     or delta.blocked_target_ids
                     or delta.exhausted_target_ids
                     or delta.pending_directive_ids
+                    or delta.dropped_proposals
                 )
             ):
                 # Genuine retry-budget failure: every target reached terminal,
@@ -1732,6 +1736,7 @@ class DynamicAnalysisRunner:
                     or delta.blocked_target_ids
                     or delta.exhausted_target_ids
                     or delta.pending_directive_ids
+                    or delta.dropped_proposals
                 )
                 and self._last_captain_snapshot == self._captain_snapshot()
                 and self._captain_termination_state != "complete"
@@ -1824,6 +1829,17 @@ class DynamicAnalysisRunner:
         }
         self._atomic_write(ctx / "claims.json", json.dumps(claims, indent=2, sort_keys=True))
 
+        # taken_target_ids.json — every target_id ever registered (terminal
+        # AND non-terminal). The captain proposes new targets via
+        # `enqueue_targets[].target_id`, and `_normalize_captain_targets`
+        # silently drops proposals that collide with any existing id. Without
+        # this list the captain can't tell which ids are taken — terminal
+        # targets are absent from frontier.json, so a captain that re-uses an
+        # old id (e.g. `target-foo-t17` when an old `t17` is already
+        # no_findings) will see its whole batch evaporate with no feedback.
+        taken_ids = sorted(self.state.targets.keys())
+        self._atomic_write(ctx / "taken_target_ids.json", json.dumps(taken_ids, indent=2))
+
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1878,6 +1894,12 @@ class DynamicAnalysisRunner:
             "blocked_targets": list(delta.blocked_target_ids),
             "exhausted_targets": list(delta.exhausted_target_ids),
             "frontier_counts": delta.frontier_counts,
+            # If your previous turn proposed targets that didn't stick, they
+            # show up here with the reason. Most common cause: target_id
+            # collides with an already-terminal target (terminal targets
+            # aren't in frontier.json, so you can't see them — generate
+            # fresher ids, e.g. include a turn-number or hash suffix).
+            "dropped_proposals": delta.dropped_proposals,
         }
         mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         mode_note = (
@@ -1893,6 +1915,9 @@ class DynamicAnalysisRunner:
             f"  - {ctx / 'frontier.json'} — current non-terminal targets with full instructions\n"
             f"  - {ctx / 'mental_model.md'} — your most recent mental model\n"
             f"  - {ctx / 'claims.json'} — every verified and rejected claim with full detail\n"
+            f"  - {ctx / 'taken_target_ids.json'} — every target_id already registered "
+            "(terminal + non-terminal). When proposing new `enqueue_targets`, every "
+            "`target_id` MUST be absent from this list — collisions are silently dropped.\n"
             "  These files are rewritten before every captain turn. Use Read / Grep to pull "
             "specific items when you need them — do not assume the prompt contains complete state.\n"
         )
@@ -3013,13 +3038,43 @@ class DynamicAnalysisRunner:
         normalized: list[TargetRecord] = []
         seen_ids: set[str] = set()
         for proposal in turn.enqueue_targets:
-            if proposal.target_id in seen_ids or proposal.target_id in self.state.targets:
+            # Surface drops as events so the captain sees them on its next
+            # delta and can self-correct (and so users on --interactive see
+            # the reason in the dashboard). Without this, the captain
+            # repeatedly proposes targets that get silently filtered and
+            # never learns why — its frontier-context files only list
+            # non-terminal targets, so it can't tell which ids are taken.
+            if proposal.target_id in seen_ids:
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason="duplicate-in-this-batch",
+                )
+                continue
+            if proposal.target_id in self.state.targets:
+                existing_status = self.state.targets[proposal.target_id].status
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason=f"target-id-already-exists (status={existing_status})",
+                )
                 continue
             try:
                 validate_target_scope(proposal.scope_paths, self.working_dir)
-            except ValueError:
+            except ValueError as exc:
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason=f"scope-invalid: {exc}",
+                )
                 continue
-            if any(dependency_id not in self.state.claims for dependency_id in proposal.depends_on_claim_ids):
+            missing_deps = [d for d in proposal.depends_on_claim_ids if d not in self.state.claims]
+            if missing_deps:
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason=f"depends_on_claim_ids references unknown claim(s): {missing_deps}",
+                )
                 continue
             seen_ids.add(proposal.target_id)
             normalized.append(

@@ -2576,6 +2576,105 @@ def test_sweep_dead_dep_targets_walks_retry_chain(tmp_path):
     assert runner.state.targets[dependent.target_id].status == "queued"
 
 
+def test_normalize_captain_targets_emits_drop_event_on_id_collision(tmp_path):
+    """When the captain proposes a target_id that already exists (likely a
+    terminal-status target the captain can't see in frontier.json), the
+    proposal is silently filtered. The runner must emit a
+    `captain.proposal_dropped` event so (a) the user sees it in the
+    interactive dashboard and (b) the captain sees it on its next delta
+    and self-corrects. Production regression: in the openthread run, the
+    captain proposed batches of 12 targets that all evaporated because
+    their ids collided with old terminal targets — captain had no
+    feedback and just kept retrying the same pattern."""
+    from juvenal.dynamic.models import CaptainTurn, TargetProposal
+
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    existing = _system_split_target("target-collide")
+    existing.status = "no_findings"
+    runner.state.targets[existing.target_id] = existing
+
+    src_path = tmp_path / "src"
+    src_path.mkdir()
+    (src_path / "app.py").write_text("# stub\n", encoding="utf-8")
+
+    turn = CaptainTurn(
+        message_to_user="",
+        acknowledged_directive_ids=[],
+        mental_model_summary="",
+        open_questions=[],
+        enqueue_targets=[
+            TargetProposal(
+                target_id="target-collide",
+                title="Collides with the existing terminal target id",
+                kind="module-level",
+                priority=80,
+                scope_paths=["src/app.py"],
+                scope_symbols=[],
+                instructions="Doesn't matter; will be dropped.",
+                depends_on_claim_ids=[],
+                spawn_reason="Test fixture.",
+            ),
+        ],
+        defer_target_ids=[],
+        termination_state="continue",
+        termination_reason="",
+    )
+
+    normalized = runner._normalize_captain_targets(turn)
+
+    assert normalized == []
+    drop_events = [e for e in runner.state.events if e.event_type == "captain.proposal_dropped"]
+    assert len(drop_events) == 1
+    assert drop_events[0].target_id == "target-collide"
+    assert "already-exists" in (drop_events[0].payload or {}).get("reason", "")
+
+
+def test_pending_captain_delta_includes_dropped_proposals(tmp_path):
+    """The CaptainDelta surfaces dropped proposals so the captain sees them
+    on its next turn and can fix the cause."""
+    from juvenal.dynamic.models import CaptainTurn, TargetProposal
+
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    existing = _system_split_target("target-already")
+    existing.status = "blocked"
+    runner.state.targets[existing.target_id] = existing
+    src_path = tmp_path / "src"
+    src_path.mkdir()
+    (src_path / "app.py").write_text("# stub\n", encoding="utf-8")
+
+    turn = CaptainTurn(
+        message_to_user="",
+        acknowledged_directive_ids=[],
+        mental_model_summary="",
+        open_questions=[],
+        enqueue_targets=[
+            TargetProposal(
+                target_id="target-already",
+                title="Collides",
+                kind="module-level",
+                priority=80,
+                scope_paths=["src/app.py"],
+                scope_symbols=[],
+                instructions="Will be dropped.",
+                depends_on_claim_ids=[],
+                spawn_reason="Test fixture.",
+            ),
+        ],
+        defer_target_ids=[],
+        termination_state="continue",
+        termination_reason="",
+    )
+
+    runner._normalize_captain_targets(turn)
+    delta = runner.state.pending_captain_delta()
+
+    assert any(d["target_id"] == "target-already" for d in delta.dropped_proposals)
+
+
 def test_should_terminate_succeeds_when_some_exhausted_but_claims_verified(tmp_path):
     """All-terminal frontier with at least one verified claim is a SUCCESS,
     even if some targets exhausted along the way. Production regression: in

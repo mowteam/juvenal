@@ -298,6 +298,7 @@ class CaptainDelta:
     exhausted_target_ids: list[str]
     pending_directive_ids: list[str]
     frontier_counts: dict[str, int]
+    dropped_proposals: list[dict[str, str]] = field(default_factory=list)
 
 
 __all__ = [

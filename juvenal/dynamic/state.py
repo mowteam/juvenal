@@ -36,6 +36,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
         "target.blocked",
         "target.exhausted",
         "directive.received",
+        "captain.proposal_dropped",
     }
 )
 _FRONTIER_STATUSES = (
@@ -397,6 +398,14 @@ class DynamicSessionState:
                     ]
                 ),
                 frontier_counts=frontier_counts,
+                dropped_proposals=[
+                    {
+                        "target_id": event.target_id or "",
+                        "reason": (event.payload or {}).get("reason", ""),
+                    }
+                    for event in unread_events
+                    if event.event_type == "captain.proposal_dropped"
+                ],
             )
 
     def record_captain_turn(self, turn: CaptainTurn, delivered_event_seq: int) -> None:
