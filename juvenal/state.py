@@ -345,16 +345,22 @@ class PipelineState:
             console.print()
             title = f"[cyan]{pid}[/] Analysis Detail (captain turn {summary['captain_turns']})"
             console.print(Panel(detail_table, title=title, border_style="dim"))
-            # `running` and `verifying` count actual in-flight agents (workers
-            # / verifiers in status="running"), not unique target IDs. A target
-            # with two simultaneous claim-retry workers contributes 2 to the
-            # running count, not 1 — matches the agent-pool budget.
+            # `workers` and `verifiers` count actual in-flight agents
+            # (worker_attempts / verifications in status="running"), not
+            # per-target status — distinct from the table's `running` /
+            # `verifying` columns which are per-target. The agent counts are
+            # what govern the budget; the per-target counts (queued,
+            # no_findings, blocked/exhausted, completed) cover frontier
+            # accounting and sum to `total` along with the running/verifying
+            # target subtotals not separately broken out here.
             line = (
                 f"  {summary['total']} targets | "
                 f"{summary['completed']} completed | "
+                f"{summary['queued']} queued | "
+                f"{summary['no_findings']} no_findings | "
                 f"{summary['blocked']} blocked/exhausted | "
-                f"{summary['active_verifiers']} verifying | "
-                f"{summary['active_workers']} running | "
+                f"{summary['active_workers']} workers | "
+                f"{summary['active_verifiers']} verifiers | "
                 f"{summary['claims_verified']} claims verified | "
                 f"{summary['claims_rejected']} claims rejected"
             )
@@ -421,6 +427,8 @@ class PipelineState:
         summary: dict[str, Any] = {
             "total": len(sorted_targets),
             "completed": 0,
+            "queued": 0,
+            "no_findings": 0,
             "blocked": 0,
             "verifying": 0,
             "running": 0,
@@ -495,6 +503,10 @@ class PipelineState:
             # Update summary counters
             if target.status == "completed":
                 summary["completed"] += 1
+            elif target.status == "queued":
+                summary["queued"] += 1
+            elif target.status == "no_findings":
+                summary["no_findings"] += 1
             elif target.status in ("blocked", "exhausted"):
                 summary["blocked"] += 1
             elif target.status == "verifying":
