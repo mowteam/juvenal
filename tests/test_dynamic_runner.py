@@ -2369,32 +2369,29 @@ def test_reconcile_orphaned_running_target_blocks_after_budget_exhausted(tmp_pat
     assert recovered.active_attempt_id is None
 
 
-def test_claim_retry_no_findings_requeues_when_budget_remains(tmp_path):
-    """When a retry worker returns `no_findings` (or `blocked`), the original
-    claim's retry_count is incremented but the claim must also be re-added
-    to `_pending_claim_retries` if budget remains. Without the re-queue, the
-    target gets set back to `status="queued"` by
-    `_refresh_target_after_verification` but the runtime queue stays empty,
-    so the next retry attempt never fires — targets wedge with rejected
-    claims that still have retry budget. Production regression: in the
-    openthread bug-bounty run, 14 claims sat at retry_count between 2/10
-    and 9/10 without dispatching, while the worker pool ran at 1/8."""
+def test_claim_retry_no_findings_burns_full_budget_and_exhausts(tmp_path):
+    """A retry worker returning `no_findings` confirms the rejection — it's
+    a kill, not a budget tick. The runner consumes the full remaining
+    budget so the claim immediately exhausts and the target rolls up to
+    `exhausted` via _refresh_target_after_verification. Re-running the
+    same investigation N more times just to re-confirm the worker's
+    confirmation wastes tokens."""
     from juvenal.backends import AgentResult
     from juvenal.dynamic.models import WorkerReport
     from juvenal.dynamic.runner import _WorkerExecutionResult
 
     config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=10)
     runner = _make_unstarted_runner(tmp_path, config)
-    target = _system_split_target("target-rq")
+    target = _system_split_target("target-kill")
     target.status = "running"
     runner.state.targets[target.target_id] = target
 
-    claim = _system_split_claim("claim-rq", target.target_id)
+    claim = _system_split_claim("claim-kill", target.target_id)
     claim.status = "rejected"
-    claim.retry_count = 5
+    claim.retry_count = 5  # 5 budget remaining
     runner.state.claims[claim.claim_id] = claim
 
-    attempt = _system_split_attempt("attempt-retry-rq", target.target_id)
+    attempt = _system_split_attempt("attempt-kill", target.target_id)
     attempt.status = "running"
     attempt.retry_claim_id = claim.claim_id
     target.active_attempt_id = attempt.attempt_id
@@ -2409,7 +2406,7 @@ def test_claim_retry_no_findings_requeues_when_budget_remains(tmp_path):
             task_id=attempt.attempt_id,
             target_id=target.target_id,
             outcome="no_findings",
-            summary="Could not reproduce.",
+            summary="Worker confirms no evidence.",
             claims=[],
             blocker=None,
             follow_up_hints=[],
@@ -2420,38 +2417,34 @@ def test_claim_retry_no_findings_requeues_when_budget_remains(tmp_path):
         error="",
     )
 
-    assert runner._pending_claim_retries == []
-
     runner._apply_worker_result(result)
 
-    # Budget consumed by 1.
-    assert runner.state.claims[claim.claim_id].retry_count == 6
-    # And the next retry is queued so it actually fires.
-    assert (target.target_id, claim.claim_id) in runner._pending_claim_retries
-    # Target is back to a re-schedulable shape.
-    assert runner.state.targets[target.target_id].status == "queued"
+    # Full budget burned — claim is at max immediately, no further retries.
+    assert runner.state.claims[claim.claim_id].retry_count == 10
+    assert runner._pending_claim_retries == []
+    # Target rolls up to exhausted on this same call.
+    assert runner.state.targets[target.target_id].status == "exhausted"
 
 
-def test_claim_retry_no_findings_does_not_requeue_when_budget_exhausted(tmp_path):
-    """When retry_count reaches max_worker_retries after a no_findings retry,
-    the claim must NOT be re-queued — it's exhausted. Without this guard the
-    fix above would loop forever past the budget cap."""
+def test_claim_retry_blocked_also_kills(tmp_path):
+    """`blocked` retry result is treated identically to `no_findings`:
+    worker can't continue → rejection stands → kill. Same exhaust semantics."""
     from juvenal.backends import AgentResult
     from juvenal.dynamic.models import WorkerReport
     from juvenal.dynamic.runner import _WorkerExecutionResult
 
-    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=2)
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=10)
     runner = _make_unstarted_runner(tmp_path, config)
-    target = _system_split_target("target-exh")
+    target = _system_split_target("target-blk")
     target.status = "running"
     runner.state.targets[target.target_id] = target
 
-    claim = _system_split_claim("claim-exh", target.target_id)
+    claim = _system_split_claim("claim-blk", target.target_id)
     claim.status = "rejected"
-    claim.retry_count = 1  # next bump pushes to max=2
+    claim.retry_count = 2
     runner.state.claims[claim.claim_id] = claim
 
-    attempt = _system_split_attempt("attempt-exh", target.target_id)
+    attempt = _system_split_attempt("attempt-blk", target.target_id)
     attempt.status = "running"
     attempt.retry_claim_id = claim.claim_id
     target.active_attempt_id = attempt.attempt_id
@@ -2466,7 +2459,7 @@ def test_claim_retry_no_findings_does_not_requeue_when_budget_exhausted(tmp_path
             task_id=attempt.attempt_id,
             target_id=target.target_id,
             outcome="blocked",
-            summary="Blocked.",
+            summary="Cannot proceed.",
             claims=[],
             blocker="missing context",
             follow_up_hints=[],
@@ -2479,9 +2472,9 @@ def test_claim_retry_no_findings_does_not_requeue_when_budget_exhausted(tmp_path
 
     runner._apply_worker_result(result)
 
-    assert runner.state.claims[claim.claim_id].retry_count == 2
-    # No re-queue because budget is exhausted.
+    assert runner.state.claims[claim.claim_id].retry_count == 10
     assert runner._pending_claim_retries == []
+    assert runner.state.targets[target.target_id].status == "exhausted"
     # And the target rolls up to exhausted via _refresh_target_after_verification.
     assert runner.state.targets[target.target_id].status == "exhausted"
 

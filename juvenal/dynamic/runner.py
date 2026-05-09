@@ -2762,26 +2762,16 @@ class DynamicAnalysisRunner:
         original_claim = self.state.claims.get(attempt.retry_claim_id or "")
 
         if report.outcome in ("no_findings", "blocked"):
-            # Retry worker confirms the claim was false or can't determine.
-            # Consume one unit of the retry budget. If budget remains, re-queue
-            # the original claim so the next attempt actually fires — without
-            # this, _refresh_target_after_verification sets target.status
-            # back to "queued" but _pending_claim_retries stays empty, and
-            # the target wedges (queued, but invisible to both initial
-            # dispatch (deps unsatisfied) and retry dispatch (not in queue))
-            # until the next --resume rebuilds the queue from disk state.
+            # The retry worker confirms the rejection: either it actively
+            # found no evidence (no_findings) or it cannot proceed
+            # (blocked). Either way the worker now agrees the claim was
+            # false — running the same investigation 9 more times to
+            # re-confirm wastes tokens. Burn the entire remaining budget
+            # so _refresh_target_after_verification rolls the target up to
+            # `exhausted` immediately, and the dead-dep sweep can cascade
+            # any dependents to `blocked` on the next loop tick.
             if original_claim is not None:
-                original_claim.retry_count += 1
-                if original_claim.retry_count < self.config.max_worker_retries and not self._has_pending_retry(
-                    original_claim
-                ):
-                    self._pending_claim_retries.append((target.target_id, original_claim.claim_id))
-                    self.state.append_event(
-                        "claim.retry_scheduled",
-                        target_id=target.target_id,
-                        claim_id=original_claim.claim_id,
-                        generation=attempt.generation,
-                    )
+                original_claim.retry_count = self.config.max_worker_retries
             self._refresh_target_after_verification(target)
             self.state.save()
             return
