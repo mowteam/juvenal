@@ -18,6 +18,7 @@ from juvenal.checkers import VerificationReport, parse_verification_report
 from juvenal.display import Display
 from juvenal.dynamic.interaction import UserInteractionChannel
 from juvenal.dynamic.models import (
+    AttackSurfaceState,
     CaptainTurn,
     ClaimRecord,
     TargetRecord,
@@ -36,7 +37,7 @@ from juvenal.dynamic.protocol import (
 )
 from juvenal.dynamic.state import DynamicSessionState
 from juvenal.execution import PhaseResult
-from juvenal.workflow import AnalysisConfig, Phase, ReporterSpec, VerifierSpec, Workflow, apply_vars
+from juvenal.workflow import AnalysisConfig, AnalystSpec, Phase, ReporterSpec, VerifierSpec, Workflow, apply_vars
 
 _CAPTAIN_EVENT_TYPES = frozenset(
     {
@@ -133,12 +134,16 @@ _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
         "worker": "claude-opus-4-7",
         "verifier": "claude-opus-4-6",
         "reporter": "claude-sonnet-4-6",
+        # Analyst defaults to opus 4.7 with the 1M-context beta because it
+        # reads a lot (codebase, docs, web research) before producing the brief.
+        "analyst": "claude-opus-4-7[1m]",
     },
     "codex": {
         "captain": None,
         "worker": None,
         "verifier": None,
         "reporter": None,
+        "analyst": None,
     },
 }
 
@@ -183,7 +188,111 @@ class _ReporterExecutionResult:
     error: str | None
 
 
+@dataclass
+class _AnalystExecutionResult:
+    agent_result: AgentResult
+    brief: str
+    error: str | None
+
+
 _MAX_REPORTER_ATTEMPTS = 3
+# After this many seconds since CREATION, a Claude session is considered too old
+# to safely resume. The Anthropic CLI does not always error on stale --resume —
+# sometimes it silently starts a fresh session that lacks the original system
+# prompt, which makes the worker emit free-form text without the structured
+# WORKER_JSON block. When we detect a stale parent session, we cold-restart
+# with run_agent + the original system_prompt instead of resuming.
+#
+# This threshold needs to be MUCH LONGER than typical pause-and-resume gaps:
+# a long-running analysis that started yesterday morning and paused/resumes a
+# few hours later still has session IDs that are 12+ hours old, but those
+# sessions are normally still resumable. Set high enough that we only flip
+# to cold-restart for runs paused across days, where the symptom (silent
+# fresh sessions returning unstructured output) has actually been observed.
+_SESSION_STALENESS_THRESHOLD_SECONDS = 36 * 3600
+
+# Substrings that indicate an Anthropic / Claude CLI rate-limit response. Used
+# to distinguish errors worth a long backoff sleep ("wait it out") from errors
+# where backoff would not help (parse failures, identity mismatches, etc.).
+_RATE_LIMIT_ERROR_SIGNATURES = (
+    "rate limit",
+    "rate_limit",
+    "monthly usage limit",
+    "monthly limit",
+    "out of extra usage",
+    "you've hit your limit",
+    "your limit · resets",
+    "429",
+)
+_DEFAULT_ANALYST_PROMPT = """You are the project's attack-surface analyst for a Juvenal bug-finding run.
+
+Your job is to produce ONE structured project brief that the captain, workers, and verifiers \
+will use as the source of truth for the project's trust model and attack surface throughout \
+the rest of the analysis. You run exactly once at the start of the analysis. Be thorough but \
+concise: cap your brief at roughly 8,000 words.
+
+Investigate using whatever tools are available — Read / Grep / Glob across the repository at \
+the path noted below, plus WebFetch / WebSearch for the project's documentation, security \
+policy, threat model, prior CVEs, and public bug-bounty scope. Do NOT modify any files in \
+the repo.
+
+Repository root: {working_dir}
+
+Mission context (the workflow this analysis is running under):
+
+{mission}
+
+Required brief structure (use these section headers verbatim):
+
+# Project Brief
+
+## Project identity
+One paragraph: what this project is, what role it plays, who maintains it, the language(s), \
+and any version pinned by the run.
+
+## Trust model & threat model
+Who is trusted (operators, signed peers, local users) vs. who is untrusted (network peers, \
+arbitrary users, attacker-controlled inputs). Cite the project's own docs / SECURITY.md / \
+threat-model docs where they exist; quote them. If the project explicitly documents an \
+attacker model, say so.
+
+## Attack surface — entry points
+Concrete enumeration of externally reachable interfaces: network listeners (protocol, port, \
+default exposure), CLI tools that take attacker-controlled input, file-format parsers, RPC \
+endpoints, public APIs. Mark each as in-scope or out-of-scope where the project says so.
+
+## Authentication & authorization boundaries
+Where the project draws privilege lines, what credentials gate what, what an unauthenticated \
+network peer can do vs. an authenticated one, etc.
+
+## Privilege & sandbox boundaries
+Process boundaries, syscall filters, container/namespace assumptions, plugin/extension \
+loading, anything documented as a sandbox or escape-relevant boundary.
+
+## Documented out-of-scope / by-design behaviors
+Anything the project explicitly documents as not-a-bug, won't-fix, or by-design — including \
+stated assumptions about input validation done elsewhere, trusted-input contracts, etc. \
+Verifiers will use this to avoid filing design-critique reports.
+
+## Known CVE classes & prior findings
+A short list of the categories of issues this project has historically had (memory safety, \
+parser confusion, type confusion, race conditions, etc.) and a couple of representative CVE \
+identifiers if available. This helps the captain prioritize variant analysis.
+
+## Bounty scope
+If a public bug-bounty program is documented, summarize: which components/repos/branches/ \
+versions are in scope, what is explicitly out of scope, what severity buckets exist. If \
+none, say so.
+
+## Quick-reference for verifiers
+A bulleted set of tight rules verifiers can check at a glance, e.g.:
+- "The XYZ daemon trusts its own admin socket but not its network listener."
+- "Project explicitly documents that file format ABC is not parsed in untrusted contexts."
+- "Bug class X is out of scope per <doc>."
+
+End your output after the Quick-reference section. Do not append meta-commentary about your \
+own process.
+"""
 
 
 class DynamicAnalysisRunner:
@@ -239,6 +348,11 @@ class DynamicAnalysisRunner:
         self._worker_executor = ThreadPoolExecutor(max_workers=self._max_worker_cap)
         self._verifier_executor = ThreadPoolExecutor(max_workers=self._max_verifier_cap)
         self._reporter_executor = ThreadPoolExecutor(max_workers=max(1, self.config.max_workers))
+        self._analyst_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-analyst")
+        self._analyst_future: Future[_AnalystExecutionResult] | None = None
+        # Stale-session warnings are debounced per-session so a target with N
+        # retries doesn't emit N copies of the same warning.
+        self._logged_stale_sessions: set[str] = set()
         self._worker_futures: dict[Future[_WorkerExecutionResult], str] = {}
         self._verifier_futures: dict[Future[_VerifierExecutionResult], str] = {}
         self._reporter_futures: dict[Future[_ReporterExecutionResult], str] = {}
@@ -306,6 +420,11 @@ class DynamicAnalysisRunner:
         if self._reporter_spec is not None and self._reporter_spec.prompt:
             self._rendered_reporter_prompt = apply_vars(self._reporter_spec.prompt, self.workflow.vars)
 
+        self._analyst_spec: AnalystSpec | None = self.config.analyst if self.config.analyst is not None else None
+        self._rendered_analyst_prompt: str = ""
+        if self._analyst_spec is not None and self._analyst_spec.prompt:
+            self._rendered_analyst_prompt = apply_vars(self._analyst_spec.prompt, self.workflow.vars)
+
         self._rendered_worker_prompt: str = ""
         if self.config.worker_prompt:
             self._rendered_worker_prompt = apply_vars(self.config.worker_prompt, self.workflow.vars)
@@ -331,6 +450,7 @@ class DynamicAnalysisRunner:
 
         self._rebuild_pending_claim_retries()
         self._rebuild_pending_reporter_claim_ids()
+        self._maybe_start_analyst()
 
         # Chat dashboard: --interactive without an injected test channel.
         # Tests inject a ScriptedInteractionChannel and route through _run_batch
@@ -348,6 +468,9 @@ class DynamicAnalysisRunner:
             self._last_review_snapshot = self._review_snapshot()
             if self._interaction_channel is not None:
                 self._interaction_channel.start()
+
+            if not self._wait_for_analyst():
+                return PhaseResult(success=False, failure_context="interrupted while waiting for analyst")
 
             while True:
                 terminate, success, reason = self._should_terminate()
@@ -387,12 +510,14 @@ class DynamicAnalysisRunner:
             return PhaseResult(success=False, failure_context="interrupted by user (Ctrl-C)")
         finally:
             self.kill_active()
+            self._finalize_analyst_on_shutdown()
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
             _flush_stdin_buffer()
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
+            self._analyst_executor.shutdown(wait=False, cancel_futures=True)
 
     def _run_chat(self) -> PhaseResult:
         """Chat-dashboard execution: captain runs on a background thread; the user
@@ -414,6 +539,9 @@ class DynamicAnalysisRunner:
                 self._interaction_channel.start()
             self._dashboard.start()
             self._paint_dashboard()
+
+            if not self._wait_for_analyst():
+                return PhaseResult(success=False, failure_context="interrupted while waiting for analyst")
 
             while True:
                 terminate, success, reason = self._should_terminate()
@@ -460,6 +588,7 @@ class DynamicAnalysisRunner:
             # this, Ctrl-C requires multiple presses because Python won't
             # exit while a thread is blocked in subprocess.Popen.wait().
             self.kill_active()
+            self._finalize_analyst_on_shutdown()
             if self._captain_executor is not None:
                 self._captain_executor.shutdown(wait=False, cancel_futures=True)
             if self._dashboard is not None:
@@ -475,6 +604,7 @@ class DynamicAnalysisRunner:
             self._worker_executor.shutdown(wait=False, cancel_futures=True)
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
+            self._analyst_executor.shutdown(wait=False, cancel_futures=True)
 
     def _apply_continuous_directives(self) -> bool:
         if self._interaction_channel is None or self.state.control.stop_requested:
@@ -678,9 +808,10 @@ class DynamicAnalysisRunner:
         self._add_tokens(result)
         self._note_agent_result(result)
         if result.exit_code != 0:
-            # Captain crash — likely rate limit. Backoff and retry on next loop iteration.
-            self._consecutive_errors += 1
-            self._rate_limit_backoff()
+            # Captain crash. Classify: only sleep on actual rate-limit signatures —
+            # other captain crashes (e.g., parse errors mid-stream) won't recover
+            # by waiting and shouldn't waste backoff time.
+            self._record_infrastructure_error(result)
             return
 
         try:
@@ -753,9 +884,9 @@ class DynamicAnalysisRunner:
             self._add_tokens(result)
             self._note_agent_result(result)
             if result.exit_code != 0:
-                # Captain repair crash — likely rate limit
-                self._consecutive_errors += 1
-                self._rate_limit_backoff()
+                # Captain repair crash. Same classification as the main captain
+                # path: only sleep on actual rate-limit signatures.
+                self._record_infrastructure_error(result)
                 return None
             try:
                 return parse_captain_output(result.output)
@@ -832,28 +963,57 @@ class DynamicAnalysisRunner:
         scheduled = False
         for target in queued_targets[:available]:
             attempt = self._start_worker_attempt(target)
-            system_prompt, user_prompt = self._build_worker_prompt(target, attempt)
-            future = self._worker_executor.submit(self._execute_worker_attempt, attempt, user_prompt, system_prompt)
+            try:
+                system_prompt, user_prompt = self._build_worker_prompt(target, attempt)
+                future = self._worker_executor.submit(self._execute_worker_attempt, attempt, user_prompt, system_prompt)
+            except Exception as exc:
+                # Prompt-build / submit failed AFTER the attempt was persisted
+                # as running. Without this revert, the attempt sits at
+                # status="running" with no tracking future and its slot leaks
+                # from the budget pool until --resume. Mark it failed so
+                # _reconcile_orphaned_running_state isn't even needed for this
+                # path on the same run, and so the target can re-queue.
+                self._fail_orphan_attempt(target, attempt, f"scheduling failed: {exc}")
+                continue
             self._worker_futures[future] = attempt.attempt_id
             scheduled = True
 
-        # Process pending claim retries within remaining budget
-        available = self._available_worker_slots()
-        if available > 0 and self._pending_claim_retries:
-            retries = self._pending_claim_retries[:available]
-            self._pending_claim_retries = self._pending_claim_retries[available:]
-            for target_id, claim_id in retries:
+        # Process pending claim retries within remaining budget. Per-target
+        # serialization: only one attempt may be in flight per target at a
+        # time. Without this, two sibling rejected claims belonging to the
+        # same target both dispatch concurrently, each call to
+        # `_start_claim_retry_attempt` overwrites `target.active_attempt_id`,
+        # and the loser's worker report is silently discarded by the
+        # mismatch guard in `_apply_worker_result` — leaving the target
+        # wedged at `status="running"` with `active_attempt_id=None`.
+        if self._pending_claim_retries:
+            available = self._available_worker_slots()
+            kept: list[tuple[str, str]] = []
+            consumed: set[str] = set()
+            for target_id, claim_id in self._pending_claim_retries:
                 target = self.state.targets.get(target_id)
                 claim = self.state.claims.get(claim_id)
                 if target is None or claim is None or claim.status != "rejected":
                     continue
                 if self._is_target_ignored(target):
                     continue
+                if available <= 0 or target.active_attempt_id is not None or target_id in consumed:
+                    kept.append((target_id, claim_id))
+                    continue
                 attempt = self._start_claim_retry_attempt(target, claim)
-                system_prompt, user_prompt = self._build_claim_retry_prompt(target, claim, attempt)
-                future = self._worker_executor.submit(self._execute_worker_attempt, attempt, user_prompt, system_prompt)
+                try:
+                    system_prompt, user_prompt = self._build_claim_retry_prompt(target, claim, attempt)
+                    future = self._worker_executor.submit(
+                        self._execute_worker_attempt, attempt, user_prompt, system_prompt
+                    )
+                except Exception as exc:
+                    self._fail_orphan_attempt(target, attempt, f"scheduling failed: {exc}")
+                    continue
                 self._worker_futures[future] = attempt.attempt_id
+                consumed.add(target_id)
+                available -= 1
                 scheduled = True
+            self._pending_claim_retries = kept
 
         return changed or scheduled
 
@@ -944,14 +1104,172 @@ class DynamicAnalysisRunner:
             verification.status = "running"
             verification.started_at = time.time()
             self.state.save()
-            system_prompt, user_prompt = self._build_verifier_prompt(target, claim, verification)
-            future = self._verifier_executor.submit(self._execute_verifier, verification, user_prompt, system_prompt)
+            try:
+                system_prompt, user_prompt = self._build_verifier_prompt(target, claim, verification)
+                future = self._verifier_executor.submit(
+                    self._execute_verifier, verification, user_prompt, system_prompt
+                )
+            except Exception as exc:
+                # Same orphan story as in `_schedule_workers`: revert
+                # status="running" before the exception propagates so the slot
+                # doesn't leak from the budget pool. Identical recovery to
+                # ``normalize_for_resume``: bounce back to "pending" with
+                # parent_session_id preserved for resume.
+                if verification.session_id and not verification.parent_session_id:
+                    verification.parent_session_id = verification.session_id
+                verification.status = "pending"
+                verification.started_at = None
+                verification.completed_at = None
+                verification.error = f"scheduling failed: {exc}"
+                verification.disposition = None
+                self.state.save()
+                continue
             self._verifier_futures[future] = verification.verification_id
             scheduled = True
         return changed or scheduled
 
+    def _fail_orphan_attempt(self, target: TargetRecord, attempt: WorkerAttempt, error: str) -> None:
+        """Revert an attempt that was marked ``running`` but never got a future.
+
+        Shared by `_schedule_workers` and the claim-retry submit path: when
+        prompt-build or executor.submit raises after `_start_*_attempt` has
+        already saved ``status="running"`` to disk, the slot would leak. This
+        helper performs the same recovery as the worker-future-crash path in
+        `_drain_completed_futures`, in-place.
+        """
+        attempt.status = "failed"
+        attempt.error = error
+        if attempt.completed_at is None:
+            attempt.completed_at = time.time()
+        if target.active_attempt_id == attempt.attempt_id:
+            target.active_attempt_id = None
+            target.error_retry_count += 1
+            if target.error_retry_count > self.config.max_worker_retries:
+                target.status = "blocked"
+            else:
+                target.status = "queued"
+            target.updated_at = time.time()
+        self.state.save()
+
+    def _reconcile_orphaned_running_state(self) -> bool:
+        """Reset any attempt/verification stuck at status="running" with no future.
+
+        The shared-budget pool is sized off ``len(_worker_futures) + len(_verifier_futures)``,
+        and the scheduling filters in step 1 of `_schedule_verifiers` and the
+        ``queued_targets`` filter in `_schedule_workers` skip any record that's
+        already running. So a record persisted as ``running`` in state but not
+        present in our futures dict is invisible to both scheduler and drainer:
+        the slot is free in the budget calc, but the scheduler cannot fill it
+        because the underlying claim/target is wedged behind the orphan.
+
+        How orphans arise: the scheduling code in
+        `_schedule_workers`/`_schedule_verifiers` sets ``status="running"`` and
+        saves state BEFORE building prompts and submitting the future. Any
+        exception between save-state and dict-assignment (filesystem hiccup
+        creating the scratch dir, prompt builder failure, executor at capacity,
+        etc.) leaves a "running" record with no tracking future. The original
+        run aborts on that exception, but on `--resume` the previous run's
+        in-flight work was reset by ``normalize_for_resume`` — we need the same
+        cleanup INSIDE a live run too, in case anything sneaks past.
+
+        Detection is cheap (set membership against the two futures dicts) and
+        safe to call every drain tick: a new attempt that was just submitted
+        cannot be an orphan because we always add to the futures dict
+        immediately after submit.
+        """
+        progressed = False
+        live_attempt_ids = set(self._worker_futures.values())
+        live_verification_ids = set(self._verifier_futures.values())
+
+        for attempt in self.state.worker_attempts.values():
+            if attempt.status != "running":
+                continue
+            if attempt.attempt_id in live_attempt_ids:
+                continue
+            attempt.status = "failed"
+            if attempt.completed_at is None:
+                attempt.completed_at = time.time()
+            if not attempt.error:
+                attempt.error = "orphaned-running-attempt-with-no-future"
+            target = self.state.targets.get(attempt.target_id)
+            if target is not None and target.active_attempt_id == attempt.attempt_id:
+                target.active_attempt_id = None
+                target.error_retry_count += 1
+                if target.error_retry_count > self.config.max_worker_retries:
+                    target.status = "blocked"
+                else:
+                    target.status = "queued"
+                target.updated_at = time.time()
+            progressed = True
+
+        for verification in self.state.verifications.values():
+            if verification.status != "running":
+                continue
+            if verification.verification_id in live_verification_ids:
+                continue
+            # Revert to "pending" so step 2 of `_schedule_verifiers` picks it up
+            # again. Preserve session_id as parent_session_id so the next
+            # attempt resumes the prior session if it had one. Identical
+            # treatment to ``normalize_for_resume`` for interrupted verifiers.
+            if verification.session_id and not verification.parent_session_id:
+                verification.parent_session_id = verification.session_id
+            verification.status = "pending"
+            verification.started_at = None
+            verification.completed_at = None
+            verification.error = "orphaned-running-verification-with-no-future"
+            verification.disposition = None
+            progressed = True
+
+        # Targets wedged at status="running" with no live attempt.
+        # Distinct from the orphan-attempt loop above: that loop only catches
+        # attempts persisted as "running"; this loop catches the inverse —
+        # the target says it's running but no attempt is. Historical cause:
+        # concurrent retries for the same target stomped active_attempt_id
+        # and both reports were discarded by the mismatch guard. Recovery is
+        # the same shape as the orphan-attempt path.
+        now = time.time()
+        for target in self.state.targets.values():
+            if target.status != "running":
+                continue
+            aid = target.active_attempt_id
+            if aid in live_attempt_ids:
+                continue
+            attempt = self.state.worker_attempts.get(aid) if aid else None
+            if attempt is not None and attempt.status == "running":
+                # Will be reconciled by the orphan-attempt loop above on this
+                # same call (it runs first). Skip — the attempt path also
+                # resets target.status, so we don't double-recover.
+                continue
+            target.active_attempt_id = None
+            target.error_retry_count += 1
+            if target.error_retry_count > self.config.max_worker_retries:
+                target.status = "blocked"
+                self.state.append_event(
+                    "target.blocked",
+                    target_id=target.target_id,
+                    generation=target.active_generation,
+                    blocker="orphaned-running-target-with-no-attempt",
+                )
+            else:
+                target.status = "queued"
+            target.updated_at = now
+            progressed = True
+
+        if progressed:
+            self.state.save()
+        return progressed
+
     def _drain_completed_futures(self) -> bool:
         progressed = False
+
+        # Detect and recover slots leaked by attempts/verifications stuck at
+        # status="running" with no tracking future. See the helper's docstring
+        # for the failure mode this protects against.
+        if self._reconcile_orphaned_running_state():
+            progressed = True
+
+        if self._drain_analyst_future():
+            progressed = True
 
         for future, attempt_id in list(self._worker_futures.items()):
             if not future.done():
@@ -975,7 +1293,7 @@ class DynamicAnalysisRunner:
                             target.status = "queued"
                         target.updated_at = time.time()
                     self.state.save()
-                self._record_infrastructure_error()
+                self._record_infrastructure_error(attempt.error if attempt is not None else str(exc))
                 continue
             self._apply_worker_result(result)
 
@@ -1571,8 +1889,11 @@ class DynamicAnalysisRunner:
             "specific items when you need them — do not assume the prompt contains complete state.\n"
         )
 
+        brief_block = self._project_brief_block()
         if is_first_turn:
             system_prompt = f"{self._captain_role_prompt}\n\nMission:\n{mission}"
+            if brief_block:
+                system_prompt = f"{system_prompt}\n\n{brief_block}"
             user_prompt = (
                 f"Repository root: {self.working_dir}\n"
                 f"Captain turn: 1\n"
@@ -1583,7 +1904,15 @@ class DynamicAnalysisRunner:
             )
         else:
             system_prompt = ""
+            # Captain turns 2+ use resume_agent, which inherits the system prompt
+            # set on turn 1. If the analyst finished after turn 1, re-inject the
+            # ready brief into the user prompt so the captain sees it. Anthropic
+            # prompt caching keeps the prefix cached across turns.
+            user_prompt_prefix = ""
+            if brief_block:
+                user_prompt_prefix = f"{brief_block}\n\n"
             user_prompt = (
+                f"{user_prompt_prefix}"
                 f"Captain turn: {self.state.captain.turn_index + 1}\n"
                 f"Mode: {mode_note}\n\n"
                 f"{files_block}\n"
@@ -1610,12 +1939,31 @@ class DynamicAnalysisRunner:
 
     def _worker_system_prompt(self) -> str:
         """Static system prompt for the worker: framework role + workflow scope."""
+        base = self._worker_role_prompt
         if self._rendered_worker_prompt:
-            return f"{self._worker_role_prompt}\n\n{self._rendered_worker_prompt}"
-        return self._worker_role_prompt
+            base = f"{base}\n\n{self._rendered_worker_prompt}"
+        brief_block = self._project_brief_block()
+        if brief_block:
+            base = f"{base}\n\n{brief_block}"
+        return base
+
+    def _scratch_dir_for_attempt(self, attempt: WorkerAttempt) -> Path:
+        """Per-attempt scratch directory for worker PoC artifacts.
+
+        Lives under .juvenal/scratch/ so it is hidden from the public output/
+        tree. The reporter copies any artifacts from this dir into
+        output/<bug-id>/ once verifiers pass.
+        """
+        return self.working_dir / ".juvenal" / "scratch" / attempt.attempt_id
 
     def _build_worker_prompt(self, target: TargetRecord, attempt: WorkerAttempt) -> tuple[str, str]:
         """Return (system_prompt, user_prompt) for an initial worker call."""
+        scratch_dir = self._scratch_dir_for_attempt(attempt)
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            scratch_rel = str(scratch_dir.relative_to(self.working_dir))
+        except ValueError:
+            scratch_rel = str(scratch_dir)
         task_packet = {
             "task_id": attempt.attempt_id,
             "target_id": target.target_id,
@@ -1628,9 +1976,11 @@ class DynamicAnalysisRunner:
             "instructions": target.instructions,
             "spawn_reason": target.spawn_reason,
             "allow_repo_tools": self.config.allow_repo_tools,
+            "scratch_dir": scratch_rel,
         }
         user_prompt = (
             f"Repository root: `{self.working_dir}`\n\n"
+            f"Scratch directory (PoC artifacts only — NEVER write under `output/`): `{scratch_rel}`\n\n"
             "Task packet:\n"
             f"```text\n{json.dumps(task_packet, indent=2)}\n```\n\n"
             "Verified dependencies:\n"
@@ -1675,8 +2025,24 @@ class DynamicAnalysisRunner:
             "next_verifier": next_name if next_name else "(none — final verifier)",
         }
         system_prompt = self._verifier_role_prompt
-        if rendered_scope:
-            system_prompt = f"{system_prompt}\n\n{rendered_scope}"
+        # Verifiers that opt in via `use_attack_surface_subagent: true` are a
+        # literal materialization of the `.claude/agents/attack-surface.md`
+        # subagent: load the subagent body and use it as the per-spec scope,
+        # replacing the YAML prompt. The brief is already embedded inside the
+        # subagent body so we skip the standard brief-block injection for
+        # them. Falls back to the YAML scope if the subagent file is missing
+        # (analyst failed / hasn't run).
+        subagent_scope: str | None = None
+        if spec.use_attack_surface_subagent:
+            subagent_scope = self._load_subagent_scope_for_verifier()
+        if subagent_scope is not None:
+            system_prompt = f"{system_prompt}\n\n{subagent_scope}"
+        else:
+            if rendered_scope:
+                system_prompt = f"{system_prompt}\n\n{rendered_scope}"
+            brief_block = self._project_brief_block()
+            if brief_block:
+                system_prompt = f"{system_prompt}\n\n{brief_block}"
         try:
             mission_path = self._mission_file.relative_to(self.working_dir)
         except ValueError:
@@ -1706,7 +2072,25 @@ class DynamicAnalysisRunner:
     ) -> _WorkerExecutionResult:
         backend = self._get_backend(self.config.worker_backend)
         worker_model = _resolve_model(self.config.worker_backend, "worker", self.config.worker_model)
-        if attempt.parent_session_id:
+        parent_session_id = attempt.parent_session_id
+        cold_restart = False
+        if parent_session_id and self._session_is_stale(parent_session_id):
+            # Parent session is too old to safely --resume (Claude session
+            # expiration). Cold-restart with run_agent + system_prompt so the
+            # worker has its full role + scope inherited from the start, and
+            # the retry feedback ships as part of the user prompt. We also
+            # drop the stale session_id below so the backend allocates a
+            # fresh UUID — passing the stale UUID via `--session-id` makes
+            # claude error with `Error: Session ID ... already in use`.
+            if parent_session_id not in self._logged_stale_sessions:
+                self._emit_analyst_message(
+                    f"[juvenal] parent session {parent_session_id[:8]} is stale; "
+                    "cold-restarting workers with system_prompt instead of --resume"
+                )
+                self._logged_stale_sessions.add(parent_session_id)
+            parent_session_id = None
+            cold_restart = True
+        if parent_session_id:
             # Claim retry: resume the prior worker's session so its context
             # (codebase reading, build state, prior reasoning) carries over
             # and the rejection feedback arrives as a continuation rather
@@ -1714,7 +2098,7 @@ class DynamicAnalysisRunner:
             # session's run_agent call and is inherited; we do not re-apply
             # it here.
             result = backend.resume_agent(
-                attempt.parent_session_id,
+                parent_session_id,
                 prompt,
                 working_dir=str(self.working_dir),
                 timeout=self.phase.timeout,
@@ -1722,6 +2106,12 @@ class DynamicAnalysisRunner:
                 model=worker_model,
             )
         else:
+            # On cold-restart, drop the (stale) attempt.session_id and let the
+            # backend allocate a fresh UUID — passing the stale UUID via
+            # `--session-id` makes claude error with `Error: Session ID …
+            # already in use`. _apply_worker_result will write the fresh
+            # session_id back onto the attempt record.
+            effective_session_id = None if cold_restart else attempt.session_id
             result = backend.run_agent(
                 prompt,
                 working_dir=str(self.working_dir),
@@ -1729,7 +2119,7 @@ class DynamicAnalysisRunner:
                 env=self._role_env("worker"),
                 model=worker_model,
                 system_prompt=system_prompt,
-                session_id=attempt.session_id,
+                session_id=effective_session_id,
             )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -1768,9 +2158,20 @@ class DynamicAnalysisRunner:
     ) -> _VerifierExecutionResult:
         backend = self._get_backend(verification.backend)
         spec = self._verifier_chain[verification.verifier_index]
-        if verification.parent_session_id:
+        parent_session_id = verification.parent_session_id
+        cold_restart = False
+        if parent_session_id and self._session_is_stale(parent_session_id):
+            if parent_session_id not in self._logged_stale_sessions:
+                self._emit_analyst_message(
+                    f"[juvenal] parent session {parent_session_id[:8]} is stale; "
+                    "cold-restarting verifiers with system_prompt instead of --resume"
+                )
+                self._logged_stale_sessions.add(parent_session_id)
+            parent_session_id = None
+            cold_restart = True
+        if parent_session_id:
             result = backend.resume_agent(
-                verification.parent_session_id,
+                parent_session_id,
                 prompt,
                 working_dir=str(self.working_dir),
                 timeout=self.phase.timeout,
@@ -1778,6 +2179,8 @@ class DynamicAnalysisRunner:
                 model=_resolve_model(spec.backend, "verifier", spec.model),
             )
         else:
+            # See _execute_worker_attempt for why cold_restart drops session_id.
+            effective_session_id = None if cold_restart else verification.session_id
             result = backend.run_agent(
                 prompt,
                 working_dir=str(self.working_dir),
@@ -1785,7 +2188,7 @@ class DynamicAnalysisRunner:
                 env=self._role_env("verifier", verifier_name=verification.verifier_name),
                 model=_resolve_model(spec.backend, "verifier", spec.model),
                 system_prompt=system_prompt,
-                session_id=verification.session_id,
+                session_id=effective_session_id,
             )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -1838,6 +2241,17 @@ class DynamicAnalysisRunner:
         """
         bug_id = self._bug_id_for_claim(claim)
         report_dir = self._report_dir_for_claim(claim)
+        # Worker scratch dir for the attempt that produced this claim — the
+        # reporter copies any PoC artifacts from there into report_dir.
+        worker_attempt = self.state.worker_attempts.get(claim.attempt_id)
+        if worker_attempt is not None:
+            scratch_dir: Path | None = self._scratch_dir_for_attempt(worker_attempt)
+        else:
+            scratch_dir = None
+        try:
+            scratch_rel = str(scratch_dir.relative_to(self.working_dir)) if scratch_dir else ""
+        except ValueError:
+            scratch_rel = str(scratch_dir) if scratch_dir else ""
         # Collect every passing verifier's structured output for the agent's reference.
         verifier_summaries: list[dict[str, Any]] = []
         for v_id in claim.verification_ids:
@@ -1859,39 +2273,52 @@ class DynamicAnalysisRunner:
         worker_artifact = self.state.worker_artifacts.get(claim.audit_artifact_id)
         artifact_payload = asdict(worker_artifact) if worker_artifact is not None else None
 
+        scratch_block = (
+            f"\nWorker scratch directory: `{scratch_rel}`\n"
+            "  - The worker who produced this claim wrote any PoC artifacts here.\n"
+            "  - List its contents and copy every file into the report directory before "
+            "writing `report.md`. (Use `cp -a` or equivalent — preserve names.)\n"
+            "  - The scratch directory may be empty if the worker emitted no artifacts; "
+            "in that case synthesize a `poc` file from the claim packet (see below).\n"
+            if scratch_rel
+            else ""
+        )
         system_prompt = (
             "You are the reporter agent for Juvenal's dynamic `analysis` phase.\n"
-            "A claim has passed every verifier in the chain. Your job is to write a "
-            "human-readable per-bug report so the finding is durably captured on disk.\n\n"
+            "A claim has passed every verifier in the chain. You are the ONLY agent "
+            "that writes anything under `output/` — workers and verifiers were told to "
+            "stay out of that tree. Your job is to materialize the per-bug directory "
+            "and write the durable, human-readable report there.\n\n"
             f"Repository root: `{self.working_dir}`\n"
-            f"Report directory: `{report_dir}`\n"
-            f"Bug id: `{bug_id}`\n\n"
-            "The worker that produced this claim was instructed to write its bug "
-            "description and PoC artifacts into the same directory before claiming. "
-            "If those files exist, leave them in place — your job is to overlay "
-            "`report.md`, not to overwrite working PoC artifacts.\n\n"
+            f"Report directory (create if missing): `{report_dir}`\n"
+            f"Bug id: `{bug_id}`\n"
+            f"{scratch_block}\n"
             "Required output:\n"
-            f"- Create the directory `{report_dir}` if it does not already exist.\n"
-            f"- Write a Markdown file at `{report_dir}/report.md` that includes:\n"
+            f"- Create `{report_dir}` if it does not already exist.\n"
+            f"- Copy any files from the worker scratch directory above into `{report_dir}`.\n"
+            f"- Write `{report_dir}/report.md` containing:\n"
             "  - Title (one line)\n"
             "  - Severity (critical / high / medium / low) with one-sentence justification\n"
             "  - Primary location (file:line) and any secondary locations\n"
             "  - Description: what the bug is and why it matters\n"
             "  - Proof of Concept: the exact reproduction steps, input, or script. "
             "Include any sanitizer/crash output verbatim if present in the claim packet. "
-            f"Reference any PoC files already in `{report_dir}/` by relative path.\n"
+            f"Reference any PoC files now in `{report_dir}/` by relative path.\n"
             "  - Impact: what an attacker can achieve\n"
             "  - Verifier consensus: a brief note that each verifier passed (poc, scope, novelty, etc.)\n"
-            f"- If the worker did not leave a PoC artifact in `{report_dir}/`, write a "
-            f"`poc` file (or `poc.<ext>`) capturing the trigger from the claim packet.\n"
+            f"- If the scratch dir was empty, write a `poc` file (or `poc.<ext>`) "
+            "capturing the trigger from the claim packet.\n"
             "- Overwriting an existing `report.md` is acceptable — this step is idempotent.\n\n"
-            "Do NOT write outside the report directory except for transient working files. "
-            "Do NOT modify project source. After writing, exit cleanly. No structured-output "
-            "block is expected from you — the runner verifies success by checking that "
-            f"`{report_dir}/report.md` exists."
+            f"Do NOT write outside `{report_dir}` (the scratch dir is read-only to you — "
+            "copy from it, do not edit it). Do NOT modify project source. After writing, "
+            "exit cleanly. No structured-output block is expected from you — the runner "
+            f"verifies success by checking that `{report_dir}/report.md` exists."
         )
         if self._rendered_reporter_prompt:
             system_prompt = f"{system_prompt}\n\n{self._rendered_reporter_prompt}"
+        brief_block = self._project_brief_block()
+        if brief_block:
+            system_prompt = f"{system_prompt}\n\n{brief_block}"
 
         user_prompt = (
             "Claim packet:\n"
@@ -2070,7 +2497,7 @@ class DynamicAnalysisRunner:
                     target.status = "queued"
                 target.updated_at = time.time()
             self.state.save()
-            self._record_infrastructure_error()
+            self._record_infrastructure_error(result.agent_result)
             return
 
         report = result.report
@@ -2092,7 +2519,7 @@ class DynamicAnalysisRunner:
                     target.status = "queued"
                 target.updated_at = time.time()
             self.state.save()
-            self._record_infrastructure_error()
+            self._record_infrastructure_error(attempt.error)
             return
         if report.task_id != attempt.attempt_id or report.target_id != target.target_id:
             attempt.status = "failed"
@@ -2115,14 +2542,19 @@ class DynamicAnalysisRunner:
                     target.status = "queued"
                 target.updated_at = time.time()
             self.state.save()
-            self._record_infrastructure_error()
+            self._record_infrastructure_error(attempt.error)
             return
 
         attempt.status = "completed"
         attempt.error = ""
         self._record_success()
         if target.active_generation != attempt.generation or target.active_attempt_id != attempt.attempt_id:
-            target.active_attempt_id = None
+            # Stale completion — the target moved on to a different attempt
+            # or generation. Do NOT touch `target.active_attempt_id`: it
+            # belongs to the live successor, and clearing it here would
+            # orphan that attempt (its mismatch path on completion would
+            # then leave the target wedged at `status="running"` with
+            # `active_attempt_id=None`).
             target.updated_at = time.time()
             self.state.save()
             return
@@ -2846,7 +3278,7 @@ class DynamicAnalysisRunner:
             self._refresh_target_after_verification(target)
         target.updated_at = time.time()
         self.state.save()
-        self._record_infrastructure_error()
+        self._record_infrastructure_error(verification.error)
 
     def _latest_rejection_reason(self, claim: ClaimRecord) -> str | None:
         candidates = [
@@ -2975,17 +3407,37 @@ class DynamicAnalysisRunner:
                 return True
         return False
 
-    def _record_infrastructure_error(self) -> None:
+    def _record_infrastructure_error(self, error: str | AgentResult | None = None) -> None:
         """Track a worker/verifier infrastructure failure (crash, malformed output, non-zero exit).
 
         Does NOT count verifier rejections — those are normal operation.
-        When consecutive errors hit the threshold, save state and either probe
-        the Claude rate limit on a fixed cadence (when a 429 was observed
-        recently) or fall back to exponential backoff for generic crashes.
+
+        Only triggers ``_rate_limit_backoff`` when the recent errors actually look
+        like rate limits (429, "monthly limit", "your limit · resets", etc.) or
+        when an ``AgentResult`` carrying ``rate_limit_status == 429`` is provided.
+        Other consecutive errors (parse failures, identity mismatches, output
+        without a structured block) do NOT trigger long sleeps — backoff cannot
+        recover those, and the per-target ``error_retry_count`` budget already
+        contains runaway loops by marking targets ``blocked`` after enough
+        retries.
         """
         self._consecutive_errors += 1
+        if not self._error_looks_like_rate_limit(error):
+            return
         if self._consecutive_errors >= self.config.max_consecutive_errors:
             self._rate_limit_backoff()
+
+    def _error_looks_like_rate_limit(self, error: str | AgentResult | None) -> bool:
+        if error is None:
+            return False
+        if isinstance(error, AgentResult):
+            if error.rate_limit_status == 429:
+                return True
+            text = (error.output or "") + "\n" + (getattr(error, "transcript", "") or "")
+        else:
+            text = error
+        text = text.lower()
+        return any(sig in text for sig in _RATE_LIMIT_ERROR_SIGNATURES)
 
     def _note_agent_result(self, agent_result: AgentResult | None) -> None:
         """Record observable signals from a finished agent result for downstream backoff decisions."""
@@ -3201,6 +3653,424 @@ class DynamicAnalysisRunner:
     def _next_verification_id(self, claim_id: str) -> str:
         existing = [record for record in self.state.verifications.values() if record.claim_id == claim_id]
         return f"{claim_id}-verification-{len(existing) + 1}"
+
+    def _maybe_start_analyst(self) -> None:
+        """Submit the analyst future at startup if configured and not already done.
+
+        Once the analyst reaches a terminal state (ready or failed) it is sticky —
+        we do NOT auto-retry on subsequent resumes. The user can force a retry by
+        editing the state file to set ``attack_surface.status`` back to ``pending``.
+        """
+        spec = self._analyst_spec
+        if spec is None or not spec.enabled:
+            return
+        status = self.state.attack_surface.status
+        if status in ("ready", "failed", "running"):
+            return
+        if self._analyst_future is not None:
+            return
+        now = time.time()
+        self.state.attack_surface = AttackSurfaceState(
+            status="running",
+            started_at=now,
+            backend=spec.backend,
+            model=_resolve_model(spec.backend, "analyst", spec.model),
+        )
+        self.state.save()
+        self._analyst_future = self._analyst_executor.submit(self._execute_analyst)
+
+    def _wait_for_analyst(self) -> bool:
+        """Block scheduling until the analyst's future drains.
+
+        The user's contract: nothing else (workers, verifiers, captain, reporters)
+        runs until the project brief is either ready or definitively failed. This
+        prevents the historical failure mode where worker errors raced ahead and
+        triggered phase termination before the analyst could finish.
+
+        Returns False if the wait was interrupted by Ctrl-C / shutdown, True
+        otherwise (including the no-analyst-future case).
+        """
+        if self._analyst_future is None:
+            return True
+        self._emit_analyst_message(
+            "[juvenal] waiting for attack-surface analyst to finish before dispatching captain/workers/verifiers…"
+        )
+        while not self._analyst_future.done():
+            if self._shutdown_event.is_set() or self.state.control.stop_requested:
+                return False
+            time.sleep(_IDLE_SLEEP_SECONDS)
+        self._drain_analyst_future()
+        return True
+
+    def _finalize_analyst_on_shutdown(self) -> None:
+        """Drain the analyst future once on shutdown so we record its result.
+
+        Without this, an analyst that was running when the phase died would leave
+        ``attack_surface.status == 'running'`` on disk. The next resume would be
+        unable to distinguish 'crashed mid-flight' from 'still running' and would
+        flip it to ``failed`` blindly. Draining here records ready/failed cleanly.
+        """
+        if self._analyst_future is None:
+            return
+        try:
+            # Short bounded wait — kill_active() has already killed the analyst's
+            # claude subprocess, so the future should resolve almost immediately.
+            self._analyst_future.result(timeout=10.0)
+        except Exception:
+            pass
+        try:
+            self._drain_analyst_future()
+        except Exception:
+            pass
+
+    def _execute_analyst(self) -> _AnalystExecutionResult:
+        spec = self._analyst_spec
+        if spec is None:
+            return _AnalystExecutionResult(
+                agent_result=AgentResult(
+                    exit_code=1, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0
+                ),
+                brief="",
+                error="analyst spec missing at execution time",
+            )
+        backend = self._get_backend(spec.backend)
+        mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
+        prompt_template = self._rendered_analyst_prompt or _DEFAULT_ANALYST_PROMPT
+        prompt = prompt_template.replace("{working_dir}", str(self.working_dir)).replace("{mission}", mission)
+        try:
+            result = backend.run_agent(
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=spec.max_duration_seconds,
+                env=self._role_env("analyst"),
+                model=_resolve_model(spec.backend, "analyst", spec.model),
+            )
+        except Exception as exc:
+            return _AnalystExecutionResult(
+                agent_result=AgentResult(
+                    exit_code=1, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0
+                ),
+                brief="",
+                error=f"analyst raised: {exc}",
+            )
+        if result.exit_code != 0:
+            return _AnalystExecutionResult(
+                agent_result=result,
+                brief="",
+                error=f"analyst exited with code {result.exit_code}: {result.output[-2000:]}",
+            )
+        brief = result.output.strip()
+        if not brief:
+            return _AnalystExecutionResult(agent_result=result, brief="", error="analyst returned empty output")
+        return _AnalystExecutionResult(agent_result=result, brief=brief, error=None)
+
+    def _drain_analyst_future(self) -> bool:
+        if self._analyst_future is None or not self._analyst_future.done():
+            return False
+        future = self._analyst_future
+        self._analyst_future = None
+        try:
+            outcome = future.result()
+        except Exception as exc:
+            self._record_analyst_failure(f"future crashed: {exc}")
+            return True
+        self._add_tokens(outcome.agent_result)
+        if outcome.error is not None:
+            self._record_analyst_failure(outcome.error, agent_result=outcome.agent_result)
+            return True
+        self._record_analyst_success(outcome)
+        return True
+
+    def _record_analyst_success(self, outcome: _AnalystExecutionResult) -> None:
+        now = time.time()
+        brief_path = self.working_dir / "output" / ".attack-surface-brief.md"
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(outcome.brief, encoding="utf-8")
+        subagent_path = self._write_subagent_definition(outcome.brief)
+        started = self.state.attack_surface.started_at or now
+        self.state.attack_surface = AttackSurfaceState(
+            status="ready",
+            brief=outcome.brief,
+            brief_path=str(brief_path),
+            subagent_path=str(subagent_path) if subagent_path else None,
+            error=None,
+            started_at=started,
+            completed_at=now,
+            duration_seconds=max(0.0, now - started),
+            input_tokens=outcome.agent_result.input_tokens,
+            output_tokens=outcome.agent_result.output_tokens,
+            session_id=outcome.agent_result.session_id,
+            backend=self.state.attack_surface.backend,
+            model=self.state.attack_surface.model,
+        )
+        self.state.save()
+        message = (
+            f"[juvenal] attack-surface analyst ready ({self.state.attack_surface.duration_seconds:.0f}s, "
+            f"{outcome.agent_result.input_tokens} in / {outcome.agent_result.output_tokens} out tokens) "
+            f"-> {brief_path}"
+        )
+        self._emit_analyst_message(message)
+        if self._dashboard is not None:
+            self._dashboard.render_event(kind="analyst.ready", text=str(brief_path))
+
+    def _record_analyst_failure(self, error: str, *, agent_result: AgentResult | None = None) -> None:
+        now = time.time()
+        started = self.state.attack_surface.started_at or now
+        input_tokens = agent_result.input_tokens if agent_result is not None else 0
+        output_tokens = agent_result.output_tokens if agent_result is not None else 0
+        session_id = agent_result.session_id if agent_result is not None else None
+        self.state.attack_surface = AttackSurfaceState(
+            status="failed",
+            brief=None,
+            brief_path=None,
+            subagent_path=None,
+            error=error,
+            started_at=started,
+            completed_at=now,
+            duration_seconds=max(0.0, now - started),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            session_id=session_id,
+            backend=self.state.attack_surface.backend,
+            model=self.state.attack_surface.model,
+        )
+        self.state.save()
+        message = f"[juvenal] [ANALYST ERROR] attack-surface analyst failed: {error}"
+        self._emit_analyst_message(message)
+        if self._dashboard is not None:
+            self._dashboard.render_event(kind="analyst.failed", text=error)
+
+    def _emit_analyst_message(self, message: str) -> None:
+        # One print only. In chat / plain / parallel modes, `display.live_update`
+        # falls through to its own `print(f"    {line}")` (display.py: when
+        # there is no Rich Live attached) which produces a duplicated,
+        # indented copy of every analyst-channel message — the cold-restart
+        # warning is emitted twice as a result. The plain `print` here is
+        # already the right output for every mode.
+        try:
+            print(message, flush=True)
+        except Exception:
+            pass
+
+    def _load_subagent_scope_for_verifier(self) -> str | None:
+        """Return the body of `.claude/agents/attack-surface.md` wrapped in a
+        verifier-mode framing for the ``trust-model`` verifier, or None if
+        unavailable.
+
+        Strips the Claude Code agent frontmatter (the leading ``---\\n…\\n---``
+        block) so what's left is the system-prompt body the subagent itself
+        would receive. Then prepends a short verifier-mode header so the LLM
+        knows to apply the body's knowledge to a single claim and return a
+        VERIFICATION_JSON block per the framework verifier role (the body on
+        its own is analyst-mode and would just answer questions). The body
+        already embeds the project brief, so the caller skips the standard
+        brief-block injection for this verifier.
+
+        Falls back to None when the subagent file is missing (analyst failed
+        / hasn't run); the caller then uses the YAML scope.
+        """
+        agent_file = self.working_dir / ".claude" / "agents" / "attack-surface.md"
+        if not agent_file.is_file():
+            return None
+        try:
+            content = agent_file.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if content.startswith("---\n"):
+            end = content.find("\n---\n", 4)
+            if end != -1:
+                content = content[end + len("\n---\n") :]
+        body = content.lstrip()
+        if not body:
+            return None
+        verifier_framing = (
+            "## Specialized scope: trust-model gate\n\n"
+            "**You are this run's `attack-surface` subagent — the same role and same project "
+            "knowledge as the file at `.claude/agents/attack-surface.md`. The body of that "
+            "subagent definition is reproduced verbatim below, including the project brief.**\n\n"
+            "You are operating in **verifier mode** for the trust-model gate (verifier 2 of 4). "
+            "The previous verifier (`attack-surface`) already classified the bug class and "
+            "filtered hardening / hypothetical / primitive-chain / correctness issues. Your one "
+            "judgment: does the attacker's required starting position SIT INSIDE the trust "
+            "boundary the project documents (or that its system class conventionally assumes)?\n\n"
+            "- Memory-safety carve-out: a reachable OOB / UAF / double-free / type confusion / "
+            "integer-overflow-into-corruption on production code passes this gate "
+            "automatically, regardless of attacker role.\n"
+            "- Pure-DoS carve-out: per the default scoping rule below, a reachable bug whose "
+            "only effect is a crash / hang / heap-exhaustion / stuck-state-machine with no "
+            "corruption primitive is a real bug but **out of scope for bug bounty** — REJECT "
+            "with `precondition-not-met`.\n"
+            "- Otherwise: compare attacker position to boundary using the brief. INSIDE the "
+            "boundary → REJECT `within-trust-model`. ABOVE the boundary → REJECT "
+            "`presupposes-attacker-position`. BELOW the boundary → check spec-authority "
+            "citation per the body's rules and pass if it holds.\n\n"
+            "Your `reason` MUST quote the boundary line from the brief, state the attacker's "
+            "position, and (for non-memory-safety passes) include a verbatim spec / RFC / "
+            "project-doc citation. Asymmetry-with-sibling-code is NOT a citation. Return your "
+            "verdict as a `VERIFICATION_JSON_BEGIN` / `VERIFICATION_JSON_END` block per the "
+            "framework verifier role at the top of this prompt — do NOT answer in analyst-mode "
+            "free-form prose.\n\n"
+            "What's out of scope for THIS verifier:\n"
+            "- Bug class / hardening / design-critique smell test (`attack-surface` handled it).\n"
+            "- PoC reproduction (`poc`).\n"
+            "- Public novelty / already-known / in-run duplication (`novelty`).\n\n"
+            "---\n\n"
+            "## Subagent body (your trust-model knowledge — verbatim)\n\n"
+        )
+        return f"{verifier_framing}{body}"
+
+    def _write_subagent_definition(self, brief: str) -> Path | None:
+        try:
+            agents_dir = self.working_dir / ".claude" / "agents"
+            agents_dir.mkdir(parents=True, exist_ok=True)
+            agent_file = agents_dir / "attack-surface.md"
+            content = (
+                "---\n"
+                "name: attack-surface\n"
+                "description: Project-specific trust-model and attack-surface analyst. Invoke this "
+                "subagent before assuming anything about what is in/out of scope, what is "
+                "attacker-reachable, or what the project considers by-design. The subagent has the "
+                "full project brief in context and can do additional code/web research per question.\n"
+                "tools: Read, Grep, Glob, WebFetch, WebSearch\n"
+                "---\n\n"
+                "You are the project's attack-surface analyst for this Juvenal bug-finding run. "
+                "The project brief below is your source of truth — quote and cite it when answering. "
+                "If the question goes beyond the brief, you may use Read / Grep / Glob over "
+                f"`{self.working_dir}` and WebFetch / WebSearch to do additional research before "
+                "answering. Keep answers focused and cite specific files, docs, or URLs whenever "
+                "possible. Reply with a concise direct answer; do not dump the entire brief back.\n\n"
+                "If the calling agent's question does not have a confident answer, say so plainly — "
+                "do not fabricate scope rules or trust-model claims that are not in the brief.\n\n"
+                "## Default scoping rule: pure-DoS is a bug, not a bug-bounty vulnerability\n\n"
+                "A pure-DoS / crash-only finding (`the parser segfaults on malformed input`, "
+                "`the daemon hangs on a crafted packet`) IS a real bug — it just is NOT a "
+                "vulnerability for bug-bounty / VRP purposes. Unless the project brief below "
+                "explicitly says otherwise, treat pure-DoS findings as **out of bug-bounty scope** "
+                "and tell the calling agent to reject the claim on scope grounds. The bar for an "
+                "in-scope memory-safety report is a corruption primitive that goes beyond a crash: "
+                "UAF, OOB write into attacker-controlled state, type confusion exploitable for "
+                "code execution, heap overflow, double-free, etc. Crashes that imply such "
+                "corruption (e.g., an ASan write-of-N report, a UAF backtrace) remain in scope "
+                "unless the brief excludes them. When a calling agent asks whether a crash-only "
+                "finding is in scope, default to NO and direct them to the brief's bounty-scope "
+                "section to confirm.\n\n"
+                "<<PROJECT_BRIEF_BEGIN>>\n"
+                f"{brief}\n"
+                "<<PROJECT_BRIEF_END>>\n"
+            )
+            agent_file.write_text(content, encoding="utf-8")
+            return agent_file
+        except Exception as exc:
+            self._emit_analyst_message(f"[juvenal] failed to write attack-surface subagent: {exc}")
+            return None
+
+    def _project_brief_block(self) -> str:
+        """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt."""
+        spec = self._analyst_spec
+        if spec is None or not spec.enabled:
+            return ""
+        state = self.state.attack_surface
+        guidance = (
+            "## Attack-surface subagent (always available)\n\n"
+            "Before assuming anything about the project's trust model, attack surface, what is "
+            "attacker-reachable, what is in/out of scope, or what the project considers by-design, "
+            "**invoke the `attack-surface` subagent via the Agent tool**. It is fast, has the full "
+            "project brief in context, and can do additional code/web research per question. "
+            "Treat its answers as authoritative for project-specific trust assumptions.\n"
+        )
+        if state.status == "ready" and state.brief:
+            return (
+                "## Project brief (attack-surface analyst output)\n\n"
+                "The attack-surface analyst has produced the brief below. Treat it as the source "
+                "of truth for the project's trust model and attack surface.\n\n"
+                f"{state.brief}\n\n"
+                f"{guidance}"
+            )
+        if state.status == "running" or state.status == "pending":
+            return (
+                "## Project brief (attack-surface analyst)\n\n"
+                "PROJECT_BRIEF: not ready yet — the attack-surface analyst is still running. "
+                "Proceed with the information you have and consult the `attack-surface` subagent "
+                "via the Agent tool if it has finished by the time you reach a project-specific "
+                "trust-model question. The subagent will respond `BRIEF_NOT_READY` until the "
+                "analyst completes.\n"
+            )
+        if state.status == "failed":
+            return (
+                "## Project brief (attack-surface analyst)\n\n"
+                f"PROJECT_BRIEF: unavailable (analyst failed: {state.error or 'unknown error'}). "
+                "Proceed without the brief; the `attack-surface` subagent may still answer if "
+                "it can use Read / Grep / WebFetch on the fly.\n"
+            )
+        return ""
+
+    def _session_is_stale(self, session_id: str) -> bool:
+        """True if a Claude session has not been SUCCESSFULLY used inside the
+        threshold window and is likely unrecoverable.
+
+        We use last-successful-use time, not creation time. A long-running
+        analysis re-uses the same captain/worker/verifier sessions across
+        multi-day runs — keying off creation falsely flags healthy sessions
+        once the run is older than the threshold (the user's symptom on
+        attempt 18 of a multi-day phase).
+
+        "Successful use" means the agent returned a parsed structured
+        response on this session_id:
+        - Worker attempts: ``status == "completed"`` (claims / no_findings
+          / blocked all parse cleanly).
+        - Verifications: ``disposition is not None`` (a clean PASS or
+          REJECT — both prove the verifier session was alive enough to
+          emit VERIFICATION_JSON).
+
+        Filtering on success closes the original failure-loop concern:
+        a session that's actually expired produces a stream of failed
+        attempts whose ``completed_at`` would otherwise refresh the signal
+        ("used recently" → don't cold-restart → fail again → "used
+        recently" → ...). Failed attempts contribute nothing here, so the
+        signal monotonically AGES until either a real success arrives
+        (session is alive after all) or the threshold trips and we
+        cold-restart.
+
+        Falls back to creation time when there is no successful record
+        yet — a brand-new session that's already failing is judged on
+        age alone (matches the prior behavior on first use).
+        """
+        now = time.time()
+        successful_use_times: list[float] = []
+        for attempt in self.state.worker_attempts.values():
+            if attempt.session_id != session_id:
+                continue
+            if attempt.status != "completed":
+                continue
+            if attempt.completed_at is not None:
+                successful_use_times.append(attempt.completed_at)
+        for verification in self.state.verifications.values():
+            if verification.session_id != session_id:
+                continue
+            if verification.disposition is None:
+                continue
+            if verification.completed_at is not None:
+                successful_use_times.append(verification.completed_at)
+
+        if successful_use_times:
+            return (now - max(successful_use_times)) > _SESSION_STALENESS_THRESHOLD_SECONDS
+
+        # No successful use yet — fall back to creation time so a brand-new
+        # session that's failing on the first try doesn't loop forever.
+        creation_times: list[float] = []
+        for attempt in self.state.worker_attempts.values():
+            if attempt.session_id == session_id and not attempt.parent_session_id and attempt.started_at is not None:
+                creation_times.append(attempt.started_at)
+        for verification in self.state.verifications.values():
+            if (
+                verification.session_id == session_id
+                and not verification.parent_session_id
+                and verification.started_at is not None
+            ):
+                creation_times.append(verification.started_at)
+        if not creation_times:
+            return False  # No record at all — let the resume try.
+        return (now - min(creation_times)) > _SESSION_STALENESS_THRESHOLD_SECONDS
 
     def _get_backend(self, name: str) -> Backend:
         with self._backend_lock:

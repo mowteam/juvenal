@@ -8,10 +8,33 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+
+
+def _format_attack_surface_line(attack_surface) -> str:
+    """One-line summary of the attack-surface analyst state for `juvenal status`."""
+    status = getattr(attack_surface, "status", "pending")
+    if status == "ready":
+        duration = getattr(attack_surface, "duration_seconds", None)
+        path = getattr(attack_surface, "brief_path", None)
+        bits = ["ready"]
+        if duration is not None:
+            bits.append(f"{duration:.0f}s")
+        if path:
+            bits.append(path)
+        return f"[green]Attack-surface analyst:[/] {' · '.join(bits)}"
+    if status == "running":
+        return "[yellow]Attack-surface analyst:[/] running"
+    if status == "failed":
+        error = getattr(attack_surface, "error", None) or "unknown error"
+        return f"[red]Attack-surface analyst:[/] failed — {error}"
+    if status == "pending":
+        return "[dim]Attack-surface analyst:[/] pending"
+    return f"[dim]Attack-surface analyst:[/] {status}"
 
 
 def _format_claim_chain_progress(claim, dss, reporter_configured: bool) -> str:
@@ -322,12 +345,16 @@ class PipelineState:
             console.print()
             title = f"[cyan]{pid}[/] Analysis Detail (captain turn {summary['captain_turns']})"
             console.print(Panel(detail_table, title=title, border_style="dim"))
+            # `running` and `verifying` count actual in-flight agents (workers
+            # / verifiers in status="running"), not unique target IDs. A target
+            # with two simultaneous claim-retry workers contributes 2 to the
+            # running count, not 1 — matches the agent-pool budget.
             line = (
                 f"  {summary['total']} targets | "
                 f"{summary['completed']} completed | "
                 f"{summary['blocked']} blocked/exhausted | "
-                f"{summary['verifying']} verifying | "
-                f"{summary['running']} running | "
+                f"{summary['active_verifiers']} verifying | "
+                f"{summary['active_workers']} running | "
                 f"{summary['claims_verified']} claims verified | "
                 f"{summary['claims_rejected']} claims rejected"
             )
@@ -338,8 +365,11 @@ class PipelineState:
                 if report_pending:
                     line += f" ({report_pending} pending)"
             console.print(line)
+            analyst_line = summary.get("analyst_line")
+            if analyst_line:
+                console.print(f"  {analyst_line}")
 
-    def _render_analysis_detail(self, analysis_state_file: str) -> tuple[Table, dict[str, int]] | None:
+    def _render_analysis_detail(self, analysis_state_file: str) -> tuple[Table, dict[str, Any]] | None:
         """Load analysis child state and render a nested detail table."""
         from rich.box import SIMPLE
 
@@ -378,17 +408,30 @@ class PipelineState:
 
         sorted_targets = sorted(dss.targets.values(), key=lambda t: (-t.priority, t.created_at, t.target_id))
 
-        summary: dict[str, int] = {
+        # Count actual in-flight agents (workers + verifiers in `running`
+        # state). This is the real budget-occupancy number; the per-target
+        # `running` / `verifying` counts are coarser because a target can
+        # have multiple in-flight claim retries (or multiple in-flight
+        # verifiers across its claims). Without this distinction the
+        # `running 3 | verifying 2` row implies 5 agents when the actual
+        # load can be up to (workers × claims) per target.
+        active_workers = sum(1 for a in dss.worker_attempts.values() if a.status == "running")
+        active_verifiers = sum(1 for v in dss.verifications.values() if v.status == "running")
+
+        summary: dict[str, Any] = {
             "total": len(sorted_targets),
             "completed": 0,
             "blocked": 0,
             "verifying": 0,
             "running": 0,
+            "active_workers": active_workers,
+            "active_verifiers": active_verifiers,
             "claims_verified": 0,
             "claims_rejected": 0,
             "claims_reported": 0,
             "claims_report_pending": 0,
             "captain_turns": dss.captain.turn_index,
+            "analyst_line": _format_attack_surface_line(dss.attack_surface),
         }
 
         # Heuristic: a reporter is configured if at least one claim has been

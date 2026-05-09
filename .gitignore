@@ -13,3 +13,4 @@ venv/
 *.juvenal-state.json
 .plan/
 .juvenal/
+to-do.txt

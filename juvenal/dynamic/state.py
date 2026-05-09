@@ -12,6 +12,7 @@ from threading import RLock
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from juvenal.dynamic.models import (
+    AttackSurfaceState,
     CaptainDelta,
     CaptainState,
     CaptainTurn,
@@ -144,6 +145,7 @@ class DynamicSessionState:
     ignored_path_prefixes: list[str] = field(default_factory=list)
     ignored_symbols: list[str] = field(default_factory=list)
     events: list[DynamicEvent] = field(default_factory=list)
+    attack_surface: AttackSurfaceState = field(default_factory=AttackSurfaceState)
     _lock: RLock = field(init=False, repr=False, default_factory=RLock)
 
     @classmethod
@@ -168,6 +170,8 @@ class DynamicSessionState:
         state.ignored_path_prefixes = list(data.get("ignored_path_prefixes", []))
         state.ignored_symbols = list(data.get("ignored_symbols", []))
         state.events = _load_dataclass_list(data.get("events", []), DynamicEvent)
+        if "attack_surface" in data:
+            state.attack_surface = _dataclass_from_dict(AttackSurfaceState, data["attack_surface"])
         return state
 
     def save(self) -> None:
@@ -308,6 +312,21 @@ class DynamicSessionState:
                     target.status = "queued"
                 else:
                     target.status = "queued"
+
+            if self.attack_surface.status == "running":
+                # The analyst was in flight when the run died. We do NOT auto-retry
+                # on resume — re-running the analyst across resumes would burn
+                # tokens and the user has explicitly opted into a once-per-lifetime
+                # contract. Mark as failed and let the run continue without a brief.
+                # User can force a retry by setting status back to 'pending' in the
+                # state file.
+                self.attack_surface.status = "failed"
+                self.attack_surface.completed_at = now
+                if not self.attack_surface.error:
+                    self.attack_surface.error = (
+                        "interrupted-before-completion; analyst will not auto-retry on resume. "
+                        "To force a retry, set attack_surface.status to 'pending' in this file."
+                    )
 
             self._apply_resume_control_rewrite_locked(now)
             self.save()
@@ -555,4 +574,5 @@ class DynamicSessionState:
             "ignored_path_prefixes": list(self.ignored_path_prefixes),
             "ignored_symbols": list(self.ignored_symbols),
             "events": [asdict(event) for event in self.events],
+            "attack_surface": asdict(self.attack_surface),
         }

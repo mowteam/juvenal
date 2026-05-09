@@ -317,12 +317,22 @@ def _describe_template_render_error(phase_id: str, field_name: str, exc: Excepti
 
 @dataclass
 class VerifierSpec:
-    """One verifier in an analysis verifier chain."""
+    """One verifier in an analysis verifier chain.
+
+    ``use_attack_surface_subagent`` swaps in the body of
+    `.claude/agents/attack-surface.md` (written by the analyst) as the
+    verifier's per-spec scope, replacing ``prompt``. The verifier session
+    then literally materializes the attack-surface subagent role, with the
+    project brief embedded. Falls back to ``prompt`` if the subagent file
+    is missing (analyst failed / hasn't run). Off by default; bug-bounty's
+    ``trust-model`` verifier opts in via YAML.
+    """
 
     name: str
     backend: str = "claude"
     model: str | None = None
     prompt: str = ""
+    use_attack_surface_subagent: bool = False
 
 
 @dataclass
@@ -338,6 +348,26 @@ class ReporterSpec:
     backend: str = "claude"
     model: str | None = None
     prompt: str = ""
+
+
+@dataclass
+class AnalystSpec:
+    """Optional attack-surface analyst that runs once at the start of an analysis phase.
+
+    The analyst reads the codebase, project documentation, and (when allowed) does
+    web research to produce a structured project brief covering the project's trust
+    model, attack surface, and any documented out-of-scope behaviors. The brief is
+    injected as a cacheable prefix into every captain/worker/verifier system prompt,
+    and is also used to seed a `.claude/agents/attack-surface.md` Claude Code subagent
+    that consulting agents can invoke for follow-up questions. Codex consulting
+    agents only get the brief in their prompt — codex has no subagent equivalent.
+    """
+
+    backend: str = "claude"
+    model: str | None = None
+    prompt: str = ""
+    enabled: bool = True
+    max_duration_seconds: int = 1800
 
 
 @dataclass
@@ -382,6 +412,7 @@ class AnalysisConfig:
     max_premature_completes: int = 5
     verifiers: list[VerifierSpec] = field(default_factory=list)
     reporter: ReporterSpec | None = None
+    analyst: AnalystSpec | None = None
     worker_prompt: str = ""
 
 
@@ -410,11 +441,13 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_premature_completes",
     "verifiers",
     "reporter",
+    "analyst",
     "worker_prompt",
 }
-_VERIFIER_SPEC_KEYS = {"name", "backend", "model", "prompt", "prompt_file"}
+_VERIFIER_SPEC_KEYS = {"name", "backend", "model", "prompt", "prompt_file", "use_attack_surface_subagent"}
 _VERIFIER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _REPORTER_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
+_ANALYST_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file", "enabled", "max_duration_seconds"}
 
 
 def _parse_analysis_backend(value: Any, *, phase_id: str, field_name: str) -> str:
@@ -525,7 +558,21 @@ def _parse_verifier_specs(
             if not isinstance(prompt, str):
                 raise ValueError(f"Phase '{phase_id}': analysis.verifiers[{index}].prompt must be a string")
 
-        specs.append(VerifierSpec(name=name, backend=backend, model=model, prompt=prompt))
+        use_subagent_raw = entry.get("use_attack_surface_subagent", False)
+        if not isinstance(use_subagent_raw, bool):
+            raise ValueError(
+                f"Phase '{phase_id}': analysis.verifiers[{index}].use_attack_surface_subagent must be a bool"
+            )
+
+        specs.append(
+            VerifierSpec(
+                name=name,
+                backend=backend,
+                model=model,
+                prompt=prompt,
+                use_attack_surface_subagent=use_subagent_raw,
+            )
+        )
 
     return specs
 
@@ -574,6 +621,69 @@ def _parse_reporter_spec(
             raise ValueError(f"Phase '{phase_id}': analysis.reporter.prompt must be a string")
 
     return ReporterSpec(backend=backend, model=model, prompt=prompt)
+
+
+def _parse_analyst_spec(
+    raw: Any,
+    *,
+    phase_id: str,
+    default_backend: str,
+    default_model: str | None,
+    yaml_path: Path | None,
+) -> AnalystSpec:
+    """Validate and load the analysis.analyst block."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Phase '{phase_id}': analysis.analyst must be a mapping")
+    unknown = set(raw.keys()) - _ANALYST_SPEC_KEYS
+    if unknown:
+        raise ValueError(f"Phase '{phase_id}': analysis.analyst has unknown keys {sorted(unknown)}")
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"Phase '{phase_id}': analysis.analyst.enabled must be a boolean")
+
+    backend = raw.get("backend", default_backend)
+    backend = _parse_analysis_backend(backend, phase_id=phase_id, field_name="analyst.backend")
+
+    model = _parse_optional_model(
+        raw.get("model", default_model),
+        phase_id=phase_id,
+        field_name="analyst.model",
+    )
+
+    max_duration_seconds = _parse_analysis_int(
+        raw.get("max_duration_seconds", AnalystSpec().max_duration_seconds),
+        phase_id=phase_id,
+        field_name="analyst.max_duration_seconds",
+        minimum=1,
+    )
+
+    has_prompt = "prompt" in raw
+    has_prompt_file = "prompt_file" in raw
+    if has_prompt and has_prompt_file:
+        raise ValueError(f"Phase '{phase_id}': analysis.analyst cannot set both prompt and prompt_file")
+
+    if has_prompt_file:
+        prompt_file = raw["prompt_file"]
+        if not isinstance(prompt_file, str) or not prompt_file:
+            raise ValueError(f"Phase '{phase_id}': analysis.analyst.prompt_file must be a non-empty string")
+        if yaml_path is None:
+            raise ValueError(f"Phase '{phase_id}': analysis.analyst.prompt_file is unsupported in this context")
+        prompt = (yaml_path / prompt_file).read_text()
+    elif has_prompt:
+        prompt = raw["prompt"]
+        if not isinstance(prompt, str):
+            raise ValueError(f"Phase '{phase_id}': analysis.analyst.prompt must be a string")
+    else:
+        prompt = ""
+
+    return AnalystSpec(
+        backend=backend,
+        model=model,
+        prompt=prompt,
+        enabled=enabled,
+        max_duration_seconds=max_duration_seconds,
+    )
 
 
 def _parse_analysis_config(
@@ -711,6 +821,16 @@ def _parse_analysis_config(
             yaml_path=yaml_path,
         )
 
+    analyst: AnalystSpec | None = None
+    if "analyst" in raw:
+        analyst = _parse_analyst_spec(
+            raw["analyst"],
+            phase_id=phase_id,
+            default_backend=captain_backend,
+            default_model=None,
+            yaml_path=yaml_path,
+        )
+
     return AnalysisConfig(
         captain_backend=captain_backend,
         worker_backend=worker_backend,
@@ -735,6 +855,7 @@ def _parse_analysis_config(
         max_premature_completes=max_premature_completes,
         verifiers=verifiers,
         reporter=reporter,
+        analyst=analyst,
         worker_prompt=worker_prompt,
     )
 

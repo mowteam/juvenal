@@ -1975,3 +1975,395 @@ def test_build_reporter_prompt_routes_preamble_and_workflow_scope_to_system(tmp_
     assert "Claim packet:" in user_prompt
     assert "You are the reporter agent" not in user_prompt
     assert "Write for VRP triagers." not in user_prompt
+
+
+def test_build_worker_prompt_provides_scratch_dir_and_keeps_workers_out_of_output(tmp_path):
+    """Workers must receive a private scratch directory under .juvenal/scratch/
+    and must NOT be told to write under output/. The reporter is the only
+    agent that writes to output/."""
+    config = AnalysisConfig()
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, user_prompt = runner._build_worker_prompt(target, attempt)
+
+    expected_scratch_rel = f".juvenal/scratch/{attempt.attempt_id}"
+    # The user prompt advertises the scratch dir explicitly.
+    assert expected_scratch_rel in user_prompt
+    assert "Scratch directory" in user_prompt
+    # Task packet carries scratch_dir.
+    assert f'"scratch_dir": "{expected_scratch_rel}"' in user_prompt
+    # Worker must not be steered toward output/.
+    assert "output/<bug-id>" not in system_prompt
+    assert "output/<bug-id>" not in user_prompt
+    # Pre-creation: the scratch dir must exist after the prompt is built so
+    # the worker can write into it without first mkdir'ing.
+    assert (tmp_path / ".juvenal" / "scratch" / attempt.attempt_id).is_dir()
+
+
+def test_build_reporter_prompt_references_scratch_dir_for_artifact_copy(tmp_path):
+    """The reporter must be told both the report dir AND the worker scratch
+    dir, so it can copy any PoC artifacts the worker dropped during the
+    investigation."""
+    from juvenal.workflow import ReporterSpec
+
+    config = AnalysisConfig(reporter=ReporterSpec(backend="claude", prompt=""))
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-x", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+    attempt = _system_split_attempt(claim.attempt_id, target.target_id)
+    runner.state.worker_attempts[attempt.attempt_id] = attempt
+
+    system_prompt, _user_prompt = runner._build_reporter_prompt(claim, target)
+
+    expected_scratch_rel = f".juvenal/scratch/{attempt.attempt_id}"
+    assert "Worker scratch directory" in system_prompt
+    assert expected_scratch_rel in system_prompt
+    # The reporter's instructions explicitly tell it to copy from scratch.
+    assert "Copy" in system_prompt or "copy" in system_prompt
+    # And not to write outside the report dir.
+    assert "Do NOT write outside" in system_prompt
+
+
+def test_reconcile_orphaned_running_attempt_frees_slot(tmp_path):
+    """A worker attempt persisted as running with NO tracking future is an
+    orphan — its slot leaks from the budget pool until the run is restarted.
+    `_reconcile_orphaned_running_state` must detect that mismatch and revert
+    the attempt + target to a re-schedulable shape."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-orphan")
+    target.status = "running"
+    target.active_attempt_id = "attempt-orphan"
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-orphan", target.target_id)
+    attempt.status = "running"
+    runner.state.worker_attempts[attempt.attempt_id] = attempt
+    # Critically: NO entry in runner._worker_futures for this attempt.
+
+    progressed = runner._reconcile_orphaned_running_state()
+
+    assert progressed is True
+    assert runner.state.worker_attempts["attempt-orphan"].status == "failed"
+    # Target was reset to a re-schedulable state.
+    assert runner.state.targets[target.target_id].active_attempt_id is None
+    assert runner.state.targets[target.target_id].status in {"queued", "blocked"}
+
+
+def test_reconcile_orphaned_running_attempt_skips_live_future(tmp_path):
+    """Don't touch an attempt that DOES have a tracking future — that's the
+    normal in-flight case, not an orphan."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-live")
+    target.status = "running"
+    target.active_attempt_id = "attempt-live"
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-live", target.target_id)
+    attempt.status = "running"
+    runner.state.worker_attempts[attempt.attempt_id] = attempt
+    # Pretend a tracking future exists.
+    runner._worker_futures[Future()] = "attempt-live"
+
+    progressed = runner._reconcile_orphaned_running_state()
+
+    assert progressed is False
+    assert runner.state.worker_attempts["attempt-live"].status == "running"
+    assert runner.state.targets[target.target_id].active_attempt_id == "attempt-live"
+
+
+def test_trust_model_verifier_prefers_subagent_body_when_flag_set(tmp_path):
+    """A verifier with `use_attack_surface_subagent: true` must replace its
+    YAML prompt with the body of `.claude/agents/attack-surface.md` and skip
+    the standard project-brief block (since the brief is embedded inside the
+    subagent body)."""
+    from juvenal.workflow import VerifierSpec
+
+    config = AnalysisConfig(
+        verifiers=[
+            VerifierSpec(
+                name="trust-model",
+                backend="claude",
+                prompt="YAML-FALLBACK-SCOPE",
+                use_attack_surface_subagent=True,
+            ),
+        ],
+    )
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-x", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+    verification = _system_split_verification(
+        claim.claim_id, target.target_id, verifier_name="trust-model", verifier_index=0
+    )
+
+    # Materialize a subagent file so the runner finds it.
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "attack-surface.md").write_text(
+        "---\nname: attack-surface\ntools: Read, Grep\n---\n\nSUBAGENT-BODY-CONTENT\n",
+        encoding="utf-8",
+    )
+
+    system_prompt, _user_prompt = runner._build_verifier_prompt(target, claim, verification)
+
+    assert "SUBAGENT-BODY-CONTENT" in system_prompt
+    # YAML scope must NOT be used when the subagent body is loaded.
+    assert "YAML-FALLBACK-SCOPE" not in system_prompt
+    # Frontmatter must be stripped — `name: attack-surface` lives in the
+    # YAML header and should not appear in the rendered prompt.
+    assert "name: attack-surface" not in system_prompt
+    # And the verifier-mode framing is added.
+    assert "verifier mode" in system_prompt
+
+
+def test_trust_model_verifier_falls_back_to_yaml_when_subagent_missing(tmp_path):
+    """When `use_attack_surface_subagent: true` but the subagent file does
+    not exist (analyst failed / hasn't run), the runner falls back to the
+    YAML scope so the verifier still has actionable guidance."""
+    from juvenal.workflow import VerifierSpec
+
+    config = AnalysisConfig(
+        verifiers=[
+            VerifierSpec(
+                name="trust-model",
+                backend="claude",
+                prompt="YAML-FALLBACK-SCOPE",
+                use_attack_surface_subagent=True,
+            ),
+        ],
+    )
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-x", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+    verification = _system_split_verification(
+        claim.claim_id, target.target_id, verifier_name="trust-model", verifier_index=0
+    )
+
+    # No subagent file written.
+    assert not (tmp_path / ".claude" / "agents" / "attack-surface.md").exists()
+
+    system_prompt, _user_prompt = runner._build_verifier_prompt(target, claim, verification)
+
+    assert "YAML-FALLBACK-SCOPE" in system_prompt
+
+
+def test_other_verifiers_ignore_subagent_body_even_when_file_present(tmp_path):
+    """A verifier WITHOUT `use_attack_surface_subagent` must keep using its
+    YAML scope, even if the subagent file exists. The flag is opt-in
+    per-verifier."""
+    from juvenal.workflow import VerifierSpec
+
+    config = AnalysisConfig(
+        verifiers=[
+            VerifierSpec(
+                name="attack-surface",
+                backend="claude",
+                prompt="YAML-ATTACK-SURFACE-SCOPE",
+                use_attack_surface_subagent=False,
+            ),
+        ],
+    )
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-x", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+    verification = _system_split_verification(
+        claim.claim_id, target.target_id, verifier_name="attack-surface", verifier_index=0
+    )
+
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "attack-surface.md").write_text(
+        "---\nname: attack-surface\n---\n\nSUBAGENT-BODY-CONTENT\n", encoding="utf-8"
+    )
+
+    system_prompt, _user_prompt = runner._build_verifier_prompt(target, claim, verification)
+
+    assert "YAML-ATTACK-SURFACE-SCOPE" in system_prompt
+    assert "SUBAGENT-BODY-CONTENT" not in system_prompt
+
+
+def test_reconcile_orphaned_running_verification_reverts_to_pending(tmp_path):
+    """A verification persisted as running with NO tracking future must be
+    reverted to pending so the next scheduling tick picks it up."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-v")
+    runner.state.targets[target.target_id] = target
+    claim = _system_split_claim("claim-v", target.target_id)
+    runner.state.claims[claim.claim_id] = claim
+    verification = _system_split_verification(
+        claim.claim_id, target.target_id, verifier_name="attack-surface", verifier_index=0
+    )
+    verification.status = "running"
+    verification.session_id = "stale-session-uuid"
+    verification.started_at = 1.0
+    runner.state.verifications[verification.verification_id] = verification
+    # No tracking future.
+
+    progressed = runner._reconcile_orphaned_running_state()
+
+    assert progressed is True
+    reverted = runner.state.verifications[verification.verification_id]
+    assert reverted.status == "pending"
+    assert reverted.started_at is None
+    assert reverted.completed_at is None
+    # Session id preserved so the resumed verifier inherits the prior context.
+    assert reverted.parent_session_id == "stale-session-uuid"
+
+
+def test_concurrent_retries_for_same_target_serialize(tmp_path):
+    """Two pending claim retries belonging to the same target must NOT
+    dispatch concurrently — the second `_start_claim_retry_attempt` would
+    overwrite the first's `target.active_attempt_id`, and on completion both
+    workers would hit the mismatch guard in `_apply_worker_result` and have
+    their reports silently discarded, leaving the target wedged at
+    `status="running"` with `active_attempt_id=None`. Production regression
+    observed in the openthread bug-bounty run: targets with two sibling
+    rejected claims accumulated 12 completed retry attempts whose reports
+    never updated state, while the target stayed stuck in the frontier."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-share")
+    runner.state.targets[target.target_id] = target
+    claim_a = _system_split_claim("claim-a", target.target_id)
+    claim_a.status = "rejected"
+    claim_b = _system_split_claim("claim-b", target.target_id)
+    claim_b.status = "rejected"
+    claim_b.worker_claim_id = "c2"
+    runner.state.claims[claim_a.claim_id] = claim_a
+    runner.state.claims[claim_b.claim_id] = claim_b
+    runner._pending_claim_retries = [
+        (target.target_id, claim_a.claim_id),
+        (target.target_id, claim_b.claim_id),
+    ]
+
+    dispatched: list[str] = []
+
+    def _fake_start(t, c):
+        attempt_id = f"{t.target_id}-retry-{c.claim_id}-{len(dispatched) + 1}"
+        attempt = _system_split_attempt(attempt_id, t.target_id)
+        attempt.status = "running"
+        attempt.retry_claim_id = c.claim_id
+        runner.state.worker_attempts[attempt_id] = attempt
+        t.status = "running"
+        t.active_attempt_id = attempt_id
+        dispatched.append(attempt_id)
+        return attempt
+
+    with (
+        patch.object(runner, "_start_claim_retry_attempt", side_effect=_fake_start),
+        patch.object(runner, "_build_claim_retry_prompt", return_value=("", "")),
+        patch.object(runner._worker_executor, "submit", return_value=Future()),
+    ):
+        runner._schedule_workers()
+
+    # Only one retry dispatched on this tick — the sibling stays queued.
+    assert len(dispatched) == 1
+    assert runner._pending_claim_retries == [(target.target_id, claim_b.claim_id)]
+    assert runner.state.targets[target.target_id].active_attempt_id == dispatched[0]
+
+
+def test_apply_worker_result_mismatch_does_not_clobber_active_attempt(tmp_path):
+    """When a stale worker attempt completes after the target has moved on
+    to a different active attempt, the mismatch path must NOT clear
+    `target.active_attempt_id` — that pointer belongs to the live successor.
+    Regression for the wedge: clobbering active_attempt_id here orphans the
+    successor (its own completion will then mismatch and the target stays
+    at status="running" with no live attempt forever)."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-mismatch")
+    target.status = "running"
+    target.active_attempt_id = "attempt-live"
+    runner.state.targets[target.target_id] = target
+
+    stale = _system_split_attempt("attempt-stale", target.target_id)
+    stale.status = "running"
+    runner.state.worker_attempts["attempt-stale"] = stale
+    live = _system_split_attempt("attempt-live", target.target_id)
+    live.status = "running"
+    runner.state.worker_attempts["attempt-live"] = live
+
+    from juvenal.backends import AgentResult
+    from juvenal.dynamic.models import WorkerReport
+    from juvenal.dynamic.runner import _WorkerExecutionResult
+
+    result = _WorkerExecutionResult(
+        attempt_id="attempt-stale",
+        target_id=target.target_id,
+        generation=stale.generation,
+        report=WorkerReport(
+            schema_version=1,
+            task_id="attempt-stale",
+            target_id=target.target_id,
+            outcome="no_findings",
+            summary="No issue.",
+            claims=[],
+            blocker=None,
+            follow_up_hints=[],
+        ),
+        agent_result=AgentResult(
+            exit_code=0, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0, session_id="s"
+        ),
+        error="",
+    )
+
+    runner._apply_worker_result(result)
+
+    # The live attempt's pointer must be preserved.
+    assert runner.state.targets[target.target_id].active_attempt_id == "attempt-live"
+    # The stale attempt itself was marked completed.
+    assert runner.state.worker_attempts["attempt-stale"].status == "completed"
+
+
+def test_reconcile_orphaned_running_target_with_no_attempt(tmp_path):
+    """A target stuck at `status="running"` with `active_attempt_id=None`
+    (or pointing at a non-running attempt) is invisible to both the
+    scheduler (which only picks `status=="queued"`) and the existing
+    orphan-attempt loop (which only walks `worker_attempts`). The target
+    reconciler must reset it to a re-schedulable shape so the work resumes
+    instead of leaking the slot indefinitely."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=2)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-wedged")
+    target.status = "running"
+    target.active_attempt_id = None
+    runner.state.targets[target.target_id] = target
+
+    progressed = runner._reconcile_orphaned_running_state()
+
+    assert progressed is True
+    recovered = runner.state.targets[target.target_id]
+    assert recovered.status == "queued"
+    assert recovered.active_attempt_id is None
+    assert recovered.error_retry_count == 1
+
+
+def test_reconcile_orphaned_running_target_blocks_after_budget_exhausted(tmp_path):
+    """If the wedged-running target has already burned its retry budget,
+    the reconciler must block it rather than re-queue — otherwise the same
+    failure mode would recycle indefinitely."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=1)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-burned")
+    target.status = "running"
+    target.active_attempt_id = None
+    target.error_retry_count = 1  # next bump pushes past max
+    runner.state.targets[target.target_id] = target
+
+    progressed = runner._reconcile_orphaned_running_state()
+
+    assert progressed is True
+    recovered = runner.state.targets[target.target_id]
+    assert recovered.status == "blocked"
+    assert recovered.active_attempt_id is None

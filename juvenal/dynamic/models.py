@@ -265,6 +265,30 @@ class DynamicEvent:
 
 
 @dataclass
+class AttackSurfaceState:
+    """Persisted state for the optional attack-surface analyst.
+
+    Status lifecycle: ``pending`` → ``running`` → ``ready`` | ``failed``.
+    On resume, ``running`` is reset to ``pending`` (so an interrupted run
+    re-attempts the analyst), while ``ready`` and ``failed`` are sticky.
+    """
+
+    status: Literal["pending", "running", "ready", "failed"] = "pending"
+    brief: str | None = None
+    brief_path: str | None = None
+    subagent_path: str | None = None
+    error: str | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+    duration_seconds: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    session_id: str | None = None
+    backend: str | None = None
+    model: str | None = None
+
+
+@dataclass
 class CaptainDelta:
     verified_claim_ids: list[str]
     rejected_claim_ids: list[str]
@@ -277,6 +301,7 @@ class CaptainDelta:
 
 
 __all__ = [
+    "AttackSurfaceState",
     "CaptainDelta",
     "CaptainState",
     "CaptainTurn",

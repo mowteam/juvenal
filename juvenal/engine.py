@@ -1119,6 +1119,16 @@ class Engine:
                     )
                 else:
                     print("       reporter: disabled")
+                if config.analyst is not None and config.analyst.enabled:
+                    print(
+                        f"       analyst: {config.analyst.backend} / "
+                        f"{_model_str(config.analyst.backend, 'analyst', config.analyst.model)} "
+                        f"(max_duration: {config.analyst.max_duration_seconds}s)"
+                    )
+                elif config.analyst is not None and not config.analyst.enabled:
+                    print("       analyst: configured but disabled")
+                else:
+                    print("       analyst: disabled")
             print()
 
         if self.workflow.parallel_groups:

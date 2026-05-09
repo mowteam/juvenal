@@ -94,6 +94,7 @@ class MockBackend(Backend):
             "worker": [],
             "verifier": [],
             "reporter": [],
+            "analyst": [],
         }
         self._role_side_effects: dict[str, list] = {}
         self._role_chunks: dict[str, list[list[str]]] = {}
