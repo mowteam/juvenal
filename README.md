@@ -332,6 +332,32 @@ juvenal validate juvenal/workflows/analysis-example.yaml
 juvenal run juvenal/workflows/analysis-example.yaml --interactive
 ```
 
+### Pwn2Own Smart Home Workflow
+
+[`juvenal/workflows/pwn2own-smart-home.yaml`](juvenal/workflows/pwn2own-smart-home.yaml) adapts the
+bug-bounty pipeline to a hardware contest entry (Pwn2Own Ireland 2026, Smart Home category). It differs
+from `bug-bounty.yaml` in four ways:
+
+- A `device-recon` phase runs first and writes `output/device-recap.md` — hardware and radios, the
+  default-configuration service table, the pre-authentication surface, sandbox boundaries, and prior
+  ZDI/Pwn2Own history. A `check` phase gates its quality before the expensive analysis starts.
+- The verifier chain is five gates: `p2o-scope` (contest rules and disqualifying preconditions) →
+  `bug-class` → `preauth-impact` (pre-auth reach or auth bypass, plus a winning impact class) → `poc` →
+  `novelty`.
+- Findings are modeled as **chains** (unauthenticated reach → primitive → code execution → sandbox
+  escape) rather than standalone bugs, since a contest entry needs every link.
+- `exploit_sim` builds the target in its default, already-onboarded state with no credential handed to
+  the attacker, so `exploit_confirmed` vs `exploit_confirmed_nondefault` maps onto the contest's
+  default-configuration requirement.
+
+Device selection is by var; the recon phase specializes the run to whatever device is named.
+
+```bash
+juvenal validate juvenal/workflows/pwn2own-smart-home.yaml
+juvenal run juvenal/workflows/pwn2own-smart-home.yaml \
+  -D TARGET_DEVICE="Sonos Era 300" -D REPO=... --max-bounces 3
+```
+
 ### Analysis Resume Behavior
 
 `--resume` resumes both the outer workflow state and the per-phase analysis child state file. If an

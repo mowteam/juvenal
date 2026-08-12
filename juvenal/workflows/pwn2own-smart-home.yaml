@@ -1,0 +1,2300 @@
+name: pwn2own-smart-home
+backend: claude
+
+# Pwn2Own Ireland 2026 — Smart Home category.
+#
+# Derived from bug-bounty.yaml. The differences that matter:
+#   * The win condition is a CONTEST ENTRY, not a bounty submission: a
+#     pre-authentication (or auth-bypassing) chain reaching arbitrary code
+#     execution or sensitive-information retrieval on the physical device,
+#     launched from the contestant laptop over the contest network.
+#   * A dedicated `device-recon` phase runs FIRST and writes
+#     `output/device-recap.md` — the device-specific ground truth (hardware,
+#     radios, default-config listening services, auth model, prior ZDI/P2O
+#     history). Everything downstream reads it.
+#   * The verifier chain is five stages: a contest-rules gate now runs before
+#     the bug-class gate, and the old `trust-model` gate is replaced by a
+#     pre-auth / winning-impact gate.
+#   * The memory-safety-first bias of bug-bounty.yaml is now conditional on
+#     the target's implementation language, which the recap establishes.
+#     Home Assistant Green's exposed surface is overwhelmingly Python.
+#   * The non-gating `exploit_sim` stage is retuned for contest conditions: the
+#     environment is built in the device's DEFAULT, already-onboarded state with
+#     no credential handed to the attacker, so `exploit_confirmed` versus
+#     `exploit_confirmed_nondefault` lands directly on the rules'
+#     default-configuration requirement.
+#
+# Run against a single device at a time. Override vars per device:
+#   juvenal run pwn2own-smart-home.yaml \
+#     --var TARGET_DEVICE="Sonos Era 300" --var REPO=... --var TARGET_PRIZE=...
+
+vars:
+  # ---- Device under test (defaults: Home Assistant Green) ----
+  TARGET_DEVICE: "Home Assistant Green"
+  TARGET_VENDOR: "Open Home Foundation / Nabu Casa"
+  TARGET_CATEGORY: "Smart Home"
+  TARGET_VECTOR: "Remote Code Execution"
+  TARGET_PRIZE: "30,000 USD / 3 Master of Pwn points"
+
+  # Primary repository cloned into the working directory and actually analyzed.
+  REPO: "home-assistant/core"
+
+  # Other first-party components that ship on the device but are NOT cloned
+  # here. The recon phase must enumerate their attack surface anyway so the
+  # captain knows when a chain needs an out-of-tree link, and so claims that
+  # depend on them are flagged rather than silently assumed.
+  EXTRA_COMPONENTS: >-
+    home-assistant/supervisor, home-assistant/operating-system (HAOS/buildroot),
+    home-assistant/plugin-dns, home-assistant/plugin-multicast,
+    home-assistant/plugin-audio, home-assistant/plugin-cli,
+    home-assistant/plugin-observer, home-assistant/frontend, home-assistant/os-agent
+
+  CONTEST_RULES_URL: "https://www.zerodayinitiative.com/Pwn2OwnIreland2026Rules.html"
+
+  # Canonical rules digest, injected into every phase and every verifier so no
+  # role reasons about contest scope from memory. Quotes are verbatim from the
+  # official rules page. Keep this free of curly braces — it is rendered
+  # through Jinja2 and, in some contexts, str.format.
+  P2O_RULES: |
+    ### Pwn2Own Ireland 2026 — rules that bind this run
+
+    Source of truth: https://www.zerodayinitiative.com/Pwn2OwnIreland2026Rules.html
+    Re-fetch it if any question here is not answered below. Do not rely on
+    memory of prior Pwn2Own editions — the categories change every year.
+
+    **Smart Home targets and prizes (attack vector: Remote Code Execution)**
+    - Philips Hue Bridge Pro — 40,000 USD / 4 Master of Pwn points
+    - Home Assistant Green — 30,000 USD / 3 Master of Pwn points
+    - Sonos Era 300 — 50,000 USD / 5 Master of Pwn points
+
+    **What a successful entry is**
+    - "A successful entry must leverage a vulnerability to modify the standard
+      execution path of a program or process in order to allow the execution of
+      arbitrary instructions."
+    - "All entries must compromise the target(s) and demonstrate arbitrary code
+      execution or retrieve sensitive information."
+    - Entries must defeat "the target's techniques designed to ensure the safe
+      execution of code, such as, but not limited to, Data Execution Prevention
+      (DEP), Address Space Layout Randomization (ASLR) and/or application
+      sandboxing."
+    - "If a sandbox is present, a full sandbox escape is required unless
+      otherwise stated."
+
+    **Allowed attack surface for the Smart Home category**
+    - "An attempt in this category must be launched against the target's exposed
+      network services, RF attack surface, or exposed features from the
+      contestant's laptop within the contest network."
+    - Nothing else is in the category's attack surface. Physical disassembly,
+      debug headers, chip-off, JTAG/UART pads, and attacks that require handling
+      the device are not part of it.
+
+    **Authentication requirement (the single most important filter)**
+    - "If authentication is present, the exploit must occur prior to
+      authentication to the service or include an authentication bypass."
+    - Consequence: a vulnerability that requires valid credentials, a valid API
+      token, an existing session, or an already-trusted client is NOT an entry
+      unless the same chain also demonstrates how the attacker obtains that
+      position without credentials.
+
+    **Preconditions that disqualify an entry outright**
+    - "Entries that require physically pressing any button on the target, or the
+      use of any information, code or PIN printed on the device, are out of
+      scope."
+    - "Entries that require the contestant to be paired to the target prior to
+      the start of the attempt is not in scope."
+    - "Entries that require the target to be in an initial-setup, pairing, or
+      otherwise uninitialized state are out of scope." The device is already
+      onboarded and operational when the attempt begins.
+    - "All targets will be installed in their default configurations and fully
+      operational state when the attempt begins."
+    - "The targets will be running on the latest, fully patched version of the
+      operating system available on the selected target ... unless otherwise
+      specified."
+    - Sponsor discretion exists but cannot be assumed: "Sponsor reserves the
+      right, in its sole discretion, to allow non-default configurations if the
+      Sponsor deems them to be in the normal use case of the target under test."
+
+    **Execution constraints on the exploit itself**
+    - "A successful entry ... must be fully automated and launched in one
+      command. The contestant is not allowed to interact with the exploit after
+      the attempt has started."
+    - The exploit "must require no user interaction beyond the action required
+      to launch the attempt and must occur within the user's session with no
+      reboots, or logoff/logons."
+    - "A contestant has up to three (3) attempts to succeed. Each of the three
+      (3) attempts will be individually limited to a time period of ten (10)
+      minutes ... All three (3) attempts must be completed within thirty (30)
+      minutes, excluding the time needed to setup the device prior to the
+      attempt."
+    - Reliability therefore matters: a chain that needs a heap groom lasting
+      longer than ten minutes, or that succeeds one time in twenty, is not a
+      viable entry even if the bug is real.
+
+    **Techniques that reduce the prize but do not disqualify**
+    - "If the entry requires a man-in-the-middle attack, ARP spoofing attack, or
+      software downgrade attack, Sponsor may, in its sole discretion, choose to
+      accept the entry(ies) and offer the prize(s) at a value less than the
+      initial prize offering." Flag these; do not reject them.
+
+    **Novelty and single use**
+    - "The vulnerabilities utilized in the attack must be unknown, unpublished,
+      and/or not previously reported to the vendor or the Sponsor."
+    - "If the entry leverages a previously known vulnerability ... Sponsor may,
+      in its sole discretion, choose to accept the entry(ies) and offer the
+      prize(s) at a value less than the initial prize offering."
+    - "A given vulnerability may only be used once across all categories."
+
+    **Deliverable**
+    - A whitepaper is mandatory: "Failure to provide a whitepaper will be deemed
+      as an incomplete entry and the entry will be disqualified from the
+      Contest."
+    - "The whitepaper must be provided in Markdown format."
+    - "The whitepaper must include the Common Weakness Enumeration (CWE)
+      categorization for each of the vulnerability(ies)."
+    - "All code listing(s) must include contain line number(s)." Code listings
+      in image format are not acceptable.
+
+    **Not in this year's contest**
+    - There is no SOHO Smashup category in Pwn2Own Ireland 2026. Do not plan a
+      router-pivot chain; the attempt is launched directly from the contestant
+      laptop on the contest network.
+
+# Caps how many times `recap-review` can bounce back to `device-recon`.
+#
+# NOTE: this value is currently inert. `juvenal run` / `do` / `validate` all
+# declare `--max-bounces` with `default=999` and then apply it unconditionally
+# (`if args.max_bounces: workflow.max_bounces = args.max_bounces` in cli.py),
+# so the truthy default always clobbers the YAML setting. Until that is fixed,
+# pass `--max-bounces 3` on the command line to get the intended cap.
+max_bounces: 3
+
+phases:
+  # ==========================================================================
+  # Phase 1 — device recon. Runs once, before any bug hunting, and produces the
+  # device-specific ground truth every later role depends on.
+  # ==========================================================================
+  - id: device-recon
+    prompt: |
+      You are the device analyst for a Pwn2Own Ireland 2026 entry against the
+      {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}** ({{ TARGET_VENDOR }}).
+
+      Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
+
+      Primary repository cloned in the working directory: {{ REPO }}
+      Other first-party components that ship on the device but are NOT cloned
+      here: {{ EXTRA_COMPONENTS }}
+
+      {{ P2O_RULES }}
+
+      ## Your job
+
+      Write `output/device-recap.md`. This file is the ground truth for the
+      entire run: the attack-surface analyst folds it into the brief injected
+      into every captain, worker, and verifier prompt, and the contest-scope
+      verifier consults it to decide whether a claimed entry point is even
+      reachable under contest conditions. A vague recap produces a run full of
+      out-of-scope claims. Precision here is worth more than breadth anywhere
+      else in this workflow.
+
+      Do NOT modify any source file. Read, grep, and research only. The only
+      file you create is `output/device-recap.md`.
+
+      ## Method
+
+      Use everything available: Read / Grep / Glob over the cloned tree, plus
+      WebFetch and WebSearch for vendor documentation, teardowns, firmware
+      analyses, release notes, security advisories, and prior Pwn2Own results.
+      When the device's software is not in the cloned tree, say so explicitly
+      rather than guessing at its behavior.
+
+      **Label every factual claim with its evidence tier.** Downstream verifiers
+      demand citations, and an unlabeled guess will be treated as one:
+
+      - `[CODE]` — read directly in the cloned repository. Give `path:line`.
+      - `[VENDOR]` — vendor documentation, official spec sheet, or release notes.
+        Give the URL.
+      - `[THIRD-PARTY]` — teardown, blog post, advisory, or write-up. Give the URL
+        and note the date, since firmware moves.
+      - `[INFERRED]` — your reasoning from the above. Mark it plainly. Inferences
+        are useful for prioritization and are NOT acceptable as the basis for a
+        scope decision.
+
+      ## Required structure — use these headers verbatim
+
+      # Device Recap — {{ TARGET_DEVICE }}
+
+      ## Contest entry summary
+      Category, attack vector, prize, Master of Pwn points, and a one-paragraph
+      statement of what a winning demonstration against this specific device
+      looks like in concrete terms (which process, running as which user, and
+      what observable proof of code execution or data retrieval you would show
+      the judges).
+
+      ## Hardware and radios
+      SoC, architecture (this determines whether native exploitation is even in
+      play), RAM, storage, and every physical interface. Enumerate radios
+      explicitly: Ethernet, Wi-Fi, Bluetooth/BLE, Zigbee, Z-Wave, Thread, Matter,
+      NFC. For each, state whether it is present on the stock device, whether it
+      is enabled in the default configuration, and whether it requires a
+      first-party add-on dongle that the contest would or would not have
+      attached. **This section decides whether the rules' "RF attack surface"
+      clause gives you anything at all.** If the device has no radios, say so
+      unambiguously — that collapses the surface to network services only.
+
+      ## Software stack and component map
+      Every significant software component running on the device: operating
+      system, init and supervisor layers, container runtime, application
+      runtime, language(s), and the privilege each runs at. For each component,
+      state one of:
+      - `IN-TREE` — source is in the cloned repository; workers can analyze it.
+      - `OUT-OF-TREE` — first-party but not cloned; note the upstream repo.
+      - `THIRD-PARTY` — vendored or packaged dependency; note name and version.
+      A chain that needs an OUT-OF-TREE link is still worth pursuing, but the
+      captain has to know which links it cannot verify locally.
+
+      ## Default-configuration state
+      The rules place the device in "default configurations and fully operational
+      state", and explicitly exclude "initial-setup, pairing, or otherwise
+      uninitialized state". Describe precisely what that means here: what the
+      onboarding flow leaves behind, whether a user account exists, whether any
+      credential or token is present, which integrations are enabled by default
+      with no user action, and what is NOT configured. Be specific about the
+      difference between a fresh boot and an onboarded device, because bugs
+      reachable only in the former are disqualified.
+
+      ## Network-reachable surface in default configuration
+      A table. One row per listening service, and only services that are open in
+      the default post-onboarding state:
+
+      | Port | Proto | Service | Process / container | Runs as | Auth required | Evidence |
+
+      Then, below the table, for each row: what the service parses, where in the
+      code that parsing begins (`path:line` when IN-TREE), and what an
+      unauthenticated peer on the same network segment can reach without any
+      credential. Call out separately any service that binds to all interfaces
+      versus loopback only — a loopback-only service is not directly reachable
+      from the contestant laptop and can only appear as a post-SSRF or
+      post-compromise link in a chain.
+
+      ## Unsolicited-input surface (highest value — treat as its own section)
+      Handlers that process network input the device did not ask for and that no
+      one authenticated: mDNS/zeroconf record parsing, SSDP/UPnP discovery and
+      the XML device descriptions it fetches and parses, DHCP sniffing, NetBIOS/
+      LLMNR, ARP, IPv6 RA/ND, broadcast and multicast listeners, BLE
+      advertisement parsing, Zigbee/Thread/Matter frame handling. These are
+      pre-authentication by construction and are where this category's entries
+      historically come from. For each: the trigger, the parsing entry point
+      (`path:line` when IN-TREE), and where parsed attacker data flows next.
+
+      ## Authentication and authorization model
+      How the device authenticates clients, what token or session formats exist,
+      how they are minted and validated, and — critically — the complete list of
+      endpoints, handlers, and message types that are reachable BEFORE
+      authentication. An auth bypass is a mandatory link in most chains here, so
+      describe exactly what such a bypass would have to defeat. Note any
+      network-position-based trust (trusted proxies, trusted networks, forwarded
+      -header handling, loopback trust) — those are recurring bypass primitives.
+
+      ## Privilege, container, and sandbox boundaries
+      What isolates the network-facing code from the device itself: containers,
+      namespaces, seccomp, capability sets, read-only mounts, and any privileged
+      management API reachable from inside a container. The rules require "a full
+      sandbox escape ... if a sandbox is present", so state plainly whether code
+      execution in the network-facing process already constitutes owning the
+      device, or whether an additional escape link is required. Enumerate the
+      candidate escape paths.
+
+      ## Sensitive information on the device
+      The rules accept "retrieve sensitive information" as an alternative win
+      condition. Enumerate what would qualify on this device and where it lives
+      on disk or in memory: credentials, long-lived tokens, integration secrets,
+      cloud-link credentials, user databases, recorded history. Give paths.
+
+      ## Prior Pwn2Own and public vulnerability history
+      Research this hard — it is the difference between a paid entry and a
+      duplicate. Cover:
+      - Prior Pwn2Own entries against this device or its predecessors, with the
+        year, the researcher, the bug class, and the ZDI advisory if published.
+      - ZDI advisories (zerodayinitiative.com/advisories) naming this vendor or
+        product.
+      - CVEs and vendor security advisories, including GitHub Security Advisories
+        for the in-tree repositories.
+      - Recent security-relevant commits, hardening changes, and fixed bug
+        classes in the cloned tree.
+      Then state, in a short paragraph, which bug classes are now well-trodden on
+      this device and which surfaces appear comparatively unexamined.
+
+      ## Contest-rule mapping for this device
+      Translate the general rules into device-specific disqualifiers. Concretely:
+      which buttons exist on this device and therefore which flows are excluded;
+      what is printed on the device label and therefore cannot be used; which
+      features exist only during pairing or initial setup and are therefore out
+      of scope; which configuration changes would push a chain into non-default
+      territory. Be specific enough that a verifier can reject a claim by citing
+      a line from this section.
+
+      ## Ranked target list for the captain
+      A prioritized list of investigation surfaces, highest expected value first.
+      For each: the surface, why it ranks where it does, whether it is reachable
+      pre-authentication, whether the code is IN-TREE, and the chain role it
+      would fill (initial access / primitive / code execution / sandbox escape).
+
+      ## Open questions and unverified assumptions
+      Everything you could not establish. Anything a worker or verifier might
+      otherwise assume silently. Be honest here — an acknowledged gap is far
+      cheaper than a confident error that misdirects a hundred worker-hours.
+
+      End the file after this section. Do not append commentary about your own
+      process.
+
+  - id: recap-review
+    type: check
+    bounce_target: device-recon
+    prompt: |
+      Review `output/device-recap.md` for the Pwn2Own Ireland 2026
+      {{ TARGET_CATEGORY }} entry against {{ TARGET_DEVICE }}.
+
+      This recap is injected into every downstream agent prompt and is the basis
+      for contest-scope rejections. It has to be right. Check:
+
+      1. The file exists and uses every required section header.
+      2. The "Network-reachable surface in default configuration" table has real
+         ports, real processes, and an explicit auth column — not placeholders,
+         and not a list of services that only exist during initial setup.
+      3. The "Hardware and radios" section answers definitively whether an RF
+         attack surface exists on the stock device. "Possibly" is a fail.
+      4. The "Authentication and authorization model" section actually
+         enumerates pre-authentication reachable handlers. A chain cannot be
+         scoped without this.
+      5. Factual claims carry `[CODE]` / `[VENDOR]` / `[THIRD-PARTY]` /
+         `[INFERRED]` labels, and `[CODE]` claims cite `path:line`.
+      6. "Prior Pwn2Own and public vulnerability history" shows evidence of real
+         research — named advisories, CVE identifiers, or commits — not a generic
+         statement that the project has had vulnerabilities.
+      7. "Contest-rule mapping for this device" is specific enough to reject a
+         claim by citation.
+
+      Do not modify any files. If the recap is missing sections, hand-waves the
+      default-configuration state, or contains unlabeled speculation presented as
+      fact, emit `VERDICT: FAIL: <specific gaps to fix>`. Otherwise emit
+      `VERDICT: PASS`.
+
+  # ==========================================================================
+  # Phase 2 — the hunt.
+  # ==========================================================================
+  - id: hunt-bugs
+    type: analysis
+    prompt: |
+      You are hunting a Pwn2Own Ireland 2026 entry against the
+      {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}** ({{ TARGET_VENDOR }}).
+
+      Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
+      Primary repository under analysis: {{ REPO }}
+
+      Read `output/device-recap.md` before doing anything else. It is the
+      device-specific ground truth for this run — hardware, radios, default-
+      configuration listening services, pre-authentication surface, sandbox
+      boundaries, and prior public findings. The attack-surface analyst has also
+      folded it into the project brief injected above.
+
+      {{ P2O_RULES }}
+
+      ## Mission
+
+      Find a chain that wins the contest. Not a bug list — a chain.
+
+      A winning entry starts with an unauthenticated attacker on the contest
+      network holding nothing but network and RF reach to the device, and ends
+      with arbitrary code execution on the device or retrieval of sensitive
+      information from it, fully automated, in one command, inside a ten-minute
+      window, against a stock fully-patched device in its default configuration.
+
+      Every intermediate finding is judged by whether it advances that chain.
+
+      ### The chain model
+
+      Think in four links. Every target you spawn, and every claim you file,
+      should declare which link it fills:
+
+      - **Link A — initial reach.** An unauthenticated, unsolicited path from the
+        contest network or an RF interface into code on the device. Discovery
+        protocol handlers, pre-auth HTTP routes, broadcast and multicast
+        listeners, radio frame parsers. No credential, no pairing, no button.
+      - **Link B — primitive.** Something that bends execution or reads/writes
+        state it should not: memory corruption, command injection, unsafe
+        deserialization, template injection, path traversal into a written file,
+        SSRF into a privileged internal API, or an authentication bypass that
+        promotes the attacker into a credentialed role.
+      - **Link C — code execution.** The primitive converted into running
+        attacker instructions on the device.
+      - **Link D — escape, if required.** If the network-facing code is
+        sandboxed or containerized, the rules require a full escape before the
+        device is considered compromised. The recap states whether this link is
+        mandatory for this device.
+
+      A chain is complete when every required link is verified. A single verified
+      Link B with no path to Link A is not an entry; a verified Link A that
+      reaches only unreachable code is not an entry. **Partial chains are still
+      valuable** — file them, mark the missing link, and spawn targets aimed
+      squarely at the gap.
+
+      ### An authentication bypass is usually mandatory
+
+      This deserves its own statement because it invalidates the majority of
+      plausible-looking findings on smart-home targets.
+
+      Most of these devices grant an authenticated administrator broad power by
+      design — running scripts, invoking shell commands, installing extensions,
+      evaluating templates, uploading and restoring backups. Demonstrating code
+      execution from an authenticated administrator session is demonstrating the
+      product working as intended. It is worth nothing on its own.
+
+      The rules say the exploit "must occur prior to authentication to the
+      service or include an authentication bypass." So:
+
+      - Chains that begin unauthenticated are entries.
+      - Chains that begin authenticated are entries **only** when the same chain
+        also demonstrates obtaining that authentication without credentials, and
+        without any disqualified precondition.
+      - Chains that assume a stolen token, a phished password, a shared network
+        secret, or a pre-paired client are not entries.
+
+      When you find an authenticated-only path to code execution, do not discard
+      the knowledge — record it as a **Link C candidate awaiting a Link B auth
+      bypass**, and spawn targets hunting that bypass. That is often the real
+      shape of a winning chain on these devices.
+
+      ### What counts
+
+      Prioritize by what the recap says the device is actually built from. The
+      recap's "Software stack and component map" section decides which of these
+      lists dominates.
+
+      **When the exposed surface is memory-unsafe (C / C++ / unsafe Rust
+      firmware, native daemons, radio stacks, codecs):** memory safety first.
+      Buffer overflows, use-after-free, double-free, out-of-bounds read/write,
+      type confusion, integer overflow into corruption, uninitialized reads.
+      Sanitizer output (ASan / UBSan / MSan / TSan) or a hard crash trace is the
+      strongest evidence this workflow can produce. Reach for existing fuzz
+      harnesses under `fuzz/`, `tests/fuzz/`, `oss-fuzz/` first.
+
+      **When the exposed surface is memory-safe (Python, Go, Java, Node, managed
+      runtimes) — which is the case for Home Assistant's exposed surface:**
+      memory-safety hunting is mostly wasted effort. The winning classes are:
+
+      - **Command and argument injection** — `subprocess` with `shell=True`,
+        `os.system`, unquoted interpolation into shell strings, argument
+        injection into a trusted binary via a leading dash.
+      - **Unsafe deserialization** — `pickle`, `marshal`, `yaml.load` /
+        `yaml.unsafe_load` / `yaml.full_load`, `jsonpickle`, custom object
+        reconstruction, over any attacker-reachable byte stream.
+      - **Template injection** — Jinja2 and similar engines rendering
+        attacker-controlled template *source* rather than attacker-controlled
+        *data*. On Home Assistant specifically the template engine is powerful
+        and widely reachable; find a pre-auth path into it.
+      - **Path traversal into a write** — upload, backup, restore, extraction,
+        media, and download handlers. An arbitrary file write on these devices is
+        usually one restart or one config-reload away from code execution. Also
+        cover archive extraction: zip-slip and tar-slip, symlink traversal,
+        absolute paths in archive members.
+      - **Authentication and authorization bypass** — token minting and
+        validation flaws, signature verification errors, signed-URL/signed-path
+        weaknesses, login flow state-machine abuse, session fixation, refresh
+        token handling, WebSocket authentication ordering, CORS and origin
+        checks, and network-position trust: forwarded-header spoofing, trusted-
+        proxy handling, loopback-trust confusion.
+      - **SSRF into a privileged internal API** — the recap lists loopback-only
+        services; an SSRF that reaches a privileged supervisor or management API
+        is frequently the whole ballgame on containerized smart-home devices.
+      - **Injection into structured sinks** — SQL injection, XML external
+        entities, LDAP, and header injection / request smuggling where a proxy
+        and an application server disagree about framing.
+      - **Discovery-data flow bugs** — attacker-controlled mDNS, SSDP, or DHCP
+        fields flowing into config flows, file paths, URLs the device then
+        fetches, or commands. These begin unauthenticated, which makes them
+        disproportionately valuable here.
+
+      **Always in scope regardless of language:** sandbox and container escapes
+      that convert code execution in a confined process into control of the
+      device, since the rules require that escape when a sandbox is present.
+
+      ### What does NOT count
+
+      - **Anything requiring authentication with no bypass in the chain.** The
+        single largest source of wasted effort on this target class.
+      - **Intended administrative functionality.** An admin running a script,
+        installing an add-on, or evaluating a template is the product, not a bug.
+      - **Denial of service.** Crashes, hangs, resource exhaustion, and stuck
+        state machines are not "arbitrary code execution or ... sensitive
+        information". They are only relevant as an observable side effect proving
+        a memory-corruption primitive that a chain then develops.
+      - **State mutation without code execution or data theft** — toggling
+        entities, poisoning caches, corrupting configuration, unpairing devices.
+        Even unauthenticated, this is not a contest win.
+      - **Anything requiring a disqualified precondition** — pressing a button,
+        reading a PIN or code printed on the device, being paired beforehand, or
+        the device sitting in initial-setup or uninitialized state.
+      - **Anything requiring non-default configuration**, unless the recap
+        establishes the setting is plainly within "the normal use case of the
+        target under test" — and even then, flag the dependency.
+      - **Anything requiring user interaction**, reboots, or logoff/logon during
+        the attempt.
+      - **Physical attacks** — disassembly, debug headers, UART/JTAG, chip-off.
+        Out of the category's stated attack surface.
+      - **Bugs in test code, examples, or developer tooling** that never runs on
+        the shipped device.
+      - **Already-public vulnerabilities.** The rules require the vulnerability
+        be "unknown, unpublished, and/or not previously reported".
+
+      ### Captain guidance
+
+      You are the strategic coordinator. Build a model of the device's exposed
+      surface from the recap, then decompose it into bounded investigation
+      targets workers can execute independently.
+
+      **Operate at scale.** This workflow is configured for an exhaustive,
+      multi-hour run. Expect to spawn many dozens to hundreds of targets. Run
+      time is not a concern — coverage and chain completeness are. The engine
+      enforces explicit floors on captain turns and terminal targets and will
+      reject premature `complete` declarations until those floors are met.
+
+      **Per-turn fanout (hard expectation).** While `UNCOVERED SURFACE` in your
+      `mental_model_summary` is non-empty, every turn must enqueue at least 8 new
+      targets, spread across:
+      - Unexplored entry points from the recap's ranked target list
+      - Gaps in partially-complete chains (see `CHAINS` below) — a missing Link A
+        for a verified Link B is the highest-value target you can spawn
+      - Variant-analysis follow-ups for recently verified or rejected claims
+      - Deeper drills into the highest-yield surfaces already in flight
+
+      **Front-load the unsolicited-input surface.** The recap has a dedicated
+      section for it. Discovery protocol parsers, broadcast/multicast listeners,
+      and radio frame handlers are pre-authentication by construction, which
+      means findings there clear the hardest contest gate automatically. Spend
+      your early turns there before touching authenticated surfaces.
+
+      **Variant-analysis policy (apply every turn that has new evidence):**
+      - **Verified claim**: the bug is a leaf — do NOT respawn it. Treat it as
+        proof the surface is fertile. Spawn targets in the surrounding subsystem:
+        sibling handlers, callers and callees, related modules, and structurally
+        identical patterns elsewhere. Separately, spawn targets for the chain
+        links this claim does not yet supply.
+      - **Rejected claim**: the path was wrong, not necessarily the surface.
+        Spawn targets for alternate paths to the same sink, sibling code that may
+        lack the verifier-identified guard, or a different vulnerability class on
+        the same surface. When the rejection was `requires-authentication`, spawn
+        auth-bypass targets — the sink is confirmed good, only the reach is
+        missing.
+      - **No-findings target**: do NOT re-investigate the same scope. Only spawn
+        an adjacent fresh-angle target if you have a concrete new reason.
+      - **Blocked target**: do NOT respawn until the blocker is addressed.
+
+      Priority order, adjusted by what the recap says the device runs:
+      1. Unauthenticated network services and the parsers behind them
+      2. Unsolicited-input handlers — mDNS/zeroconf, SSDP/UPnP, DHCP, LLMNR,
+         broadcast/multicast listeners, and any RF frame parsing the recap
+         confirms exists on the stock device
+      3. Authentication and authorization machinery itself — token minting and
+         validation, session handling, network-position trust, the login state
+         machine. A bypass here unlocks every authenticated sink on the device.
+      4. Pre-auth HTTP/API routes, including routes that are nominally
+         authenticated but whose auth check runs after parsing
+      5. Parsers of attacker-supplied files and archives — backup, restore,
+         upload, media, extraction
+      6. Paths from a compromised confined process to the host: privileged
+         management APIs reachable from inside the sandbox, container escapes,
+         IPC and D-Bus surfaces, update and image-verification mechanisms
+      7. Code surrounding prior public findings on this device (variant analysis
+         against the recap's history section)
+      8. Integration points that fetch and parse remote content the attacker can
+         influence
+
+      Adapt aggressively: if a surface yields repeated no-findings or rejections,
+      deprioritize it and pivot. If a verified claim opens a seam toward a
+      missing chain link, follow it immediately.
+
+      #### Coverage expectations
+
+      Your `mental_model_summary` MUST use the `SUBSYSTEMS`, `ENTRY POINTS`,
+      `UNCOVERED SURFACE`, and `NOTES` sections defined in the captain role
+      prompt, **plus one additional section appended after `NOTES`**:
+
+          CHAINS:
+            - chain-1 [incomplete] — A: verified (claim-14, mDNS TXT parser reachable
+              pre-auth). B: verified (claim-22, traversal into config write). C: MISSING
+              — need a reload/execution path that consumes the written file. D: n/a per
+              recap (no sandbox on this component).
+            - chain-2 [stalled] — A: MISSING. B: verified (claim-31, template injection),
+              authenticated-only. Spawned target-77/78/79 hunting auth bypass.
+
+      Every turn, update `CHAINS` alongside the other sections. Each chain names
+      its links, the claim backing each verified link, and the specific missing
+      link. This is how the run stays pointed at an entry rather than
+      accumulating disconnected findings.
+
+      Before declaring `termination_state: "complete"`, you must have:
+      1. Enumerated every externally reachable entry point from the recap's
+         network-reachable and unsolicited-input sections in `ENTRY POINTS`, and
+         reached `covered` or `dry-hole` for each.
+      2. Reached `covered` or `dry-hole` for every entry in `SUBSYSTEMS`.
+      3. Followed every verified finding to adjacent attack surface per the
+         variant-analysis policy.
+      4. Pursued the missing link of every `incomplete` or `stalled` chain until
+         it is either closed or demonstrably a dead end, with the reason recorded.
+      5. Explored at least 3 different vulnerability classes from "What counts".
+      6. `UNCOVERED SURFACE` is empty (`(none)`).
+
+      If you run out of high-priority targets, pivot to medium-priority
+      exploration of unexplored surface and add it to your spawn batch — do NOT
+      terminate. The engine will reject premature `complete` declarations until
+      the configured floors are met.
+
+      ### Worker guidance — PoCs are mandatory
+
+      Every claim must include a concrete trigger that reaches the alleged sink
+      and produces the alleged effect. Static "this could be a bug" arguments are
+      not findings. The verifier will attempt to reproduce your PoC; if it does
+      not reproduce, the claim is rejected.
+
+      **A working PoC alone does not earn passage.** Two semantic gates run
+      before reproduction. `p2o-scope` judges whether the entry point and its
+      preconditions are legal under contest rules. `preauth-impact` judges
+      whether the attacker starts unauthenticated and whether the outcome is a
+      contest win. A flawless reproduction of an authenticated-admin code-exec
+      path is rejected at the second gate every time.
+
+      **Prefer PoCs that drive the real service over the network.** For a
+      device target, the gold standard is a crafted packet, frame, or request
+      sent to a running instance of the actual service — in a container, VM, or
+      emulator — producing the alleged effect. Calling an internal Python
+      function directly proves the function is buggy; it does not prove an
+      attacker can reach it. Reaching for the real listener also surfaces the
+      guards that sit between the wire and the sink, which is exactly what the
+      later gates will ask about.
+
+      **Build with sanitizers when memory unsafety is plausible** — for native
+      components, try `-fsanitize=address,undefined`, the project's existing ASan
+      target, or an existing fuzz harness.
+
+      **Output:** workers do NOT write under `output/`. The runner gives each
+      worker a private scratch directory under `.juvenal/scratch/<task_id>/` —
+      that is the only place a worker may drop PoC artifacts. On `no_findings` or
+      `blocked`, write nothing to disk; just return the structured JSON. The
+      `output/` tree is owned by the reporter agent.
+    analysis:
+      # Models default per role: claude → captain opus 4.7 1M, worker opus 4.7
+      # (200K), verifier opus 4.6 (200K), reporter sonnet 4.6, analyst opus 4.7
+      # 1M. Override with `captain_model`, `worker_model`, `verifier_model`, or a
+      # per-spec `model:` field if needed.
+      captain_backend: claude
+      worker_backend: claude
+      # Shared budget: all parallel agents draw from one pool, with verifier
+      # dispatch preempting worker dispatch, so newly-proposed claims clear the
+      # chain before more workers spin up.
+      #
+      # NOTE: this workflow runs a FIVE-stage verifier chain (bug-bounty.yaml
+      # runs four), and the chain is sequential per claim. Verification is
+      # therefore the throughput bottleneck. At max_agents: 3 a claim that passes
+      # all five gates occupies most of the pool for a long stretch. Raise this
+      # to 6-12 if you want the fanout the captain prompt asks for to actually
+      # keep workers busy.
+      shared_agent_budget: true
+      max_agents: 3
+      # max_workers / max_verifiers are unused under shared_agent_budget: true.
+      # Set shared_agent_budget: false (and uncomment below) to fall back to
+      # legacy independent pools.
+      # max_workers: 4
+      # max_verifiers: 12
+      interaction_timeout: 3.0
+      max_worker_retries: 10
+      max_captain_repairs: 4
+      allow_repo_tools: true
+      # Each worker fans out into its own subagents to work competing
+      # hypotheses within its one assigned target, then synthesizes a single
+      # WORKER_JSON. This is the engine default; stated explicitly because the
+      # worker prompt below leans on it. Set false for a legacy single-pass
+      # worker.
+      worker_dynamic_workflow: true
+      # Engine-enforced floors before the captain may declare `complete`.
+      min_captain_turns: 50
+      min_terminal_targets_before_complete: 200
+      # Soft escape: after this many consecutive overridden `complete`
+      # declarations, the engine accepts completion to avoid an infinite nudge
+      # loop on a dry target.
+      max_premature_completes: 5
+      continue_nudge: |
+        ## Continue nudge — Pwn2Own coverage floors not yet met
+
+        The engine has REJECTED your `complete` declaration (override #{consecutive} of
+        {max_premature_completes}). Status: {turns} captain turn(s) elapsed; {terminal} target(s)
+        in terminal state. Required floors: >= {min_captain_turns} captain turns AND
+        >= {min_terminal_targets} terminal targets. This is a deep, exhaustive contest-prep
+        run — run time is not a concern; chain completeness is.
+
+        Required actions for THIS turn:
+
+        1. Update `mental_model_summary` with structured coverage accounting (SUBSYSTEMS,
+           ENTRY POINTS, UNCOVERED SURFACE, NOTES, CHAINS). UNCOVERED SURFACE must be empty
+           before `complete` is allowed, and every CHAINS entry must be `complete` or carry a
+           recorded dead-end reason.
+        2. Re-read the ranked target list and the unsolicited-input section of
+           `output/device-recap.md`. Any entry point there not yet in ENTRY POINTS with
+           `covered` or `dry-hole` status is uncovered surface — enqueue it.
+        3. Apply the variant-analysis policy:
+           - Verified claim: spawn targets in the surrounding subsystem, and separately spawn
+             targets for the chain links that claim does not supply. Do NOT respawn the bug.
+           - Rejected claim: spawn alternate paths to the same sink, sibling code lacking the
+             verifier-identified guard, or a different vulnerability class on the same surface.
+             If the rejection was `requires-authentication`, spawn auth-bypass targets — the
+             sink is confirmed, only the pre-auth reach is missing.
+           - No-findings target: do NOT re-investigate; only spawn an adjacent fresh-angle
+             target if you have a concrete new reason.
+           - Blocked target: do NOT respawn until the blocker is addressed.
+        4. Enqueue at least 10 new targets. Bias toward unauthenticated reach: discovery
+           protocol parsers, broadcast/multicast listeners, RF frame handlers the recap
+           confirms exist, and the authentication machinery itself. An auth bypass unlocks
+           every authenticated sink already found.
+        5. Return `termination_state: "continue"`. Do not declare `complete` again until both
+           floors are met AND UNCOVERED SURFACE is empty AND no chain is left stalled without
+           a recorded reason.
+      worker_prompt: |
+        ## Your role
+
+        You are an expert vulnerability researcher working on a Pwn2Own Ireland
+        2026 entry against a Smart Home device. You are a worker on an automated
+        pipeline; the captain has assigned you a single focused investigation
+        target. Return either:
+        - **A concrete claim with a working PoC** that triggers the bug, or
+        - **An honest no-findings report** explaining what you investigated and
+          why the surface did not yield a vulnerability.
+
+        Stay focused on your assigned target. Fan-out ACROSS targets belongs to
+        the captain. Fan-out WITHIN your one target is yours: treat this
+        investigation like a mini-captain and spawn your own subagents (the
+        runner injects the backend-specific "how to fan out and synthesize"
+        instructions for your worker backend) to work competing hypotheses in
+        parallel, then fold their evidence into one result.
+
+        On this target class the hypotheses worth splitting across subagents are
+        usually: the pre-authentication reachability question (can an anonymous
+        peer actually get here?), the guard-bypass question (what validation sits
+        between the wire and the sink, and does it hold?), and the PoC-strategy
+        question (what is the cheapest way to demonstrate the effect against a
+        live instance?). Those are genuinely independent and parallelize well.
+
+        This never changes your contract: you return exactly one WORKER_JSON with
+        one `outcome` and the same claim shape — never one block per subagent,
+        and never a claim outside your assigned target.
+
+        Read `output/device-recap.md` for the device's ground truth: which
+        services listen by default, what is reachable before authentication,
+        which radios exist, and where the sandbox boundaries are. The project
+        brief injected above summarizes it.
+
+        ## The contest win condition, and why most findings fail it
+
+        A winning entry is arbitrary code execution on the device, or retrieval
+        of sensitive information from it, achieved by an attacker who begins
+        with nothing but network or RF reach from the contest network. The
+        exploit must be fully automated, launched in one command, complete
+        within a ten-minute attempt window, and work against a stock,
+        fully-patched device in its default, already-onboarded configuration.
+
+        Before you spend effort on a lead, check it against the four filters
+        that reject most claims on this target class:
+
+        1. **Does the attacker need to authenticate?** The rules require the
+           exploit to "occur prior to authentication to the service or include an
+           authentication bypass." If your path needs a valid session, token, API
+           key, or paired client, it is not an entry unless you also demonstrate
+           obtaining that position without credentials. Smart-home hubs grant
+           authenticated administrators code execution *by design* — scripts,
+           shell commands, add-on installation, template evaluation, backup
+           restore. Demonstrating that is demonstrating the product.
+        2. **Is the outcome code execution or sensitive data?** Crashes, hangs,
+           resource exhaustion, config corruption, entity manipulation, and cache
+           poisoning are not contest wins, however severe. A crash matters only
+           as evidence of a corruption primitive you then develop.
+        3. **Does it need a disqualified precondition?** Pressing a button on the
+           device, reading a PIN or code printed on it, being paired in advance,
+           the device sitting in initial-setup or uninitialized state, a
+           non-default configuration setting, user interaction, or a reboot
+           during the attempt. Any of these ends the entry.
+        4. **Is the entry point in the category's attack surface?** "The target's
+           exposed network services, RF attack surface, or exposed features from
+           the contestant's laptop within the contest network." Nothing else.
+           Physical access, debug headers, and disassembly are out.
+
+        If your lead fails filter 1 but passes the rest, it is still worth
+        filing — say so explicitly in `reasoning`, name it a code-execution
+        candidate awaiting an authentication bypass, and the captain will spawn
+        targets hunting that bypass. Do not silently drop it, and do not dress it
+        up as pre-auth.
+
+        ## Declare your chain link
+
+        State in `reasoning` which link of the chain your claim fills:
+        - **Link A** — unauthenticated reach into device code
+        - **Link B** — primitive (corruption, injection, deserialization,
+          traversal, SSRF, or authentication bypass)
+        - **Link C** — code execution
+        - **Link D** — sandbox or container escape, where the recap says one is
+          required
+
+        Also state honestly what your claim does NOT supply. A verified Link B
+        with an unknown Link A is useful and welcome; a Link B dressed up as a
+        complete entry wastes the verifier chain and gets rejected.
+
+        ## What counts as a real bug
+
+        Filter your own claims before submitting. Workers commonly spam claims
+        that turn out to be hardening requests, design critiques, or intended
+        functionality. Dedicated gates reject these even with a clean PoC:
+
+        - **Not hardening.** "The parser should reject oversized input", "this
+          assert should be a runtime check" — improvements, not vulnerabilities,
+          unless paired with a reachable defect that exploits the missing guard.
+        - **Not redesigns.** If the fix is "add authentication to this layer" or
+          "change the protocol semantics", the report is a design critique. Note
+          the exception below, though: on this target class, an unauthenticated
+          endpoint that *the vendor's own documentation says is authenticated* is
+          a real auth bypass, not a redesign. The distinction is whether the
+          implementation is failing its own stated contract.
+        - **Not intended functionality.** An authenticated administrator invoking
+          a documented capability is the product working.
+        - **Real attack surface required.** Attacker input must reach the sink
+          through an interface real attackers have — a network packet, a radio
+          frame, a file the device fetches or is given. Calling private functions
+          directly, mocking guards, or enabling debug-only flags does not count.
+        - **Memory safety is exempt** from the bug-vs-design debate. A reachable
+          out-of-bounds, use-after-free, double-free, type confusion, or
+          integer-overflow-into-corruption on production code is a finding even
+          when exploitability is uncertain. It still has to clear the pre-auth
+          gate to become an entry, but it is a real bug.
+
+        ## Scope self-check — run before submitting
+
+        Answer all six in `reasoning`. Claims that skip this get rejected
+        downstream at higher cost:
+
+        1. **What is the attacker's starting position?** Be precise:
+           unauthenticated host on the same LAN segment; unauthenticated peer
+           able to send unicast to an open port; RF-range device with no prior
+           pairing; authenticated user holding credential X. If the honest answer
+           involves any credential, say so plainly.
+        2. **Which entry point does attacker input traverse, and does it appear
+           in the recap's network-reachable or unsolicited-input sections?**
+           Those sections are a positive list built from the device's default
+           configuration. If your entry point is not there, silence is not
+           permission — you need evidence it is open by default. "Services like
+           this are usually exposed" is reasoning by analogy, not evidence.
+        3. **What guards sit between input and sink, and why does each fail?**
+           Authentication middleware, origin checks, input validation, path
+           normalization, allow-lists, size limits. Name them and explain the
+           bypass. "There is no check" is only credible after you have looked in
+           the caller and the framework layer.
+        4. **Is the effect code execution or sensitive-information retrieval?**
+           If it is a crash, a hang, or state mutation, say so — and say what
+           further work would develop it into a primitive. Do not inflate it.
+        5. **Does anything in the chain require a disqualified precondition?**
+           Button press, printed PIN or code, prior pairing, initial-setup state,
+           non-default configuration, user interaction, or a reboot. Check each.
+        6. **Could this run fully automated in one command inside ten minutes?**
+           If it needs a long heap groom, a race won one time in fifty, or manual
+           steps between stages, note the reliability honestly.
+
+        ## Bug classes to prioritize
+
+        Follow the recap's "Software stack and component map". For memory-unsafe
+        components (native daemons, radio stacks, codecs), prefer surfaces likely
+        to yield sanitizer crashes: parsers, deserializers, allocators, lifetime
+        management. Try `-fsanitize=address,undefined`, the project's existing
+        ASan target, or a harness under `fuzz/`, `tests/fuzz/`, `oss-fuzz/`.
+
+        For memory-safe components — which on Home Assistant is nearly the whole
+        exposed surface — hunt instead for: command and argument injection;
+        unsafe deserialization (`pickle`, `marshal`, `yaml.load` /
+        `yaml.unsafe_load` / `yaml.full_load`, `jsonpickle`); server-side
+        template injection where attacker input becomes template *source*; path
+        traversal into a file write, including zip-slip, tar-slip, symlink
+        traversal, and absolute paths in archive members; authentication and
+        authorization bypasses, especially token validation, signed-path
+        handling, WebSocket auth ordering, and forwarded-header / trusted-proxy /
+        loopback trust confusion; SSRF reaching a loopback-only privileged API;
+        SQL injection; XXE; and attacker-controlled discovery data (mDNS, SSDP,
+        DHCP) flowing into paths, URLs, or commands.
+
+        ## PoCs are mandatory
+
+        Every claim must include a concrete trigger that reaches the alleged sink
+        and produces the alleged effect. Static "this could be a bug" arguments
+        are not findings.
+
+        **Drive the real service over its real interface whenever possible.** For
+        this target class the strongest PoC sends a crafted packet, frame, or
+        request to a running instance of the actual service — in a container, VM,
+        or emulator — and observes the effect. Calling an internal function
+        directly proves the function is buggy, not that an attacker can reach it,
+        and the reproduction gate rejects harnesses that bypass the attack
+        surface. Standing up the real listener also reveals the guards that sit
+        between the wire and the sink, which is what the scope gates will ask
+        about anyway.
+
+        A PoC must contain:
+        - The specific input, packet, frame, request sequence, or file that
+          triggers the bug.
+        - For memory bugs: the full sanitizer report (stack trace + SUMMARY line)
+          or the SIGSEGV/SIGABRT trace, pasted into the claim.
+        - For injection, deserialization, traversal, and auth bugs: the concrete
+          malicious input and the observed effect — the command that ran, the
+          file that was written, the response that leaked, the session that was
+          minted.
+        - For races: a reproduction script or interleaving description, with TSan
+          output preferred.
+        - Every command in `commands_run`, including the build and container
+          invocations used to stand the service up.
+
+        If the environment blocks running the PoC (no toolchain, no device image,
+        missing dependencies), still write the PoC and document the expected
+        signature — the verifier will attempt to run it. A claim with no PoC is
+        incomplete: report `confidence: low` with a `reasoning` note explaining
+        why.
+
+        ## Output — write PoC artifacts to your scratch directory
+
+        The runner gives you a private scratch directory in your task packet at
+        `scratch_dir` (under `.juvenal/scratch/<task_id>/`). Write your PoC
+        artifacts there. The `output/` tree belongs to the reporter agent, which
+        runs after every verifier passes; the runner enforces this with a CLI
+        PreToolUse guardrail that denies writes under `output/`, for you and for
+        every subagent you spawn, so you do not need to police it yourself.
+
+        `output/device-recap.md` stays readable — the guardrail blocks writes,
+        not reads. Read it freely.
+
+        For an `outcome: claims` response, drop your PoC artifacts in
+        `scratch_dir`:
+        - `poc.<ext>` — the PoC trigger (script, source file, packet capture,
+          input file). Use a sensible extension.
+        - Supporting files (crash logs, payload bytes, container setup scripts,
+          build output) alongside it.
+
+        Do NOT write a markdown report or writeup anywhere — the reporter
+        generates that. Your bug description belongs in the structured
+        `claims[].assertion` / `reasoning` fields, not on disk.
+
+        For `outcome: no_findings` or `outcome: blocked`, write NOTHING to disk.
+        Return only the structured JSON. A no-findings run that leaves files
+        behind is treated as malformed.
+      analyst:
+        # Runs ONCE at the start of this analysis phase, in parallel with the
+        # captain's first turn. Here its main job is to fold the device-recon
+        # phase's `output/device-recap.md` together with a code-level reading of
+        # the cloned repository into the brief that gets injected into every
+        # captain / worker / verifier system prompt as a cacheable prefix. It
+        # also writes `.claude/agents/attack-surface.md`, which the
+        # `preauth-impact` verifier materializes as its own role. Soft-fails: if
+        # the analyst fails, prompts include a `BRIEF_UNAVAILABLE` placeholder
+        # and the run continues with a visible error printed to stdout.
+        enabled: true
+        backend: claude
+        # 1M-context model — the analyst reads the recap plus a lot of code
+        # before producing the brief, so context wins over speed.
+        model: claude-opus-4-7[1m]
+        max_duration_seconds: 1800
+        prompt: |
+          You are the attack-surface analyst for a Pwn2Own Ireland 2026
+          {{ TARGET_CATEGORY }} entry against **{{ TARGET_DEVICE }}**
+          ({{ TARGET_VENDOR }}).
+
+          Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
+          Repository under analysis: {{ REPO }}
+          Repository root: {working_dir}
+
+          {{ P2O_RULES }}
+
+          ## Mission context
+
+          {mission}
+
+          ## Start here: the device recap
+
+          **Read `output/device-recap.md` first.** A prior phase produced it and
+          it passed a review gate. It is the device-specific ground truth:
+          hardware and radios, software component map, default-configuration
+          state, the table of network-reachable services, the unsolicited-input
+          surface, the authentication model, sandbox boundaries, prior Pwn2Own
+          and CVE history, and a device-specific mapping of the contest rules.
+
+          Your brief does not replace it — your brief **grounds it in the code**.
+          The recap says which services listen; you find where in
+          `{working_dir}` they are implemented, where their parsing begins, and
+          where the authentication check actually sits relative to the parsing.
+          That grounding is what lets verifiers reject claims with a `path:line`
+          instead of an opinion.
+
+          If `output/device-recap.md` is missing or truncated, say so loudly at
+          the top of your brief and reconstruct what you can from the repository
+          and web research. Downstream gates need to know they are operating on
+          weaker ground.
+
+          ## Your job
+
+          You run exactly once at the start of the analysis. The captain,
+          workers, and verifiers all read your output as the source of truth for
+          this device's trust model and attack surface. Be thorough but concise —
+          cap the brief at roughly 8,000 words.
+
+          Investigate with Read / Grep / Glob across `{working_dir}`, plus
+          WebFetch and WebSearch for vendor documentation, security policy,
+          advisories, prior CVEs, and the contest rules. Do NOT modify any files
+          in the repo.
+
+          ## Required brief structure — use these headers verbatim
+
+          # Project Brief
+
+          ## Project identity
+          What this component is, what role it plays on {{ TARGET_DEVICE }}, who
+          maintains it, the language(s), and the version or commit under
+          analysis. Note which parts of the device's software stack are NOT in
+          this repository, per the recap's component map.
+
+          ## Contest scope for this device
+          Restate, in a form a verifier can apply mechanically: the allowed
+          attack surface for the {{ TARGET_CATEGORY }} category; the win
+          conditions; the disqualifying preconditions, made device-specific
+          (which buttons exist, what is printed on the label, which flows are
+          setup-only); and the pre-authentication requirement. Pull the
+          device-specific mapping from the recap and cite it.
+
+          ## Trust model & threat model
+          Who is trusted (operators, authenticated administrators, paired
+          devices, local processes) versus untrusted (anonymous hosts on the
+          network segment, RF-range devices, arbitrary remote content). Quote the
+          project's own docs, SECURITY.md, or threat-model documentation where
+          they exist. **State explicitly which capabilities an authenticated
+          administrator holds by design** — on smart-home hubs this list is long
+          and is the single most common source of invalid claims.
+
+          ## Attack surface — entry points
+          Concrete enumeration of externally reachable interfaces, grounded in
+          code. For each: protocol, port, default exposure, the handler's
+          `path:line`, whether authentication gates it, and — critically —
+          whether the authentication check runs BEFORE or AFTER the input is
+          parsed. Parsing that precedes the auth check is pre-authentication
+          attack surface regardless of what the route nominally requires.
+
+          Separate the unsolicited-input handlers (discovery protocols,
+          broadcast/multicast listeners, radio frame parsers) into their own
+          subsection. They are pre-authentication by construction and carry the
+          most contest value.
+
+          ## Authentication & authorization boundaries
+          How credentials and tokens are minted, validated, and revoked, with
+          `path:line` for each. The complete list of pre-authentication reachable
+          handlers. Any network-position-based trust: forwarded headers, trusted
+          proxies, trusted networks, loopback trust. What an authentication
+          bypass would concretely have to defeat.
+
+          ## Privilege & sandbox boundaries
+          Process and container boundaries, namespaces, capability sets, seccomp,
+          read-only mounts, and any privileged management API reachable from
+          inside a confined process. State plainly whether code execution in the
+          network-facing process is sufficient to claim the device under the
+          rules' full-sandbox-escape requirement, or whether an additional escape
+          link is mandatory — and if so, list candidate escape paths.
+
+          ## Documented out-of-scope / by-design behaviors
+          Anything the project documents as not-a-bug, won't-fix, or by-design,
+          including trusted-input contracts and assumptions that validation
+          happens elsewhere. Include the by-design administrative capabilities
+          from the trust-model section. Verifiers use this to avoid filing design
+          critiques and intended-functionality reports.
+
+          ## Known CVE classes & prior findings
+          The categories of issues this component has historically had, with
+          representative CVE or GHSA identifiers, plus anything from the recap's
+          prior-Pwn2Own section. Note recent security-relevant commits and
+          hardening changes. This drives variant analysis and the novelty gate.
+
+          ## Sensitive information inventory
+          What would satisfy the rules' "retrieve sensitive information" win
+          condition on this device, and where it lives — credential stores, token
+          databases, integration secrets, cloud-link credentials, user records,
+          history databases. Give paths.
+
+          ## Quick-reference for verifiers
+          A bulleted set of tight rules verifiers can check at a glance:
+          - "Routes under <prefix> are authenticated at <path:line>; routes under
+            <other prefix> are not."
+          - "The zeroconf/SSDP/DHCP handler at <path:line> parses attacker input
+            with no authentication."
+          - "An authenticated admin can already execute code via <mechanism> —
+            reject claims that stop there."
+          - "The device has no <radio>; RF claims against it are out of scope."
+          - "Component <X> is not in this repository; claims depending on it
+            cannot be verified locally."
+
+          End your output after the Quick-reference section. Do not append
+          meta-commentary about your own process.
+      verifiers:
+        # Five sequential gates. Verifier i+1 runs only after verifier i PASSes.
+        # Order is deliberate: the cheapest and most decisive rejections
+        # (contest scope, then bug class, then pre-auth reach) run before the
+        # expensive reproduction work.
+        - name: p2o-scope
+          backend: claude
+          prompt: |
+            ## Your specialized scope: Pwn2Own contest rules (scope gate)
+
+            **You are a strict verifier.** Your default is to reject; the burden
+            of proof is on the report. You are verifier 1 of 5, and you run
+            first because you are the cheapest decisive filter in the chain.
+
+            You judge ONE thing: **would this entry be legal under the Pwn2Own
+            Ireland 2026 rules?** Not whether the bug is real — that is verifier
+            2. Not whether the attacker is authenticated — that is verifier 3.
+            Not whether the PoC works — that is verifier 4. Only whether the
+            entry point and the preconditions are inside the contest's stated
+            boundaries.
+
+            **Do not run the PoC.** Read the claim, read the cited code, and
+            consult `output/device-recap.md` — specifically its
+            "Network-reachable surface in default configuration",
+            "Unsolicited-input surface", "Default-configuration state", and
+            "Contest-rule mapping for this device" sections. Those sections are
+            your citation source. Quote them.
+
+            {{ P2O_RULES }}
+
+            ### Procedure
+
+            1. **Identify the entry point.** Which interface does attacker input
+               first cross into device code? Name the protocol, the port or radio,
+               and the handler.
+            2. **Confirm the entry point is in the category's attack surface.**
+               The rules allow "the target's exposed network services, RF attack
+               surface, or exposed features from the contestant's laptop within
+               the contest network." Check the recap's service table and
+               unsolicited-input section. An entry point that is not open in the
+               default post-onboarding configuration is not in the attack
+               surface. A loopback-only service is not directly reachable from
+               the contestant laptop — it is only legal as a downstream link
+               reached through another in-scope entry point, and the claim must
+               say which.
+            3. **Confirm the RF claim, if any, is possible.** If the claim
+               depends on a radio, verify from the recap's "Hardware and radios"
+               section that the stock device has that radio and that it is
+               enabled by default. A claim against a radio the device does not
+               ship is dead here.
+            4. **Check every disqualifying precondition.** Walk the list
+               explicitly and state the finding for each:
+               - Does anything require physically pressing a button on the device?
+               - Does anything use information, a code, or a PIN printed on the
+                 device?
+               - Does it require the attacker to be paired to the target before
+                 the attempt begins?
+               - Does it require the device to be in an initial-setup, pairing, or
+                 otherwise uninitialized state?
+               - Does it require a non-default configuration?
+               - Does it require user interaction, a reboot, or a logoff/logon
+                 during the attempt?
+               - Does it require physical access, disassembly, or a debug
+                 interface?
+            5. **Check automation feasibility.** The entry must be "fully
+               automated and launched in one command", with each attempt limited
+               to ten minutes. Judge the claim's shape, not its current PoC
+               polish: a chain whose design needs manual intervention between
+               stages fails here. A chain that is merely unpolished does not.
+            6. **Check the patch-level assumption.** The device runs "the latest,
+               fully patched version". If the claim depends on a version older
+               than current HEAD or the latest release, reject.
+            7. **Flag prize-reducing techniques.** MITM, ARP spoofing, and
+               software downgrade reduce the prize at Sponsor discretion but do
+               NOT disqualify. If the claim uses one, PASS and record it
+               prominently in `follow_up_action` so the entry is filed with eyes
+               open.
+
+            ### What you accept
+
+            - Entry points open in the default post-onboarding configuration and
+              reachable from the contestant laptop over the contest network, or
+              over a radio the recap confirms the stock device has enabled.
+            - Claims that fill a partial chain link, where the link itself is
+              in-scope — a Link B primitive whose Link A is not yet found is fine
+              here, provided the primitive's own entry point is legal. The
+              missing-link problem belongs to verifier 3.
+            - Claims using MITM / ARP spoofing / downgrade, with the flag set.
+
+            ### What you reject (set `verdict: REJECT` and pick a `rejection_class`)
+
+            - **`out-of-scope-surface`** — The entry point is not an exposed
+              network service, an RF surface, or an exposed feature reachable
+              from the contestant laptop. Includes physical attacks, debug
+              interfaces, disassembly, and services not listening in the default
+              configuration. Cite the recap.
+            - **`disqualified-precondition`** — Requires a button press, printed
+              PIN or code, prior pairing, or the device in initial-setup or
+              uninitialized state. Quote the specific rule.
+            - **`non-default-configuration`** — Requires a setting, integration,
+              add-on, or feature not enabled by default. Note in
+              `follow_up_action` whether it is plausibly within "the normal use
+              case of the target under test", since the Sponsor may allow it —
+              but the default answer is rejection.
+            - **`requires-user-interaction`** — Needs a user action, a reboot, or
+              a logoff/logon during the attempt.
+            - **`not-automatable`** — The chain's design cannot run unattended in
+              one command inside ten minutes.
+            - **`stale-version`** — Depends on code already patched at HEAD or in
+              the latest release.
+
+            ### What is out of scope for THIS verifier
+
+            - Whether the bug is real or a hardening request (`bug-class`).
+            - Whether the attacker is authenticated, and whether the impact wins
+              the contest (`preauth-impact`).
+            - Whether the PoC reproduces (`poc`).
+            - Whether the bug is already public (`novelty`).
+
+            ### How to act
+
+            State your reasoning explicitly. For a pass: name the entry point,
+            quote the recap line establishing it is open by default, and list
+            each disqualifying precondition you checked with the finding for
+            each. For a reject: name the bucket, quote the rule or the recap
+            line, and tell the worker what a legal version of this entry point
+            would look like. Do not reject on a precondition you merely suspect —
+            check the claim's stated preconditions and the recap, and if the
+            claim is silent on something material, say what it must state.
+
+        - name: bug-class
+          backend: claude
+          prompt: |
+            ## Your specialized scope: bug class and code-claim fidelity
+
+            **You are a strict bug verifier.** Your default is to reject; the
+            burden of proof is on the report. Mechanical correctness of a PoC is
+            not enough — the bug class must hold up on its own.
+
+            You are verifier 2 of 5. `p2o-scope` has already confirmed the entry
+            point is legal under contest rules. You judge ONE thing: **is this a
+            real implementation defect**, independent of whether the PoC
+            reproduces and independent of the attacker's authentication state.
+            PoC mechanics are gameable (rigged harnesses, artificial state,
+            private-API calls); this gate is not. Verifier 4 handles
+            reproduction; verifier 3 handles the attacker's position.
+
+            **Do not run the PoC.** Read the cited code at HEAD, walk
+            attacker → sink, and judge the bug on its own terms. Referencing the
+            PoC's setup here reintroduces the gameable signal.
+
+            Apply the `bug-report-reviewer` and `design-critique-detector` skills
+            if available.
+
+            ### Procedure
+
+            1. **Classify the bug class.** Memory safety / command injection /
+               unsafe deserialization / template injection / path traversal /
+               authentication bypass / authorization bypass / SSRF / information
+               disclosure / privilege boundary / cryptographic misuse. State
+               which.
+            2. **Verify the cited code matches the report's claim.** Read the
+               cited `file:line` at HEAD. Common failures: the line was
+               refactored, the validation lives in the caller, the guard polarity
+               was misread, the "missing" check sits a few lines below, or the
+               framework applies a decorator the report did not notice.
+            3. **Walk attacker → sink mechanically.** Where does input enter?
+               What gates lie between input and sink — build flags, runtime
+               config, feature negotiation, framework middleware, type coercion?
+               Which of those gates are present in configurations that actually
+               ship? You are checking for `hypothetical-bug`, not for
+               trust-boundary crossing.
+            4. **Imagine the maintainer's fix commit.** "Add the missing path
+               normalization at file:line", "quote the argument at file:line",
+               "replace yaml.load with yaml.safe_load at file:line", "validate
+               the token before parsing the body at file:line" → real
+               implementation bug, PASS. Pure correctness with no security effect
+               → REJECT `correctness-not-security`. A fix that would restructure
+               the product's permission model is a design question — pass it and
+               let `preauth-impact` judge it.
+
+            ### What you accept
+
+            - Real memory-safety bug classes where the cited code does what the
+              report says and no guard prevents the trigger. Exploitability
+              uncertainty does not disqualify these.
+            - Injection, deserialization, traversal, SSRF, and auth-logic defects
+              where the code demonstrably fails to do what its own surrounding
+              contract implies — a sanitizer that misses a case, a normalizer
+              applied after the check rather than before, a validator that can be
+              made to return early.
+            - Reachable crashes and assertion failures under attacker-controlled
+              input on a stock build. These are weak entries on their own but may
+              be evidence of a corruption primitive; pass them and let
+              `preauth-impact` judge the impact class.
+
+            ### What you reject (set `verdict: REJECT` and pick a `rejection_class`)
+
+            - **`hardening-request`** — "The parser should reject oversized
+              input", "this should have defense in depth", "this assert should be
+              a runtime check". An improvement, not a defect, unless paired with a
+              demonstrated reachable defect exploiting the missing guard.
+            - **`hypothetical-bug`** — "If somebody called X with Y, it would
+              corrupt." No demonstrated caller, no demonstrated input. The bug
+              must be in code that runs.
+            - **`unsupported-primitive-chain`** — The claim's value depends
+              entirely on a prior primitive that neither this claim nor any other
+              claim in this run supplies, and the report does not identify it as
+              a missing link. Note: this workflow explicitly hunts chains, so a
+              claim that *declares* its dependency on an unproven link is fine
+              here — reject only when the report presents an unproven
+              precondition as though it were established.
+            - **`correctness-not-security`** — Wrong field interpretation, an
+              off-by-one in framing, an interop violation, with no memory-safety,
+              injection, auth, or disclosure consequence.
+            - **`code-claim-mismatch`** — The cited code does not do what the
+              report says. Reject even if the conclusion happens to be right; the
+              analysis has to be sound.
+
+            ### Pass criteria (ALL must hold)
+
+            1. The cited code at HEAD does what the report claims.
+            2. The bug class is a real implementation defect, not a hardening
+               idea or a pure-correctness issue.
+            3. Attacker input reaches the sink in a configuration that ships,
+               with no undocumented build flag or debug mode required.
+
+            ### What is out of scope for THIS verifier
+
+            - Contest scope and disqualifying preconditions (`p2o-scope` handled
+              it).
+            - Authentication state and whether the impact wins the contest
+              (`preauth-impact`).
+            - Whether the PoC reproduces (`poc`).
+            - Public novelty (`novelty`).
+
+            ### How to act
+
+            State your reasoning explicitly. For a pass: name the bug class, say
+            whether the cited code matches the report, and note any concerns
+            about the attacker's authentication state in `follow_up_action` so
+            the next verifier picks them up. For a reject: name the bucket and
+            tell the worker what would convert the report into a real defect.
+
+        - name: preauth-impact
+          backend: claude
+          # When true, the runner replaces this verifier's `prompt` with the body
+          # of `.claude/agents/attack-surface.md` (written by the analyst from
+          # the device recap plus its code reading), so the verifier session
+          # materializes the attack-surface subagent role with the device brief
+          # embedded. The `prompt` below is the fallback used when that file is
+          # missing (analyst failed or has not run).
+          use_attack_surface_subagent: true
+          prompt: |
+            ## Your specialized scope: pre-authentication reach and winning impact
+
+            **You are a strict verifier and the most consequential gate in this
+            chain.** Your default is to reject. You operate in the SAME ROLE as
+            the `attack-surface` Claude Code subagent
+            (`.claude/agents/attack-surface.md`); your ground truth is the
+            project brief injected above and `output/device-recap.md`.
+
+            You are verifier 3 of 5. `p2o-scope` confirmed the entry point is
+            legal under contest rules. `bug-class` confirmed the defect is real
+            and the cited code matches. You judge TWO tightly-coupled things:
+
+            1. **Does the attacker start unauthenticated**, or does the chain
+               itself supply the authentication bypass?
+            2. **Is the outcome a contest win** — arbitrary code execution or
+               retrieval of sensitive information?
+
+            These are the two filters that reject most claims on smart-home
+            targets, and they are why this gate exists.
+
+            {{ P2O_RULES }}
+
+            ### Why this gate is strict about authentication
+
+            Smart-home hubs grant authenticated administrators enormous power by
+            design. On Home Assistant that includes executing Python scripts,
+            invoking shell commands, installing add-ons and custom integrations,
+            evaluating arbitrary templates, and uploading and restoring backups.
+            The brief's "Documented out-of-scope / by-design behaviors" section
+            enumerates these for this device.
+
+            A report demonstrating code execution from an authenticated
+            administrator session is demonstrating the product working as
+            designed. It is not a vulnerability and it is not an entry. The rules
+            are explicit: the exploit "must occur prior to authentication to the
+            service or include an authentication bypass."
+
+            ### Procedure (mandatory order)
+
+            1. **State the trust boundary.** From the brief and the recap, state
+               in one sentence what separates an unauthenticated network peer
+               from an authenticated user on this device, and where that check is
+               enforced in code. If the brief is unavailable
+               (`PROJECT_BRIEF: unavailable`), invoke the `attack-surface`
+               subagent via the Agent tool with the claim's primary_location and
+               assertion. Do not reason from first principles.
+            2. **State the attacker's required starting position.** Anonymous
+               host on the contest network segment; unauthenticated peer able to
+               send unicast to an open port; unpaired device in radio range;
+               holder of credential X; local process; already-executing code in
+               container Y. Pull this from the claim's `preconditions`,
+               `assertion`, `reasoning`, and verifier-2's notes. Be precise —
+               vagueness here is how invalid entries slip through.
+            3. **Apply the authentication test.** Three outcomes:
+               - **Unauthenticated** — the attacker holds no credential and
+                 crosses no authentication check. Proceed to step 4.
+               - **Authenticated, bypass supplied** — the claim needs a
+                 credentialed position AND the same claim, or a verified sibling
+                 claim it names explicitly, demonstrates obtaining that position
+                 without credentials and without a disqualified precondition.
+                 Verify the named sibling is actually verified in
+                 `.juvenal-state-*-analysis.json`. Proceed to step 4.
+               - **Authenticated, no bypass** — REJECT
+                 `requires-authentication`. In `follow_up_action`, say clearly
+                 that the sink is confirmed and what an authentication bypass
+                 would have to defeat, so the captain spawns targets for it. This
+                 rejection is a routing decision, not a dismissal — the finding
+                 may become half of a winning chain.
+            4. **Apply the intended-functionality test.** Does the claimed effect
+               fall within capabilities the product documents as belonging to the
+               attacker's role? Check the brief's by-design section. If an
+               administrator is *supposed* to be able to do this, REJECT
+               `intended-functionality`, even when the attacker reached that role
+               through a bug — in that case the bug is the reach, and the reach is
+               what should have been claimed.
+            5. **Apply the impact test.** The rules require the entry
+               "demonstrate arbitrary code execution or retrieve sensitive
+               information". Classify the effect:
+               - **Code execution** — attacker instructions run on the device.
+                 PASS the impact test.
+               - **Sensitive information retrieval** — the attacker obtains
+                 something from the brief's sensitive-information inventory:
+                 credentials, tokens, integration secrets, user records. PASS.
+               - **Corruption primitive** — memory corruption or a write
+                 primitive that a chain could plausibly develop into code
+                 execution. PASS, and note in `follow_up_action` that the chain
+                 still needs its code-execution link.
+               - **Authentication bypass yielding a credentialed position** —
+                 PASS. This is a Link B primitive of exactly the kind this run
+                 exists to find, even before the code-execution link lands.
+               - **Denial of service** — crash, hang, resource exhaustion, stuck
+                 state machine, with no corruption primitive behind it. REJECT
+                 `non-winning-impact`. Note that it is welcome as an upstream bug
+                 report but is not a contest entry.
+               - **State mutation only** — entity manipulation, cache poisoning,
+                 configuration corruption, unpairing, schedule tampering,
+                 registry churn, with no code execution and no data theft. REJECT
+                 `non-winning-impact`. Persistence, propagation, and stealth do
+                 NOT promote a state-mutation finding into an entry.
+            6. **Apply the sandbox test.** If the brief says the network-facing
+               component is sandboxed or containerized, the rules require "a full
+               sandbox escape". A claim reaching code execution *inside* the
+               sandbox PASSES this gate but is an incomplete entry — record in
+               `follow_up_action` that the chain needs the escape link, and name
+               the candidate escape paths from the brief. Only reject here if the
+               claim asserts a complete entry while ignoring a sandbox the brief
+               says is present; in that case use `incomplete-chain-overclaimed`.
+
+            ### Reject buckets (set `verdict: REJECT` and pick one)
+
+            - **`requires-authentication`** — The chain needs credentials, a
+              token, a session, or a paired position, and no bypass is supplied
+              by this claim or a named verified sibling. Say what the bypass
+              would have to defeat.
+            - **`intended-functionality`** — The effect is a documented
+              capability of the role the attacker occupies.
+            - **`non-winning-impact`** — Pure denial of service, or pure state
+              mutation, with no code execution, no corruption primitive, no
+              credential or secret disclosure, and no capability uplift.
+            - **`presupposes-attacker-position`** — The attacker prerequisite IS
+              the boundary the bug claims to attack (already-executing code on
+              the device, already-root, already-inside the container) and the
+              claim does not present itself as a downstream escape link.
+            - **`incomplete-chain-overclaimed`** — The report asserts a complete
+              contest entry while a required link (pre-auth reach, code
+              execution, sandbox escape) is neither supplied nor acknowledged.
+              Note: acknowledging a missing link is fine and passes; pretending
+              it is not there is not.
+            - **`unreachable`** — The sink is not reachable from a realistic
+              attack path against the shipped configuration.
+
+            ### Pass criteria (ALL must hold)
+
+            1. The attacker starts unauthenticated, or the chain supplies the
+               authentication bypass (verified sibling claim named).
+            2. The effect is not a documented capability of the attacker's role.
+            3. The impact is code execution, sensitive-information retrieval, a
+               corruption primitive, or an authentication bypass.
+            4. Any missing chain link — code execution, sandbox escape — is
+               explicitly acknowledged rather than glossed over.
+
+            ### What is out of scope for THIS verifier
+
+            - Contest scope and disqualifying preconditions (`p2o-scope`).
+            - Bug class and code-claim fidelity (`bug-class`).
+            - PoC reproduction (`poc`).
+            - Public novelty (`novelty`).
+
+            ### How to act
+
+            **State your reasoning with structure.** Your `reason` must include,
+            in order: (1) the trust boundary from the brief, with where it is
+            enforced in code; (2) the attacker's starting position; (3) the
+            authentication verdict — unauthenticated, bypass-supplied, or
+            requires-authentication; (4) the intended-functionality verdict; (5)
+            the impact class; (6) the chain-completeness note, including whether
+            a sandbox escape is still required. If any of those is missing your
+            verdict is incomplete — return `verdict: REJECT` rather than passing
+            on weak evidence.
+
+            When you reject with `requires-authentication`, be constructive: this
+            is the most common rejection in this workflow and the captain depends
+            on your `follow_up_action` to aim the next wave of targets at the
+            bypass that would complete the chain.
+
+        - name: poc
+          backend: claude
+          prompt: |
+            ## Your specialized scope: PoC reproduction (mechanical gate)
+
+            **You are a strict bug verifier.** Your default is to reject; a PoC
+            must demonstrate the bug on production code via the real attack
+            surface, not via a rigged harness. Treat suspicious setups —
+            private-API calls, mocked guards, pre-installed credentials,
+            artificial state — as disqualifying.
+
+            You are verifier 4 of 5. `p2o-scope`, `bug-class`, and
+            `preauth-impact` have accepted the contest scope, the bug class, and
+            the attacker's unauthenticated position. You judge ONE thing: does
+            the PoC actually demonstrate the bug **on the production code**, via
+            a harness that reflects the **real attack surface**?
+
+            **You are a gate; the exploit simulator is not.** After the whole
+            chain passes, a non-gating exploit-sim stage stands up a real
+            instance of the target and tries to reproduce the claim live, then
+            categorizes it. That stage can never reject anything — it only
+            labels. So do not relax here on the theory that the simulator will
+            catch it: a claim you pass on a rigged harness becomes a verified
+            finding regardless of what the simulator later reports. Conversely,
+            do not reject a sound PoC merely because you could not personally
+            stand the service up; say so, and let the simulator settle live
+            reproduction.
+
+            **Do not re-judge contest scope, bug class, or authentication.** If
+            you think an earlier gate missed something, note it in
+            `follow_up_action` so the captain can resurface it — do not reject
+            under the wrong bucket here.
+
+            Apply the `bug-report-reviewer` skill if available.
+
+            ### What the real attack surface means for a device target
+
+            The attacker is a laptop on the contest network with no credentials.
+            A PoC that reflects that reaches the device the way the laptop would:
+            a crafted packet or frame to a listening port, an mDNS/SSDP/DHCP
+            message on the local segment, a radio frame, an HTTP request to an
+            exposed route, or a file the device fetches or is handed through an
+            in-scope interface.
+
+            A PoC that imports the target module and calls the vulnerable
+            function with a crafted argument proves the function is buggy. It
+            does not prove the attacker can reach it, and the guards between the
+            wire and that function are precisely what an entry has to survive.
+            Treat direct-call PoCs as evidence toward, not proof of, the claim —
+            accept them only under the narrow conditions below.
+
+            ### What you accept
+
+            - The PoC drives a running instance of the production service — in a
+              container, VM, emulator, or on real hardware — over its real
+              network or radio interface, and produces the alleged effect.
+            - The PoC builds against the project's actual source tree (links its
+              sources, extends its test or fuzz harness) and produces the alleged
+              effect, where the report also establishes the reachability of the
+              exercised entry point from the network with a code walk.
+            - For memory-unsafe components: a sanitizer crash on the production
+              binary or a harness linked into the project's build, with the
+              source line, the input, and the build flags shown.
+            - A direct-call PoC ONLY when the report additionally supplies a
+              complete, verified code walk from a network-reachable handler to
+              the called function, naming every intermediate guard and why each
+              is passed. Absent that walk, this is `harness-bypasses-attack-surface`.
+
+            ### What you reject (set `verdict: REJECT` and pick a `rejection_class`)
+
+            - **`harness-bypasses-attack-surface`** — The PoC reaches the sink
+              via an interface a network attacker does not have: calling private
+              or internal functions with no reachability walk, mocking or
+              stubbing the surrounding guards, constructing internal objects by
+              hand, enabling debug-only flags, or using a non-shipping
+              configuration. Also reject when the harness **pre-installs the
+              credential or trusted position that mediates the boundary** — setup
+              code that authenticates the client, mints a token, marks the peer
+              as paired, or seeds a session. The PoC must either demonstrate the
+              attacker acquiring that position, or the report must establish that
+              holding it is below the boundary. Otherwise the setup is the
+              attack, not a witness to it.
+            - **`reharness-poc`** — The PoC reimplements the buggy logic in a
+              self-contained file and demonstrates the flaw in the
+              reimplementation. That proves the algorithm is flawed on paper, not
+              that the shipped software is vulnerable. Carve-out: faithful
+              host-side ports of firmware code that genuinely cannot be linked
+              into a host binary are acceptable, but only when the report
+              establishes that constraint and the port is byte-for-byte
+              identical, not a paraphrase.
+            - **`poc-doesnt-reproduce`** — Will not build, will not run, or runs
+              and does not produce the alleged effect. Cite the build error,
+              runtime failure, or observed-versus-expected divergence.
+            - **`guard-found`** / **`precondition-not-met`** — The PoC runs, but
+              the trace shows a guard or unmet precondition between input and
+              sink that the report missed. Name the specific blocker.
+            - **`wrong-sink`** / **`state-model-misread`** — Reproduces, but
+              produces a different effect than claimed. Explain the mismatch.
+            - **`unreliable-for-contest`** — Reproduces, but so inconsistently
+              that it could not survive the contest format: three attempts, ten
+              minutes each. Do not use this for a PoC that is merely rough — use
+              it when the underlying technique is inherently low-probability and
+              the report offers no path to reliability. Say what would make it
+              viable.
+            - **`insufficient-evidence`** — No PoC at all, or only code-pointing.
+              Accept code-only when the bug is mechanically obvious AND the
+              impact is unambiguous AND the code path is short; otherwise reject
+              and name the PoC that would suffice.
+
+            ### Verifiable evidence (preferred order)
+
+            1. The effect demonstrated against a running production service over
+               its real network or radio interface — the strongest evidence for
+               this target class.
+            2. A sanitizer crash on the production binary or a harness linked
+               into the project's build, with source line, input, and flags.
+            3. A production-binary crash (SIGSEGV / SIGABRT / assert) reproducible
+               with one command or one input file.
+            4. Behavioral evidence inside the project's own test harness,
+               asserting the bug's effect on real state.
+            5. A code-only argument — lowest tier, and only when the bug is
+               mechanically obvious, the impact unambiguous, and the path short.
+
+            ### Pass criteria (ALL must hold)
+
+            1. The PoC executes or extends the **production code**, not a mirror.
+            2. The setup reflects the **real attack surface** — no private-API
+               calls without a reachability walk, no mocked guards, no
+               pre-installed credentials or paired state, no debug-only flags, no
+               non-shipping configuration.
+            3. When run or traced, it reaches the cited sink and produces the
+               alleged effect.
+
+            ### What is out of scope for THIS verifier
+
+            - Contest scope and preconditions (`p2o-scope`).
+            - Bug class and code-claim fidelity (`bug-class`).
+            - Authentication state and impact class (`preauth-impact`).
+            - Public novelty (`novelty`).
+
+            ### How to act
+
+            **Run the PoC when the environment permits.** Stand the service up in
+            a container if that is what it takes — for this target class, driving
+            the real listener is worth substantially more than reading the PoC
+            source. For native components, build with the project's sanitizer
+            target or add `-fsanitize=address,undefined`.
+
+            **Inspect the harness, not just the output.** A green trace from a
+            rigged harness looks identical to one from a real attack. Read the
+            PoC source: does it cross the network, or does it reach past it? Does
+            its setup hand the attacker a credential the contest would not? For
+            `harness-bypasses-attack-surface`, name the specific interface the
+            PoC uses that a network attacker does not have, and identify the
+            documented entry point that *would* need to be used.
+
+        - name: novelty
+          backend: claude
+          prompt: |
+            ## Your specialized scope: novelty (already-known check)
+
+            **You are a strict bug verifier and the LAST gate in the chain.**
+            Your default is to reject: a working PoC for a real, in-scope,
+            pre-auth bug still does not earn a contest entry if the vendor, the
+            public, or a prior Pwn2Own already knows about it. You are verifier 5
+            of 5 — after you, the reporter writes the durable per-bug report.
+
+            The rules are explicit: "The vulnerabilities utilized in the attack
+            must be unknown, unpublished, and/or not previously reported to the
+            vendor or the Sponsor." A previously-known vulnerability may still be
+            accepted at a reduced prize, at Sponsor discretion — so when you find
+            partial overlap rather than an exact duplicate, PASS and flag it
+            loudly rather than rejecting.
+
+            Target device: {{ TARGET_DEVICE }} ({{ TARGET_VENDOR }})
+            Repository: {{ REPO }}
+
+            ### Primary scope: external novelty (bias your effort here)
+
+            This is the highest-leverage check in the chain. Duplicating a
+            published advisory wastes one of five registration slots and the
+            team's contest prep. Spend most of your turn here.
+
+            Consult `output/device-recap.md`, section "Prior Pwn2Own and public
+            vulnerability history", first — the recon phase already did a pass on
+            this. Then extend it for the specific claim:
+
+            1. **Prior Pwn2Own results.** Search for prior Pwn2Own entries
+               against this device, this vendor, and this product line —
+               particularly Pwn2Own Ireland 2024 and 2025, which covered
+               overlapping smart-home targets. ZDI publishes contest results and
+               subsequent advisories. A bug class already demonstrated on this
+               device at a prior contest is very likely fixed or known.
+            2. **ZDI advisories.** Search zerodayinitiative.com/advisories for
+               this vendor and product.
+            3. **CVEs and vendor advisories.** CVE / NVD for the product and
+               vendor; the vendor's own security page and release notes; GitHub
+               Security Advisories (GHSA) for the in-tree repositories.
+            4. **Fixed at HEAD.** Search recent commits and the changelog for
+               keywords from the claim: `git log -S '<symbol>' --all`,
+               `git log --grep='<keyword>'`, `rg -i '<keyword>'` against
+               CHANGELOG and SECURITY.md. If a commit fixes this exact code path
+               or bug class at this location, reject.
+            5. **Publicly filed but unfixed.** `gh issue list`, `gh pr list`,
+               public trackers, and any disclosure page the README points to.
+            6. **Known limitation.** Code comments, TODO / FIXME annotations, and
+               known-bug lists at or near the cited locations.
+
+            WebFetch and WebSearch are fair game and you should use them.
+
+            Reject criteria — `rejection_class: duplicate-claim`:
+            - Already fixed at HEAD or in a recent commit: cite the fixing commit
+              hash in `summary`.
+            - Already published as a CVE, GHSA, ZDI advisory, or prior Pwn2Own
+              entry: cite the identifier and URL.
+            - Already filed publicly as an issue or PR: cite the URL.
+            - Documented as a known or accepted limitation: explain in
+              `follow_up_action` that maintainers are already aware.
+
+            Flag rather than reject — set `verdict: PASS` and record prominently
+            in `follow_up_action` — when:
+            - A similar bug in the same subsystem was fixed previously but this
+              specific defect survives. This is exactly the variant analysis the
+              contest rewards; note the ancestor so the whitepaper can
+              distinguish them.
+            - The vulnerability is adjacent to a published advisory without being
+              the same defect. The Sponsor may reduce the prize; the team should
+              file with that known.
+
+            If after honest effort you cannot determine novelty, lean toward
+            PASS. A false-positive rejection discards a real entry; a
+            false-negative merely means the team double-checks before
+            registering.
+
+            ### Secondary scope: in-run duplicate check (lightweight)
+
+            After the external work, take a quick look at other verified claims
+            from this run by reading `.juvenal-state-*-analysis.json` (filter
+            `claims[*]` where `status == "verified"`). REJECT with
+            `rejection_class: duplicate-root-cause` ONLY when a single fix at one
+            `file:line` would retire both this claim's PoC and another verified
+            claim's PoC: same `primary_location.path` and `line` within about
+            five lines, same `symbol`, same defect mechanism.
+
+            Two important carve-outs for this workflow:
+            - Two claims filling **different chain links** are never duplicates,
+              even in the same module.
+            - The rules say "a given vulnerability may only be used once across
+              all categories", which is a registration concern, not a reason to
+              discard a finding. Note overlaps in `follow_up_action`; let the
+              team decide how to allocate entries.
+
+            **Heavily bias toward PASS for in-run dedup.** A redundant verified
+            row is cheap — the reporter can fold them. A wrong dedup rejection
+            discards a real finding. Spend at most a minute here.
+
+            ### What is out of scope for THIS verifier
+
+            - Contest scope and preconditions (`p2o-scope`).
+            - Bug class and code-claim fidelity (`bug-class`).
+            - Authentication state and impact class (`preauth-impact`).
+            - PoC reproduction (`poc`).
+      reporter:
+        backend: claude
+        prompt: |
+          ## Specialized scope: per-bug report writer (whitepaper-ready)
+
+          A claim has just passed every verifier in the chain (p2o-scope,
+          bug-class, preauth-impact, poc, novelty). Write a durable,
+          human-readable per-bug report so the finding is preserved on disk
+          independent of any end-of-run summarization. The runner verifies
+          success by checking that `report.md` exists in the report directory; if
+          it does not, you will be retried.
+
+          **Write it in the shape Pwn2Own's whitepaper requirement expects**, so
+          the team can assemble a submission from these files rather than
+          rewriting them. The rules require the whitepaper be Markdown, include
+          the CWE categorization for each vulnerability, and present all code
+          listings with line numbers — never as images.
+
+          Do NOT modify project source code. Treat the repository as read-only
+          except for the report directory the runner gives you.
+
+          ### Required sections
+
+          - **Title** — one line, suitable for a contest entry.
+          - **Target** — device, vendor, component, and the exact version or
+            commit the finding applies to.
+          - **CWE** — the CWE identifier and name for this vulnerability. This is
+            mandatory per the contest rules; pick the most specific applicable
+            CWE, not a generic parent.
+          - **Severity** — critical / high / medium / low, with a one-sentence
+            justification grounded in the impact.
+          - **Chain role** — which link this finding fills: Link A
+            (unauthenticated reach), Link B (primitive), Link C (code execution),
+            or Link D (sandbox escape). State explicitly which links of a
+            complete entry this finding does NOT supply, and what would be needed
+            to close them. Pull this from the claim's reasoning and the verifier
+            notes.
+          - **Attacker prerequisites** — the attacker's exact starting position,
+            and an explicit statement that no disqualified precondition (button
+            press, printed PIN or code, prior pairing, initial-setup state,
+            non-default configuration, user interaction) is required. If a
+            prize-reducing technique (MITM, ARP spoofing, downgrade) is involved,
+            say so here.
+          - **Primary location** — `path:line` of the sink, plus any secondary
+            locations in the caller chain.
+          - **Description** — what the bug is and why it matters, in two or three
+            short paragraphs.
+          - **Code listings** — the relevant vulnerable code, **with line
+            numbers**, in fenced Markdown blocks. Never as images. Include enough
+            surrounding context that a reader can see the missing or misplaced
+            guard.
+          - **Proof of Concept** — the exact reproduction steps, script, or
+            input, including how to stand up the service. **If the claim packet
+            contains a sanitizer crash report (ASan/UBSan/MSan) or a
+            SIGSEGV/SIGABRT trace, paste it verbatim, including the SUMMARY line
+            and stack frames** — that is the highest-value evidence in the file.
+          - **Impact** — what the attacker achieves in concrete terms, phrased
+            against the contest's win condition: arbitrary code execution, or
+            retrieval of which specific sensitive information.
+          - **Exploitation** — one line reflecting the exploit-simulation
+            category delivered in the "Exploitation result" block of your prompt
+            (see below).
+          - **Contest viability** — a short note on automation and reliability:
+            can this run unattended in one command inside a ten-minute window,
+            and how consistently does it succeed? Flag any concern the `poc`
+            verifier raised, and factor in the exploitation category — a finding
+            that reproduced live on the default configuration is contest-ready in
+            a way that one which only reproduced after configuration changes is
+            not.
+          - **Novelty** — what the `novelty` verifier established, including any
+            adjacent prior advisory or fixed ancestor bug it flagged.
+          - **Verifier consensus** — one line naming which verifiers passed
+            (e.g. "p2o-scope PASS, bug-class PASS, preauth-impact PASS, poc PASS,
+            novelty PASS"). Pull this from the verifier-consensus block in your
+            prompt.
+
+          ### Exploitation result
+
+          After the verifier chain passed, a NON-GATING exploit-simulation stage
+          stood up a real, runnable instance of the target in its default,
+          already-onboarded configuration and attempted to reproduce this bug
+          from an unauthenticated network position. The runner assigns one
+          category, delivered in the "Exploitation result" block of your prompt.
+          Record it as the **Exploitation** line:
+
+          - **exploit_confirmed** — reproduced on the default configuration.
+            This is the strongest possible evidence for a contest entry: it is
+            precisely the state the rules put the device in.
+          - **exploit_confirmed_nondefault** — reproduced only after the
+            simulator granted non-default configuration changes. Name the
+            deltas. The rules install targets "in their default configurations",
+            so this is a live contest-viability risk, not a footnote.
+          - **exploit_unconfirmed** — the bug is valid (every verifier passed)
+            but did not reproduce live this run.
+          - **sim_inconclusive** / **sim_error** — the simulation environment
+            was unavailable or hit an infrastructure error. The finding is still
+            valid and unaffected.
+
+          This is descriptive only. **Never downgrade, soften, or drop a
+          verified finding because the simulation did not reproduce it** — the
+          simulator is a categorizer, not a gate, and a device-class target is
+          often hard to stand up faithfully in a sandbox.
+
+          ### Workflow
+
+          The runner gives you BOTH a `Worker scratch directory` and a `Report
+          directory` in the system prompt above. The scratch directory is
+          enforced read-only for you by a CLI PreToolUse guardrail — copy
+          artifacts out of it, do not edit them in place.
+
+          1. Create the report directory if it does not exist.
+          2. Copy every file from the scratch directory into the report directory
+             verbatim. The scratch dir holds the worker's PoC artifacts; preserve
+             filenames.
+          3. Write `report.md` in the report directory.
+          4. If the scratch directory was empty, synthesize a PoC file
+             (`poc.py`, `poc.sh`, `poc.bin`, …) from the claim packet so the
+             finding can still be reproduced.
+
+          Do NOT write outside the report directory. Do NOT edit files inside the
+          scratch directory — only copy from it. Overwriting an existing report
+          at this path is fine; this step is idempotent.
+      # NON-GATING post-verification exploit simulation. Runs AFTER the full
+      # five-stage verifier chain passes and BEFORE the reporter, on its own
+      # single-slot executor (it does not draw from `max_agents`). It stands the
+      # target up for real and tries to reproduce each verified claim live, then
+      # categorizes it. It NEVER rejects a verified claim; an env-build or
+      # simulator failure yields sim_error / sim_inconclusive while the claim
+      # stays verified and the reporter still runs.
+      #
+      # Why this matters more here than in a generic bounty run: the contest
+      # installs the device "in their default configurations and fully
+      # operational state", and requires the exploit to work pre-authentication.
+      # The env-builder below reproduces exactly that state — onboarded, but with
+      # no credential handed to the attacker — so the judge's
+      # exploit_confirmed vs exploit_confirmed_nondefault split lands directly on
+      # a contest rule instead of being a generic nicety.
+      exploit_sim:
+        enabled: true
+        max_exchange_rounds: 5
+        max_attempts: 1
+        env_builder:
+          backend: claude
+          model: claude-opus-4-7[1m]
+          prompt: |
+            You are the exploit-simulation environment builder for a Pwn2Own
+            Ireland 2026 Smart Home entry against {{ TARGET_DEVICE }}
+            ({{ TARGET_VENDOR }}). Target repository: {{ REPO }}
+
+            Read `output/device-recap.md` first if it exists. Its
+            "Default-configuration state", "Network-reachable surface in default
+            configuration", and "Software stack and component map" sections tell
+            you what a correct instance looks like and which components are not
+            in this repository.
+
+            Stand up a REAL, RUNNABLE instance of the target INSIDE THIS
+            SANDBOX. Actually fetch, build, install, and configure it so a live
+            process can be started and reached over the network — do NOT mock
+            it, stub it, or merely describe how it would run. A container is
+            usually the right shape here.
+
+            ## Reproduce the contest's starting state, not a fresh install
+
+            This is the part a generic environment build gets wrong. The rules
+            place the device in its "default configurations and fully
+            operational state", and explicitly exclude entries that need it to
+            be in an "initial-setup, pairing, or otherwise uninitialized state".
+
+            So: complete onboarding. Create the operator account, finish the
+            setup wizard, let the default integrations settle — bring the
+            instance to the state a real owner's device sits in. An instance
+            parked on the onboarding screen is the WRONG environment and will
+            make genuinely valid pre-auth findings look unreproducible.
+
+            Change nothing else. Do not enable extra integrations, add-ons,
+            debug modes, or configuration options beyond what a stock device
+            ships with. If the recap identifies something as enabled by default,
+            it belongs; anything else does not.
+
+            ## Hard rule — hand the attacker nothing
+
+            Do NOT pre-install, pre-seed, or expose ANY credential, token,
+            session cookie, API key, paired-client identity, or privileged
+            socket that an attacker would have to cross a trust boundary to
+            obtain. The operator account you create during onboarding is the
+            device owner's — its password and tokens stay inside the instance
+            and are never written anywhere the attacker role can read.
+
+            The entry being simulated must work pre-authentication. Provisioning
+            a credential would invalidate the entire exercise and would turn a
+            disqualified finding into a false confirmation.
+
+            Record in your brief which network ports the instance exposes and
+            what an unauthenticated peer can reach, so the attacker knows its
+            real starting position.
+
+            Persist every artifact under `{env_dir}`. Write an `instantiate.sh`
+            there that spins up a FRESH, ISOLATED, already-onboarded instance
+            from the built artifact each time it runs, so per-claim attempts
+            never share state. Onboarding must be baked into the artifact or
+            automated by the script — not left as a manual step.
+
+            End your output with:
+            ENV_JSON_BEGIN
+            {"artifact_path": "<path under env_dir>", "instantiate_script": "<path to instantiate.sh>"}
+            ENV_JSON_END
+        simulator:
+          backend: claude
+          model: claude-opus-4-7
+          prompt: |
+            You are the exploit-simulation SIMULATOR (round {round} of
+            {max_rounds}) for a Pwn2Own Ireland 2026 Smart Home entry against
+            {{ TARGET_DEVICE }}. Instantiate and drive a fresh instance of the
+            target from the prepared environment and report its REAL observed
+            behavior to the attacker. Run the actual system; never fabricate
+            output.
+
+            The instance starts already onboarded and in DEFAULT configuration —
+            that is the state the contest puts the device in, and it is the state
+            you must preserve.
+
+            If the attacker requests a configuration change, grant it ONLY if a
+            real operator plausibly would on a stock device, and log every
+            granted change verbatim on its own line prefixed `CONFIG_DELTA: `.
+            Those lines are what separates a contest-ready finding from one that
+            needs a caveat, so be precise and complete.
+
+            NEVER grant a change that hands over a trust-boundary credential,
+            authenticates the attacker, marks it as paired, discloses anything
+            printed on the device, presses a virtual button on its behalf, or
+            otherwise skips the boundary the entry is meant to cross. Those are
+            not configuration changes — they are the attack, and granting one
+            manufactures a false confirmation. Refuse, and say why.
+
+            Environment brief:
+            {env_brief}
+
+            Claim under test:
+            {claim_packet}
+
+            Attacker's last message: {attacker_last}
+        attacker:
+          backend: claude
+          model: claude-opus-4-7
+          prompt: |
+            You are the exploit-simulation ATTACKER (round {round} of
+            {max_rounds}) for a Pwn2Own Ireland 2026 Smart Home entry against
+            {{ TARGET_DEVICE }}. Run the verified proof-of-concept for the claim
+            below against the live instance the simulator manages.
+
+            ## Your starting position is the contest's, and nothing more
+
+            You are a laptop on the contest network. You hold no credential, no
+            token, no session, and no paired relationship with the device. You
+            cannot touch the device, press anything on it, or read anything
+            printed on it. Your reach is its exposed network services and,
+            where the device actually has radios, its RF surface.
+
+            Work only from that position. Do not fabricate a credential for
+            yourself, do not reach into the instance's filesystem to read one,
+            and do not invoke internal APIs that a network peer could not
+            invoke. If the claim's chain includes an authentication bypass,
+            execute the bypass — do not shortcut it by helping yourself to the
+            credential it was supposed to produce.
+
+            If you genuinely need a non-default configuration to reproduce,
+            request it explicitly from the simulator and let it decide and log
+            the delta. Never assume it.
+
+            ## Report against the contest's bar
+
+            State concretely whether the exploit reproduced and what you
+            observed. Then say, plainly:
+            - Did you achieve arbitrary code execution, or retrieve sensitive
+              information? Or something short of both?
+            - Did it work from a fully unauthenticated start?
+            - Roughly how long did it take, and would it run unattended in one
+              command inside a ten-minute window?
+            - How consistent was it across the attempts you made?
+
+            Honest negative results are valuable — this stage never rejects the
+            finding, so there is nothing to protect by overstating a result.
+
+            Claim under test:
+            {claim_packet}
+
+            Simulator's last message: {simulator_last}
+        judge:
+          backend: claude
+          model: claude-opus-4-6
+          prompt: |
+            You are the exploit-simulation JUDGE for a Pwn2Own Ireland 2026
+            Smart Home entry against {{ TARGET_DEVICE }}. Read the
+            attacker/simulator transcript and the granted config-delta log, then
+            categorize this already-verified claim.
+
+            You do NOT re-verify the bug and you NEVER reject it. Every verifier
+            in the chain already passed. You only record whether it reproduced
+            live and under what configuration.
+
+            Categories:
+            - **exploit_confirmed** — reproduced on the DEFAULT configuration,
+              from an unauthenticated start. This is the contest-grade result:
+              the rules install the device in its default configuration and
+              require the exploit to precede authentication.
+            - **exploit_confirmed_nondefault** — reproduced only after the
+              simulator granted non-default configuration changes. List those
+              deltas in `config_deltas`; they are a live contest-viability risk,
+              since the Sponsor allows non-default configurations only at its own
+              discretion.
+            - **exploit_unconfirmed** — valid bug, did not reproduce live this
+              run.
+            - **sim_inconclusive** — the environment or simulator could not
+              exercise it at all.
+
+            Two judgment notes specific to this target class:
+
+            Read the config-delta log carefully before choosing between the
+            first two categories. A delta that merely enables something a stock
+            device already ships with is not a real deviation; a delta that
+            enables an integration, add-on, or setting the device does not have
+            by default is. When the log is ambiguous about which it was, prefer
+            `exploit_confirmed_nondefault` — an overstated confirmation is far
+            more expensive to the team than an understated one.
+
+            If the transcript shows the attacker was handed a credential, was
+            authenticated by the simulator, or reached the sink through an
+            interface a network peer does not have, that is not a confirmation
+            at all. Use `sim_inconclusive` and say so in the rationale — the
+            simulation failed to model the boundary, which tells the team
+            nothing about the entry.
+
+            Claim under test:
+            {claim_packet}
+
+            Config deltas granted (JSON list): {config_deltas}
+
+            Transcript:
+            {transcript}
+
+            End your output with:
+            EXPLOIT_JUDGE_JSON_BEGIN
+            {"category": "<one of the four>", "config_deltas": ["..."], "rationale": "one line"}
+            EXPLOIT_JUDGE_JSON_END
+
+  # ==========================================================================
+  # Phase 3 — assemble the contest picture.
+  # ==========================================================================
+  - id: summarize-findings
+    prompt: |
+      Write `pwn2own-report.md`, the run's contest-readiness index for the
+      Pwn2Own Ireland 2026 {{ TARGET_CATEGORY }} target **{{ TARGET_DEVICE }}**
+      ({{ TARGET_VENDOR }}).
+
+      Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
+
+      This is not a bug list. It is an assessment of how close the run got to a
+      registrable entry, and what remains.
+
+      ## Inputs
+
+      1. **`output/device-recap.md`** — the device ground truth from the recon
+         phase. Use it to frame coverage: which of the surfaces it ranked were
+         actually investigated.
+      2. **Per-bug reports under `output/<bug-id>/report.md`** — the
+         authoritative source for verified findings. List them
+         (`find output -maxdepth 2 -name report.md`), read each, and use its
+         content directly. Do NOT rewrite the per-bug bodies — link to them and
+         quote the title, CWE, severity, chain role, and location into the index.
+      3. **`.juvenal-state-hunt-bugs-analysis.json`** — for what the reports do
+         not capture: rejected claims with verifier reasons, blocked targets,
+         no-findings targets, and the captain's final `mental_model_summary`
+         including its `CHAINS` section.
+
+      ## Output format
+
+      ## Contest readiness
+
+      Lead with the bottom line: is there a complete chain — unauthenticated
+      reach through to code execution (and sandbox escape, if the recap says one
+      is required) — or not? If yes, name the claims that compose it. If no, name
+      the single missing link that is closest to being closed.
+
+      ## Candidate chains
+
+      Reconstruct every chain from the captain's `CHAINS` section, cross-checked
+      against the verified claims. For each:
+      - Chain ID and status: complete / incomplete / stalled
+      - Link A (unauthenticated reach) — claim ID and title, or MISSING
+      - Link B (primitive) — claim ID and title, or MISSING
+      - Link C (code execution) — claim ID and title, or MISSING
+      - Link D (sandbox escape) — claim ID and title, MISSING, or n/a
+      - The specific work that would close the gap
+
+      Order chains by how close they are to complete.
+
+      ## Verified findings
+
+      One compact entry per verified finding:
+      - **[Title](output/<bug-id>/report.md)** — CWE, severity, chain role,
+        `path:line`, exploitation category. One sentence on impact, and whether
+        the attacker starts unauthenticated.
+
+      Sort by exploitation category first: `exploit_confirmed` findings lead,
+      then `exploit_confirmed_nondefault`, then the rest. A finding that
+      reproduced live on the default configuration from an unauthenticated
+      start is the closest thing this run produces to a registrable entry, and
+      it should not be buried under findings that only passed review.
+
+      ## Live reproduction summary
+
+      Tabulate the exploit-simulation outcome across all verified findings —
+      pull `exploit_category` from the claims in the state JSON, or the
+      **Exploitation** line of each `report.md`:
+
+      | Category | Count | Findings |
+
+      Then interpret it. Note specifically:
+      - Any `exploit_confirmed_nondefault` finding, with the configuration
+        deltas the simulator granted. The rules install targets in their default
+        configuration and allow deviations only at Sponsor discretion, so each
+        of these needs a decision before registration.
+      - Any `sim_inconclusive` / `sim_error` cluster. If most findings landed
+        there, the environment build is the problem, not the findings — say so,
+        and say what about the device made it hard to stand up. That is directly
+        actionable for the next run.
+
+      Remember that this stage never gates: an `exploit_unconfirmed` finding
+      passed all five verifiers and remains valid. Do not present these
+      categories as verdicts on the findings.
+
+      ## Contest-viability concerns
+
+      Anything that threatens a finding's use as an entry even though it passed
+      the chain: reliability doubts flagged by the `poc` verifier, dependence on
+      MITM / ARP spoofing / downgrade (prize-reducing at Sponsor discretion),
+      novelty overlaps flagged by the `novelty` verifier, dependence on an
+      out-of-tree component that could not be verified locally, or any
+      configuration assumption that may not hold on the contest device.
+
+      ## Rejected claims
+
+      Grouped **by rejection class**, not as a flat list — the pattern is the
+      useful signal. Give special weight to `requires-authentication`
+      rejections: list the sinks they confirmed, since each is a code-execution
+      candidate waiting on an authentication bypass, and collectively they are
+      the highest-value target list for a follow-up run.
+
+      ## Coverage against the recap
+
+      Walk the recap's "Ranked target list for the captain" and mark each surface
+      as covered, partially covered, or untouched, citing the targets that
+      addressed it. Then list any entry point from the recap's
+      network-reachable and unsolicited-input sections that was never
+      investigated.
+
+      ## Incomplete targets
+
+      Targets that were blocked, exhausted, or returned no findings, with brief
+      notes on what was tried and why investigation stalled.
+
+      ## Reporter gaps (if any)
+
+      Any claim with `status: "verified"` in the state JSON that has no
+      corresponding `output/<bug-id>/report.md`. The user can re-run with
+      `--resume` to re-trigger the reporter step.
+
+      ## Recommendations
+
+      - The single highest-value next investigation, and why
+      - Surfaces that were not fully explored
+      - Patterns observed across multiple findings, especially recurring
+        guard-placement or validation-ordering mistakes worth sweeping for
+      - Whitepaper readiness: which verified findings have everything the rules
+        require (Markdown, CWE, line-numbered code listings, reproduction) and
+        which are missing pieces
+
+      If the run produced no verified findings, say so plainly and explain what
+      was investigated and where the surface proved hardest.

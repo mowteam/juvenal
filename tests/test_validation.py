@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from juvenal.workflow import (
     ParallelGroup,
     Phase,
     Workflow,
+    apply_vars,
     expand_multi_vars,
     load_workflow,
     make_command_check_prompt,
@@ -260,6 +262,132 @@ class TestValidateWorkflow:
         assert workflow.phases[0].type == "analysis"
         assert workflow.phases[1].type == "implement"
         assert validate_workflow(workflow) == []
+
+
+SHIPPED_WORKFLOWS = sorted(p.name for p in Path("juvenal/workflows").glob("*.yaml"))
+
+
+class TestShippedWorkflows:
+    @pytest.mark.parametrize("name", SHIPPED_WORKFLOWS)
+    def test_shipped_workflow_loads_and_validates(self, name):
+        workflow = load_workflow(f"juvenal/workflows/{name}")
+
+        assert workflow.phases, f"{name} declares no phases"
+        assert validate_workflow(workflow) == []
+
+    @pytest.mark.parametrize("name", SHIPPED_WORKFLOWS)
+    def test_shipped_workflow_prompts_render_with_declared_vars(self, name):
+        """Every templated prompt must render against the workflow's own vars.
+
+        Guards the failure mode where a prompt references a var the workflow
+        never declares — validate() catches phase prompts, but analysis role
+        prompts (analyst / verifiers / reporter / exploit-sim) are rendered
+        later, at dispatch, so a typo there surfaces mid-run instead of at
+        load time.
+        """
+        workflow = load_workflow(f"juvenal/workflows/{name}")
+        for phase in workflow.phases:
+            config = phase.analysis
+            if config is None:
+                continue
+            sources = [config.worker_prompt]
+            if config.analyst is not None:
+                sources.append(config.analyst.prompt)
+            if config.reporter is not None:
+                sources.append(config.reporter.prompt)
+            sources.extend(spec.prompt for spec in config.verifiers)
+            if config.exploit_sim is not None:
+                sim = config.exploit_sim
+                sources.extend([sim.env_builder.prompt, sim.simulator.prompt, sim.attacker.prompt, sim.judge.prompt])
+            for source in sources:
+                rendered = apply_vars(source, workflow.vars)
+                # Undeclared vars are passed through as literal `{{name}}` rather
+                # than raising, so a typo would otherwise ship silently — and the
+                # leftover braces corrupt the runner's own `{placeholder}`
+                # substitution downstream.
+                assert "{{" not in rendered, f"{name}: unresolved Jinja passthrough in a role prompt"
+
+
+class TestPwn2OwnSmartHomeWorkflow:
+    """The Pwn2Own workflow leans on engine features whose contracts are easy to
+    break silently: runtime `{placeholder}` substitution surviving Jinja
+    rendering, and the ordered five-gate verifier chain."""
+
+    @staticmethod
+    def _analysis():
+        workflow = load_workflow("juvenal/workflows/pwn2own-smart-home.yaml")
+        phase = next(p for p in workflow.phases if p.type == "analysis")
+        return workflow, phase.analysis
+
+    def test_verifier_chain_order_and_preauth_subagent(self):
+        _, config = self._analysis()
+
+        assert [spec.name for spec in config.verifiers] == [
+            "p2o-scope",
+            "bug-class",
+            "preauth-impact",
+            "poc",
+            "novelty",
+        ]
+        by_name = {spec.name: spec for spec in config.verifiers}
+        assert by_name["preauth-impact"].use_attack_surface_subagent
+
+    def test_recon_precedes_analysis_and_check_bounces_back(self):
+        workflow, _ = self._analysis()
+
+        ids = [phase.id for phase in workflow.phases]
+        assert ids.index("device-recon") < ids.index("hunt-bugs")
+        review = next(p for p in workflow.phases if p.id == "recap-review")
+        assert review.type == "check"
+        assert review.bounce_target == "device-recon"
+
+    def test_exploit_sim_runtime_placeholders_survive_var_rendering(self):
+        """Jinja renders these prompts before the runner substitutes its own
+        single-brace placeholders. A stray `{{ }}` or a Jinja-swallowed brace
+        would strip them and the exploit-sim roles would run blind."""
+        workflow, config = self._analysis()
+        sim = config.exploit_sim
+        assert sim is not None and sim.enabled
+
+        required = {
+            sim.env_builder.prompt: ["{env_dir}"],
+            sim.simulator.prompt: ["{round}", "{max_rounds}", "{env_brief}", "{claim_packet}", "{attacker_last}"],
+            sim.attacker.prompt: ["{round}", "{max_rounds}", "{claim_packet}", "{simulator_last}"],
+            sim.judge.prompt: ["{claim_packet}", "{config_deltas}", "{transcript}"],
+        }
+        for source, placeholders in required.items():
+            rendered = apply_vars(source, workflow.vars)
+            # `{{ x }}` for an undeclared `x` survives rendering as `{{x}}`, whose
+            # inner substring would satisfy a naive `in` check while breaking the
+            # runner's `.replace("{x}", ...)` into `{value}`. Reject the wrapper
+            # form before checking for the placeholder itself.
+            assert "{{" not in rendered, "placeholder was written as a Jinja expression"
+            for placeholder in placeholders:
+                assert placeholder in rendered, f"runner placeholder {placeholder} lost during rendering"
+            assert workflow.vars["TARGET_DEVICE"] in rendered
+
+    def test_analyst_runtime_placeholders_survive_var_rendering(self):
+        workflow, config = self._analysis()
+
+        rendered = apply_vars(config.analyst.prompt, workflow.vars)
+        assert "{mission}" in rendered
+        assert "{working_dir}" in rendered
+
+    def test_continue_nudge_accepts_engine_format_fields(self):
+        """The runner formats this template with exactly these fields; an
+        unescaped brace elsewhere in the text would raise and silently fall
+        back to the unformatted template."""
+        _, config = self._analysis()
+
+        rendered = config.continue_nudge.format(
+            turns=1,
+            terminal=2,
+            min_captain_turns=config.min_captain_turns,
+            min_terminal_targets=config.min_terminal_targets_before_complete,
+            max_premature_completes=config.max_premature_completes,
+            consecutive=1,
+        )
+        assert str(config.min_captain_turns) in rendered
 
 
 class TestTimeoutField:

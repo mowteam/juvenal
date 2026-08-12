@@ -129,7 +129,7 @@ juvenal/
 ├── prompts/             # Built-in checker role prompts (.md)
 │   └── agents/          # Shipped role subagents (4 verifiers + 4 exploit-sim roles); repo-root .claude/agents/ symlinks here, and the runner dual-emits Codex .codex/agents/*.toml from the same bodies for codex-backed roles. See docs/AGENTS.md
 ├── templates/           # Workflow scaffolding templates
-└── workflows/           # Built-in workflows and examples (plan.yaml, analysis-example.yaml, bug-bounty.yaml)
+└── workflows/           # Built-in workflows and examples (plan.yaml, analysis-example.yaml, bug-bounty.yaml, pwn2own-smart-home.yaml)
 docs/
 ├── AGENTS.md            # Native subagent (Claude + Codex) resolution and dual-emit
 ├── analysis-workflow.md # Analysis-phase author guide
