@@ -49,6 +49,10 @@ from juvenal.workflow import (
     apply_vars,
 )
 
+# Canonical shipped location for static role subagent definitions. Native Claude
+# Code discovery is mirrored via repo-root `.claude/agents/*.md` symlinks into here.
+_PACKAGE_AGENTS_DIR = Path(__file__).resolve().parent.parent / "prompts" / "agents"
+
 _CAPTAIN_EVENT_TYPES = frozenset(
     {
         "claim.verified",
@@ -492,6 +496,37 @@ def _parse_exploit_judge_output(output: str) -> tuple[str, list[str], str | None
     return category, deltas, None
 
 
+def _strip_agent_frontmatter(text: str) -> str:
+    """Drop a leading Claude Code `---\\n…\\n---\\n` frontmatter block; return the body."""
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            return text[end + len("\n---\n") :].lstrip("\n")
+    return text
+
+
+def _load_agent_body(name: str, working_dir: Path | None = None) -> str | None:
+    """Return the frontmatter-stripped body of subagent `{name}.md`, or None.
+
+    A per-project `.claude/agents/{name}.md` under ``working_dir`` overrides the
+    canonical package copy so a target repo can specialize a role.
+    """
+    candidates: list[Path] = []
+    if working_dir is not None:
+        candidates.append(Path(working_dir) / ".claude" / "agents" / f"{name}.md")
+    candidates.append(_PACKAGE_AGENTS_DIR / f"{name}.md")
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            body = _strip_agent_frontmatter(path.read_text(encoding="utf-8")).strip()
+        except OSError:
+            continue
+        if body:
+            return body
+    return None
+
+
 class DynamicAnalysisRunner:
     """Deterministic runner for one dynamic analysis phase."""
 
@@ -621,10 +656,13 @@ class DynamicAnalysisRunner:
             if spec.name in seen_names:
                 raise ValueError(f"Phase '{self.phase.id}': verifier chain has duplicate name {spec.name!r}")
             seen_names.add(spec.name)
-        self._rendered_verifier_prompts: dict[str, str] = {
-            spec.name: apply_vars(spec.prompt, self.workflow.vars) if spec.prompt else ""
-            for spec in self._verifier_chain
-        }
+        # Per-spec scope: an explicit YAML `prompt` wins (user override); when it
+        # is empty, fall back to the shipped `.claude/agents/{name}-verifier.md`
+        # subagent body so the role prompt lives in one place. Both empty -> no scope.
+        self._rendered_verifier_prompts: dict[str, str] = {}
+        for spec in self._verifier_chain:
+            source = spec.prompt or _load_agent_body(f"{spec.name}-verifier", self.working_dir) or ""
+            self._rendered_verifier_prompts[spec.name] = apply_vars(source, self.workflow.vars) if source else ""
 
         self._reporter_spec: ReporterSpec | None = self.config.reporter
         self._rendered_reporter_prompt: str = ""
@@ -639,12 +677,19 @@ class DynamicAnalysisRunner:
         self._exploit_sim_spec: ExploitSimSpec | None = self.config.exploit_sim
         self._rendered_exploit_sim_prompts: dict[str, str] = {}
         if self._exploit_sim_spec is not None:
-            self._rendered_exploit_sim_prompts = {
-                "env_builder": apply_vars(self._exploit_sim_spec.env_builder.prompt or "", self.workflow.vars),
-                "simulator": apply_vars(self._exploit_sim_spec.simulator.prompt or "", self.workflow.vars),
-                "attacker": apply_vars(self._exploit_sim_spec.attacker.prompt or "", self.workflow.vars),
-                "exploit_judge": apply_vars(self._exploit_sim_spec.judge.prompt or "", self.workflow.vars),
-            }
+            # Effective prompt per role: explicit YAML `prompt` wins; when empty,
+            # fall back to the shipped `.claude/agents/exploit-sim-{role}.md` subagent
+            # body; still empty -> the embedded `_DEFAULT_*_PROMPT` at execution time.
+            # Placeholders ({round}, {mission}, …) survive apply_vars and are filled by
+            # the runner's `.replace(...)`.
+            for role_key, agent_name, yaml_prompt in (
+                ("env_builder", "exploit-sim-env-builder", self._exploit_sim_spec.env_builder.prompt),
+                ("simulator", "exploit-sim-simulator", self._exploit_sim_spec.simulator.prompt),
+                ("attacker", "exploit-sim-attacker", self._exploit_sim_spec.attacker.prompt),
+                ("exploit_judge", "exploit-sim-judge", self._exploit_sim_spec.judge.prompt),
+            ):
+                source = yaml_prompt or _load_agent_body(agent_name, self.working_dir) or ""
+                self._rendered_exploit_sim_prompts[role_key] = apply_vars(source, self.workflow.vars)
 
         self._rendered_worker_prompt: str = ""
         if self.config.worker_prompt:

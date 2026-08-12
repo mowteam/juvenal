@@ -120,6 +120,7 @@ juvenal/
 ├── state.py             # Atomic state persistence
 ├── workflow.py          # Workflow/Phase models and loading
 ├── prompts/             # Built-in checker role prompts (.md)
+│   └── agents/          # Shipped Claude Code subagents (verifier + exploit-sim roles); repo-root .claude/agents/ symlinks here. See docs/AGENTS.md
 ├── templates/           # Workflow scaffolding templates
 └── workflows/           # Built-in workflows and examples (plan.yaml, analysis-example.yaml)
 tests/

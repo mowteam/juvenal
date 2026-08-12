@@ -29,7 +29,7 @@ juvenal = "juvenal.cli:main"
 include = ["juvenal*"]
 
 [tool.setuptools.package-data]
-juvenal = ["prompts/*.md", "templates/**/*", "workflows/**/*"]
+juvenal = ["prompts/*.md", "prompts/agents/*.md", "templates/**/*", "workflows/**/*"]
 
 [tool.ruff]
 line-length = 120
