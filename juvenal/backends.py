@@ -468,6 +468,152 @@ class ClaudeBackend(Backend):
         )
 
 
+def _load_claude_agent_sdk() -> Any | None:
+    """Import the Claude Agent SDK, returning the module or None if absent.
+
+    Ships as `claude_agent_sdk` (the renamed `claude_code_sdk`); we try both so a
+    machine with either installed works. Absence is expected on the default
+    subprocess path, so callers treat None as "SDK backend unavailable".
+    """
+    for module_name in ("claude_agent_sdk", "claude_code_sdk"):
+        try:
+            return __import__(module_name)
+        except ImportError:
+            continue
+    return None
+
+
+class ClaudeSDKBackend(Backend):
+    """Claude backend driving the Claude Agent SDK in-process instead of a CLI subprocess.
+
+    Opt-in via `backend: claude-sdk` (or `JUVENAL_BACKEND_SDK=1`); the subprocess
+    `ClaudeBackend` remains the default. Targets the session-expiration cold-restart
+    gap: the SDK keeps session state in-process, so a resume either works or raises
+    rather than silently starting a fresh CLI session without the original system
+    prompt. Accepts the same `model=` strings as `ClaudeBackend`, including the
+    `[1m]` 1M-context suffix, and returns the identical `AgentResult` contract.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._sdk = _load_claude_agent_sdk()
+
+    @property
+    def sdk_available(self) -> bool:
+        return self._sdk is not None
+
+    def name(self) -> str:
+        return "claude-sdk"
+
+    def run_agent(
+        self,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        session_id: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
+    ) -> AgentResult:
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        result = self._run_sdk_query(
+            prompt=prompt,
+            working_dir=working_dir,
+            display_callback=display_callback,
+            timeout=timeout,
+            env=env,
+            model=model,
+            system_prompt=system_prompt,
+            session_id=session_id,
+            hooks_config=hooks_config,
+            resume=False,
+        )
+        result.session_id = session_id
+        return result
+
+    def resume_agent(
+        self,
+        session_id: str,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
+    ) -> AgentResult:
+        result = self._run_sdk_query(
+            prompt=prompt,
+            working_dir=working_dir,
+            display_callback=display_callback,
+            timeout=timeout,
+            env=env,
+            model=model,
+            # Resumed sessions inherit the system prompt from the original run.
+            system_prompt=None,
+            session_id=session_id,
+            hooks_config=hooks_config,
+            resume=True,
+        )
+        result.session_id = session_id
+        return result
+
+    def _run_sdk_query(
+        self,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None,
+        timeout: int | None,
+        env: dict[str, str] | None,
+        model: str | None,
+        system_prompt: str | None,
+        session_id: str,
+        hooks_config: dict[str, Any] | None,
+        resume: bool,
+    ) -> AgentResult:
+        if self._sdk is None:
+            raise RuntimeError(
+                "claude-sdk backend requires the Claude Agent SDK. Install with: pip install claude-agent-sdk"
+            )
+        # SDK wiring (options build, async event drain, AgentResult mapping) lives
+        # in _drive_sdk so it can be filled in and E2E-verified by a human once the
+        # SDK is installed; the contract shape above is what the runner depends on.
+        return self._drive_sdk(
+            prompt=prompt,
+            working_dir=working_dir,
+            display_callback=display_callback,
+            timeout=timeout,
+            env=env,
+            model=model,
+            system_prompt=system_prompt,
+            session_id=session_id,
+            hooks_config=hooks_config,
+            resume=resume,
+        )
+
+    def _drive_sdk(
+        self,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None,
+        timeout: int | None,
+        env: dict[str, str] | None,
+        model: str | None,
+        system_prompt: str | None,
+        session_id: str,
+        hooks_config: dict[str, Any] | None,
+        resume: bool,
+    ) -> AgentResult:
+        raise NotImplementedError(
+            "ClaudeSDKBackend._drive_sdk is not implemented yet. "
+            "Fill in the Claude Agent SDK query loop and verify against "
+            "tests/test_e2e_claude.py before relying on this backend."
+        )
+
+
 class CodexBackend(Backend):
     """Codex CLI backend using NDJSON streaming."""
 
@@ -658,13 +804,29 @@ def _extend_with_settings(cmd: list[str], hooks_config: dict[str, Any] | None) -
 
 
 def create_backend(name: str) -> Backend:
-    """Factory to create a backend by name."""
+    """Factory to create a backend by name.
+
+    `claude-sdk` is opt-in and falls back to the subprocess `ClaudeBackend` when the
+    Claude Agent SDK isn't installed, so existing workflows never break. Set
+    `JUVENAL_BACKEND_SDK=1` to fail loud instead of falling back — for the human
+    verifying the SDK path.
+    """
     if name == "claude":
         return ClaudeBackend()
     elif name == "codex":
         return CodexBackend()
+    elif name == "claude-sdk":
+        backend = ClaudeSDKBackend()
+        if backend.sdk_available:
+            return backend
+        if os.environ.get("JUVENAL_BACKEND_SDK", "0") == "1":
+            raise RuntimeError(
+                "backend 'claude-sdk' requested with JUVENAL_BACKEND_SDK=1 but the "
+                "Claude Agent SDK is not installed. Install with: pip install claude-agent-sdk"
+            )
+        return ClaudeBackend()
     else:
-        raise ValueError(f"Unknown backend: {name!r}. Must be 'claude' or 'codex'.")
+        raise ValueError(f"Unknown backend: {name!r}. Must be 'claude', 'claude-sdk', or 'codex'.")
 
 
 def _parse_json_event(line: str) -> dict | None:

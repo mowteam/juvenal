@@ -466,7 +466,7 @@ class AnalysisConfig:
     worker_prompt: str = ""
 
 
-_ANALYSIS_BACKENDS = {"claude", "codex"}
+_ANALYSIS_BACKENDS = {"claude", "claude-sdk", "codex"}
 _ANALYSIS_CONFIG_KEYS = {
     "captain_backend",
     "captain_model",

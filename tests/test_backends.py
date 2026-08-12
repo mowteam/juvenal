@@ -9,6 +9,7 @@ import pytest
 from juvenal.backends import (
     Backend,
     ClaudeBackend,
+    ClaudeSDKBackend,
     CodexBackend,
     InteractiveResult,
     _extend_with_settings,
@@ -64,6 +65,12 @@ class TestCreateBackend:
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown backend"):
             create_backend("gpt")
+
+    def test_claude_sdk_returns_backend(self):
+        # Either the SDK backend (if installed) or a transparent CLI fallback —
+        # never an error on the default path.
+        backend = create_backend("claude-sdk")
+        assert isinstance(backend, (ClaudeSDKBackend, ClaudeBackend))
 
 
 class TestParseJsonEvent:

@@ -170,6 +170,9 @@ _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
         "exploit_judge": None,
     },
 }
+# The SDK-backed Claude backend takes the same model strings (incl. the `[1m]`
+# 1M-context suffix), so it inherits the subprocess backend's per-role defaults.
+_DEFAULT_MODELS_BY_BACKEND_AND_ROLE["claude-sdk"] = _DEFAULT_MODELS_BY_BACKEND_AND_ROLE["claude"]
 
 
 def _resolve_model(backend: str, role: str, configured: str | None) -> str | None:
