@@ -668,8 +668,7 @@ def test_session_is_stale_returns_false_when_recent_success_with_old_creation(tm
     )
 
     assert runner._session_is_stale("long-lived") is False, (
-        "session with a recent SUCCESSFUL use should not be flagged stale "
-        "regardless of how long ago it was created"
+        "session with a recent SUCCESSFUL use should not be flagged stale regardless of how long ago it was created"
     )
 
 
