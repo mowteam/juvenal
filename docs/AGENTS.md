@@ -11,6 +11,42 @@ Code, and reused across workflows. Each has YAML frontmatter (`name`,
   `juvenal/prompts/agents/*.md`
 - **Native Claude Code discovery (repo root):** `.claude/agents/*.md` — symlinks
   into the canonical files above, so there is a single editable copy.
+- **Native Codex discovery (per target working dir):** `.codex/agents/*.toml` —
+  materialized at run start from the same canonical `.md` bodies whenever any
+  orchestrated role runs on a Codex backend. See "Codex parity" below.
+
+## Codex parity
+
+Codex has a real, first-class on-demand subagent mechanism (verified locally:
+`codex features list` reports `multi_agent  stable  true` on codex-cli 0.128.0),
+but its definitions use a different format than Claude Code: project-scoped
+`.codex/agents/<name>.toml` files with `name` / `description` /
+`developer_instructions` keys (these are the exact keys the installed Codex binary
+parses). Codex spawns subagents **in-session, driven by the model** (`spawn_agent`
+/ `wait_agent` collab primitives) — the runner does not, and cannot, call them
+programmatically; delegation is triggered by the role prompt asking the model to
+spawn a named subagent. Juvenal's deterministic loop is unchanged: the runner still
+owns retry/advance/terminate and each role still runs as its own process.
+
+To keep a single source of truth, the same shipped `.md` bodies are dual-emitted:
+
+- `juvenal.dynamic.runner.write_codex_agent_definitions(working_dir)` writes every
+  shipped role (`_SHIPPED_AGENT_NAMES`) into `<working_dir>/.codex/agents/*.toml`,
+  serialized from the identical body the Claude path loads (the runner calls this at
+  run start only when a Codex-backed role is present).
+- The runtime attack-surface analyst subagent is dual-written: the Claude
+  `.claude/agents/attack-surface.md` **and** the Codex
+  `.codex/agents/attack-surface.toml` come from one `_attack_surface_body(brief)`.
+- The brief block and trust-model verifier framing swap the Claude "invoke via the
+  Agent tool" wording for Codex's "spawn the `attack-surface` subagent (defined in
+  `.codex/agents/attack-surface.toml`)" wording based on the effective role backend.
+
+**What is genuinely not possible today:** the runner cannot deterministically drive
+Codex subagent fan-out/wait/collect the way Claude Code exposes a programmatic
+`Task()` — Codex's native path is model-driven in-session. When strict, deterministic
+out-of-process control is needed, the correct primitive is the out-of-process
+`codex exec --json` / Codex SDK path (see `docs/backends/codex-sdk-exploration.md`),
+not the in-session collab tools.
 
 ## Available subagents
 

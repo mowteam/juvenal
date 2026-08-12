@@ -527,6 +527,118 @@ def _load_agent_body(name: str, working_dir: Path | None = None) -> str | None:
     return None
 
 
+# Shipped role subagents whose bodies are dual-emitted as Codex `.codex/agents/*.toml`
+# definitions so a codex-backed worker/verifier can spawn them natively (verified
+# `multi_agent stable true` on codex-cli 0.128.0; defs live in `.codex/agents/<name>.toml`
+# with name/description/developer_instructions — the exact keys the installed binary parses).
+_SHIPPED_AGENT_NAMES = (
+    "attack-surface-verifier",
+    "trust-model-verifier",
+    "poc-verifier",
+    "novelty-verifier",
+    "exploit-sim-env-builder",
+    "exploit-sim-simulator",
+    "exploit-sim-attacker",
+    "exploit-sim-judge",
+)
+
+
+def _backend_is_codex(name: str | None) -> bool:
+    """True for the Codex subprocess/SDK backends (`codex`, `codex-sdk`)."""
+    return name in ("codex", "codex-sdk")
+
+
+def _parse_agent_frontmatter(text: str) -> dict[str, str]:
+    """Return the `name`/`description` (etc.) scalars from a leading `---\\n…\\n---` block.
+
+    Values are single-line in the shipped agent files; anything without a closing
+    delimiter yields an empty mapping (matches `_strip_agent_frontmatter`).
+    """
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}
+    fields: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip():
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def _toml_escape(value: str) -> str:
+    r"""Escape a Python string for a TOML basic (double-quoted) string literal."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "").replace("\t", "\\t")
+
+
+def _codex_agent_toml(name: str, description: str, developer_instructions: str) -> str:
+    """Serialize a Codex subagent definition (`name`/`description`/`developer_instructions`).
+
+    `developer_instructions` uses a TOML multi-line basic string so the role body
+    survives verbatim; `name`/`description` are single-line basic strings.
+    """
+    body = developer_instructions.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    return (
+        f'name = "{_toml_escape(name)}"\n'
+        f'description = "{_toml_escape(description)}"\n'
+        f'developer_instructions = """\n{body}\n"""\n'
+    )
+
+
+def _agent_toml_from_shipped(name: str, working_dir: Path | None = None) -> str | None:
+    """Build a Codex `.codex/agents/<name>.toml` from the shipped Claude agent `.md`.
+
+    Single source of truth: reads the same `juvenal/prompts/agents/<name>.md` (or a
+    per-project `.claude/agents/<name>.md` override) the Claude path uses, so the two
+    formats never drift. Returns None when the source is missing/empty.
+    """
+    candidates: list[Path] = []
+    if working_dir is not None:
+        candidates.append(Path(working_dir) / ".claude" / "agents" / f"{name}.md")
+    candidates.append(_PACKAGE_AGENTS_DIR / f"{name}.md")
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        body = _strip_agent_frontmatter(raw).strip()
+        if not body:
+            continue
+        fm = _parse_agent_frontmatter(raw)
+        description = fm.get("description") or f"{name} role for the Juvenal bug-finding run."
+        return _codex_agent_toml(fm.get("name") or name, description, body)
+    return None
+
+
+def write_codex_agent_definitions(working_dir: Path) -> list[Path]:
+    """Materialize the shipped role subagents into `<working_dir>/.codex/agents/*.toml`.
+
+    Mirrors the Claude `.claude/agents/*.md` path so a codex-backed role can spawn the
+    same specialized roles natively. Best-effort: skips any agent that fails to render
+    or write and returns the paths successfully written.
+    """
+    written: list[Path] = []
+    agents_dir = Path(working_dir) / ".codex" / "agents"
+    try:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return written
+    for name in _SHIPPED_AGENT_NAMES:
+        toml_text = _agent_toml_from_shipped(name, working_dir)
+        if not toml_text:
+            continue
+        target = agents_dir / f"{name}.toml"
+        try:
+            target.write_text(toml_text, encoding="utf-8")
+        except OSError:
+            continue
+        written.append(target)
+    return written
+
+
 class DynamicAnalysisRunner:
     """Deterministic runner for one dynamic analysis phase."""
 
@@ -717,6 +829,11 @@ class DynamicAnalysisRunner:
         self._rebuild_pending_claim_retries()
         self._rebuild_pending_reporter_claim_ids()
         self._rebuild_pending_exploit_sim_claim_ids()
+        # Mirror the Claude `.claude/agents/*.md` role subagents into Codex's native
+        # `.codex/agents/*.toml` format so a codex-backed role can spawn the same
+        # specialized roles. Best-effort; a codex run without them still works.
+        if self._uses_codex_backend():
+            write_codex_agent_definitions(self.working_dir)
         self._maybe_start_analyst()
         self._maybe_start_env_builder()
 
@@ -2217,7 +2334,7 @@ class DynamicAnalysisRunner:
             "specific items when you need them — do not assume the prompt contains complete state.\n"
         )
 
-        brief_block = self._project_brief_block()
+        brief_block = self._project_brief_block(self.config.captain_backend)
         if is_first_turn:
             system_prompt = f"{self._captain_role_prompt}\n\nMission:\n{mission}"
             if brief_block:
@@ -2270,7 +2387,7 @@ class DynamicAnalysisRunner:
         base = self._worker_role_prompt
         if self._rendered_worker_prompt:
             base = f"{base}\n\n{self._rendered_worker_prompt}"
-        brief_block = self._project_brief_block()
+        brief_block = self._project_brief_block(self.config.worker_backend)
         if brief_block:
             base = f"{base}\n\n{brief_block}"
         return base
@@ -2362,13 +2479,13 @@ class DynamicAnalysisRunner:
         # (analyst failed / hasn't run).
         subagent_scope: str | None = None
         if spec.use_attack_surface_subagent:
-            subagent_scope = self._load_subagent_scope_for_verifier()
+            subagent_scope = self._load_subagent_scope_for_verifier(spec.backend)
         if subagent_scope is not None:
             system_prompt = f"{system_prompt}\n\n{subagent_scope}"
         else:
             if rendered_scope:
                 system_prompt = f"{system_prompt}\n\n{rendered_scope}"
-            brief_block = self._project_brief_block()
+            brief_block = self._project_brief_block(spec.backend)
             if brief_block:
                 system_prompt = f"{system_prompt}\n\n{brief_block}"
         try:
@@ -2650,7 +2767,8 @@ class DynamicAnalysisRunner:
         )
         if self._rendered_reporter_prompt:
             system_prompt = f"{system_prompt}\n\n{self._rendered_reporter_prompt}"
-        brief_block = self._project_brief_block()
+        reporter_backend = self._reporter_spec.backend if self._reporter_spec else None
+        brief_block = self._project_brief_block(reporter_backend)
         if brief_block:
             system_prompt = f"{system_prompt}\n\n{brief_block}"
 
@@ -4799,7 +4917,7 @@ class DynamicAnalysisRunner:
         except Exception:
             pass
 
-    def _load_subagent_scope_for_verifier(self) -> str | None:
+    def _load_subagent_scope_for_verifier(self, backend: str | None = None) -> str | None:
         """Return the body of `.claude/agents/attack-surface.md` wrapped in a
         verifier-mode framing for the ``trust-model`` verifier, or None if
         unavailable.
@@ -4812,6 +4930,11 @@ class DynamicAnalysisRunner:
         its own is analyst-mode and would just answer questions). The body
         already embeds the project brief, so the caller skips the standard
         brief-block injection for this verifier.
+
+        The subagent body is identical across vendors (the runtime-written
+        `.claude/agents/attack-surface.md` is the source; the codex-side
+        `.codex/agents/attack-surface.toml` carries the same body), so the only
+        backend-dependent bit is which definition path the framing cites.
 
         Falls back to None when the subagent file is missing (analyst failed
         / hasn't run); the caller then uses the YAML scope.
@@ -4830,10 +4953,13 @@ class DynamicAnalysisRunner:
         body = content.lstrip()
         if not body:
             return None
+        def_path = (
+            ".codex/agents/attack-surface.toml" if _backend_is_codex(backend) else ".claude/agents/attack-surface.md"
+        )
         verifier_framing = (
             "## Specialized scope: trust-model gate\n\n"
             "**You are this run's `attack-surface` subagent — the same role and same project "
-            "knowledge as the file at `.claude/agents/attack-surface.md`. The body of that "
+            f"knowledge as the file at `{def_path}`. The body of that "
             "subagent definition is reproduced verbatim below, including the project brief.**\n\n"
             "You are operating in **verifier mode** for the trust-model gate (verifier 2 of 4). "
             "The previous verifier (`attack-surface`) already classified the bug class and "
@@ -4866,6 +4992,78 @@ class DynamicAnalysisRunner:
         )
         return f"{verifier_framing}{body}"
 
+    _ATTACK_SURFACE_DESCRIPTION = (
+        "Project-specific trust-model and attack-surface analyst. Invoke this "
+        "subagent before assuming anything about what is in/out of scope, what is "
+        "attacker-reachable, or what the project considers by-design. The subagent has the "
+        "full project brief in context and can do additional code/web research per question."
+    )
+
+    def _attack_surface_body(self, brief: str) -> str:
+        """The runtime attack-surface subagent body (shared by the Claude `.md` and Codex `.toml`)."""
+        return (
+            "You are the project's attack-surface analyst for this Juvenal bug-finding run. "
+            "The project brief below is your source of truth — quote and cite it when answering. "
+            "If the question goes beyond the brief, you may use Read / Grep / Glob over "
+            f"`{self.working_dir}` and WebFetch / WebSearch to do additional research before "
+            "answering. Keep answers focused and cite specific files, docs, or URLs whenever "
+            "possible. Reply with a concise direct answer; do not dump the entire brief back.\n\n"
+            "If the calling agent's question does not have a confident answer, say so plainly — "
+            "do not fabricate scope rules or trust-model claims that are not in the brief.\n\n"
+            "## Default scoping rule: pure-DoS is a bug, not a bug-bounty vulnerability\n\n"
+            "A pure-DoS / crash-only finding (`the parser segfaults on malformed input`, "
+            "`the daemon hangs on a crafted packet`) IS a real bug — it just is NOT a "
+            "vulnerability for bug-bounty / VRP purposes. Unless the project brief below "
+            "explicitly says otherwise, treat pure-DoS findings as **out of bug-bounty scope** "
+            "and tell the calling agent to reject the claim on scope grounds. The bar for an "
+            "in-scope memory-safety report is a corruption primitive that goes beyond a crash: "
+            "UAF, OOB write into attacker-controlled state, type confusion exploitable for "
+            "code execution, heap overflow, double-free, etc. Crashes that imply such "
+            "corruption (e.g., an ASan write-of-N report, a UAF backtrace) remain in scope "
+            "unless the brief excludes them. When a calling agent asks whether a crash-only "
+            "finding is in scope, default to NO and direct them to the brief's bounty-scope "
+            "section to confirm.\n\n"
+            "<<PROJECT_BRIEF_BEGIN>>\n"
+            f"{brief}\n"
+            "<<PROJECT_BRIEF_END>>\n"
+        )
+
+    def _write_codex_attack_surface_subagent(self, brief: str) -> Path | None:
+        """Emit the runtime attack-surface subagent as `.codex/agents/attack-surface.toml`.
+
+        Mirrors the Claude `.md` write from the same body so a codex-backed role can spawn
+        the analyst natively. Best-effort — a failure here never blocks the Claude write.
+        """
+        try:
+            agents_dir = self.working_dir / ".codex" / "agents"
+            agents_dir.mkdir(parents=True, exist_ok=True)
+            toml_file = agents_dir / "attack-surface.toml"
+            toml_file.write_text(
+                _codex_agent_toml("attack-surface", self._ATTACK_SURFACE_DESCRIPTION, self._attack_surface_body(brief)),
+                encoding="utf-8",
+            )
+            return toml_file
+        except Exception as exc:
+            self._emit_analyst_message(f"[juvenal] failed to write codex attack-surface subagent: {exc}")
+            return None
+
+    def _uses_codex_backend(self) -> bool:
+        """True when any orchestrated role (captain/worker/verifier/reporter/analyst/exploit-sim) runs on Codex."""
+        names: list[str | None] = [
+            self.config.captain_backend,
+            self.config.worker_backend,
+            self.config.verifier_backend,
+        ]
+        names.extend(spec.backend for spec in self._verifier_chain)
+        if self._reporter_spec is not None:
+            names.append(self._reporter_spec.backend)
+        if self._analyst_spec is not None:
+            names.append(self._analyst_spec.backend)
+        if self._exploit_sim_spec is not None:
+            es = self._exploit_sim_spec
+            names.extend([es.env_builder.backend, es.simulator.backend, es.attacker.backend, es.judge.backend])
+        return any(_backend_is_codex(n) for n in names)
+
     def _write_subagent_definition(self, brief: str) -> Path | None:
         try:
             agents_dir = self.working_dir / ".claude" / "agents"
@@ -4874,54 +5072,49 @@ class DynamicAnalysisRunner:
             content = (
                 "---\n"
                 "name: attack-surface\n"
-                "description: Project-specific trust-model and attack-surface analyst. Invoke this "
-                "subagent before assuming anything about what is in/out of scope, what is "
-                "attacker-reachable, or what the project considers by-design. The subagent has the "
-                "full project brief in context and can do additional code/web research per question.\n"
+                f"description: {self._ATTACK_SURFACE_DESCRIPTION}\n"
                 "tools: Read, Grep, Glob, WebFetch, WebSearch\n"
-                "---\n\n"
-                "You are the project's attack-surface analyst for this Juvenal bug-finding run. "
-                "The project brief below is your source of truth — quote and cite it when answering. "
-                "If the question goes beyond the brief, you may use Read / Grep / Glob over "
-                f"`{self.working_dir}` and WebFetch / WebSearch to do additional research before "
-                "answering. Keep answers focused and cite specific files, docs, or URLs whenever "
-                "possible. Reply with a concise direct answer; do not dump the entire brief back.\n\n"
-                "If the calling agent's question does not have a confident answer, say so plainly — "
-                "do not fabricate scope rules or trust-model claims that are not in the brief.\n\n"
-                "## Default scoping rule: pure-DoS is a bug, not a bug-bounty vulnerability\n\n"
-                "A pure-DoS / crash-only finding (`the parser segfaults on malformed input`, "
-                "`the daemon hangs on a crafted packet`) IS a real bug — it just is NOT a "
-                "vulnerability for bug-bounty / VRP purposes. Unless the project brief below "
-                "explicitly says otherwise, treat pure-DoS findings as **out of bug-bounty scope** "
-                "and tell the calling agent to reject the claim on scope grounds. The bar for an "
-                "in-scope memory-safety report is a corruption primitive that goes beyond a crash: "
-                "UAF, OOB write into attacker-controlled state, type confusion exploitable for "
-                "code execution, heap overflow, double-free, etc. Crashes that imply such "
-                "corruption (e.g., an ASan write-of-N report, a UAF backtrace) remain in scope "
-                "unless the brief excludes them. When a calling agent asks whether a crash-only "
-                "finding is in scope, default to NO and direct them to the brief's bounty-scope "
-                "section to confirm.\n\n"
-                "<<PROJECT_BRIEF_BEGIN>>\n"
-                f"{brief}\n"
-                "<<PROJECT_BRIEF_END>>\n"
+                "---\n\n" + self._attack_surface_body(brief)
             )
             agent_file.write_text(content, encoding="utf-8")
+            # Dual-emit the Codex definition when a codex-backed role may spawn it.
+            if self._uses_codex_backend():
+                self._write_codex_attack_surface_subagent(brief)
             return agent_file
         except Exception as exc:
             self._emit_analyst_message(f"[juvenal] failed to write attack-surface subagent: {exc}")
             return None
 
-    def _project_brief_block(self) -> str:
-        """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt."""
+    def _subagent_invoke_phrase(self, backend: str | None) -> str:
+        """Backend-specific instruction for reaching the `attack-surface` subagent.
+
+        Claude spawns subagents via its native Agent tool; Codex spawns them natively
+        from the `.codex/agents/attack-surface.toml` definition this runner emits. Only
+        the invocation verb differs — the role and its project knowledge are identical.
+        """
+        if _backend_is_codex(backend):
+            return (
+                "**spawn the `attack-surface` subagent** (defined in "
+                "`.codex/agents/attack-surface.toml`), wait for its result, then use it"
+            )
+        return "**invoke the `attack-surface` subagent via the Agent tool**"
+
+    def _project_brief_block(self, backend: str | None = None) -> str:
+        """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt.
+
+        ``backend`` tailors the subagent-invocation wording (Claude Agent tool vs. Codex
+        native spawn); ``None`` keeps the Claude phrasing (default backend).
+        """
         spec = self._analyst_spec
         if spec is None or not spec.enabled:
             return ""
         state = self.state.attack_surface
+        invoke = self._subagent_invoke_phrase(backend)
         guidance = (
             "## Attack-surface subagent (always available)\n\n"
             "Before assuming anything about the project's trust model, attack surface, what is "
             "attacker-reachable, what is in/out of scope, or what the project considers by-design, "
-            "**invoke the `attack-surface` subagent via the Agent tool**. It is fast, has the full "
+            f"{invoke}. It is fast, has the full "
             "project brief in context, and can do additional code/web research per question. "
             "Treat its answers as authoritative for project-specific trust assumptions.\n"
         )
@@ -4938,7 +5131,7 @@ class DynamicAnalysisRunner:
                 "## Project brief (attack-surface analyst)\n\n"
                 "PROJECT_BRIEF: not ready yet — the attack-surface analyst is still running. "
                 "Proceed with the information you have and consult the `attack-surface` subagent "
-                "via the Agent tool if it has finished by the time you reach a project-specific "
+                "if it has finished by the time you reach a project-specific "
                 "trust-model question. The subagent will respond `BRIEF_NOT_READY` until the "
                 "analyst completes.\n"
             )
