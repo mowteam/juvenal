@@ -2383,10 +2383,18 @@ class DynamicAnalysisRunner:
         return system_prompt, user_prompt
 
     def _worker_system_prompt(self) -> str:
-        """Static system prompt for the worker: framework role + workflow scope."""
+        """Static system prompt for the worker: framework role + workflow scope.
+
+        When `worker_dynamic_workflow` is on (default), a backend-aware fan-out
+        block turns the worker into a mini-captain of its single target — it
+        spawns its own subagents to explore competing hypotheses in parallel and
+        synthesizes, without changing its loop position or one-WORKER_JSON output.
+        """
         base = self._worker_role_prompt
         if self._rendered_worker_prompt:
             base = f"{base}\n\n{self._rendered_worker_prompt}"
+        if self.config.worker_dynamic_workflow:
+            base = f"{base}\n\n{self._worker_fanout_block(self.config.worker_backend)}"
         brief_block = self._project_brief_block(self.config.worker_backend)
         if brief_block:
             base = f"{base}\n\n{brief_block}"
@@ -5098,6 +5106,73 @@ class DynamicAnalysisRunner:
                 "`.codex/agents/attack-surface.toml`), wait for its result, then use it"
             )
         return "**invoke the `attack-surface` subagent via the Agent tool**"
+
+    def _worker_fanout_block(self, backend: str | None) -> str:
+        """Backend-aware 'fan out into your own subagents, then synthesize' guidance.
+
+        Injected into the worker system prompt when `worker_dynamic_workflow` is on
+        (default). The worker's loop position and one-WORKER_JSON output contract do
+        NOT change — only its INTERNAL investigation method does: it spawns its own
+        subagents to explore competing hypotheses/attack-angles in parallel, then
+        folds their findings into the single structured result it already returns.
+        Claude fans out via the native Agent tool; Codex spawns natively from its
+        `.codex/agents/*.toml` definitions and degrades to a strong single pass when
+        that mechanism is unavailable rather than faking parallelism.
+        """
+        header = (
+            "## Investigate as a mini-captain: fan out, then synthesize\n\n"
+            "You have ONE assigned target, but that target usually admits several "
+            "competing hypotheses (different sink candidates, attack angles, guard-bypass "
+            "theories, or PoC strategies). Instead of exploring them one at a time in your "
+            "own context, delegate them to subagents that run in parallel, then SYNTHESIZE "
+            "their evidence into your result. This does not change your job: you still "
+            "return **exactly one WORKER_JSON block** with the same outcome "
+            "(`claims` / `no_findings` / `blocked`) and the same claim shape. The fan-out is "
+            "purely your internal method — the runner still treats you as a single worker on "
+            "a single target.\n\n"
+        )
+        if _backend_is_codex(backend):
+            mechanism = (
+                "### How to fan out (Codex)\n\n"
+                "If your Codex backend has native subagent spawning (multi-agent) enabled, "
+                "spawn 2-4 parallel subagents — one per distinct hypothesis or attack angle — "
+                "wait for all of them, then reconcile their findings. Reuse the "
+                "`.codex/agents/*.toml` roles this run emits (e.g. `attack-surface`) where "
+                "they fit. Keep the fan-out shallow (one layer): subagents investigate and "
+                "report evidence; YOU alone decide the final claims and emit the single "
+                "WORKER_JSON.\n\n"
+                "If native spawning is unavailable in this environment, do NOT fake it and do "
+                "NOT emit multiple WORKER_JSON blocks. Instead run a strong single pass: "
+                "enumerate the competing hypotheses explicitly, work each to a conclusion "
+                "yourself, and note in your `summary` that you investigated sequentially "
+                "because subagent spawning was unavailable.\n\n"
+            )
+        else:
+            mechanism = (
+                "### How to fan out (Claude)\n\n"
+                "Use the **Agent tool** to spawn 2-4 subagents in parallel, one per distinct "
+                "hypothesis or attack angle. Each subagent runs in its own fresh context, so "
+                "put every file path, error string, and code excerpt it needs directly in the "
+                "Agent prompt, and ask it to return a compact evidence summary (what it "
+                "confirmed/refuted, the exact sink/guard, any sanitizer output). Where a "
+                "named role fits — e.g. the project-scoped `attack-surface` subagent, or the "
+                "`.claude/agents/*` roles present in this repo — invoke it by name. Keep the "
+                "fan-out shallow: subagents gather evidence; YOU alone reconcile it and emit "
+                "the single WORKER_JSON. Spawn only as many as the target warrants — each "
+                "subagent costs tokens and wall-clock.\n\n"
+            )
+        guardrail = (
+            "### Fan-out guardrails (unchanged)\n\n"
+            "- Keep all PoC artifacts in your assigned `scratch_dir`; the `output/` tree "
+            "stays off-limits to you and every subagent you spawn (the runner denies writes "
+            "there).\n"
+            "- Stay inside your assigned target's scope — do not let a subagent sprawl into "
+            "adjacent surfaces the captain owns.\n"
+            "- One layer of fan-out is enough; do not build deep recursive agent trees.\n"
+            "- The final synthesis is yours: emit exactly one WORKER_JSON, never one per "
+            "subagent.\n"
+        )
+        return header + mechanism + guardrail
 
     def _project_brief_block(self, backend: str | None = None) -> str:
         """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt.

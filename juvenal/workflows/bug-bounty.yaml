@@ -236,7 +236,15 @@ phases:
           and why the surface didn't yield a vulnerability.
 
         Stay focused on your assigned target. Do NOT sprawl into adjacent
-        surfaces — the captain handles fan-out and variant analysis.
+        surfaces — the captain handles fan-out ACROSS targets. Fan-out WITHIN
+        your one target is yours: treat this single investigation like a
+        mini-captain and spawn your own subagents (the runner injects the
+        backend-specific "how to fan out and synthesize" instructions for your
+        worker backend) to work competing hypotheses / attack angles in
+        parallel, then fold their evidence into your single result. This never
+        changes your contract: you still return exactly one WORKER_JSON with one
+        `outcome` and the same claim shape — never one block per subagent, and
+        never a claim outside your assigned target.
 
         ## What counts as a real bug
 

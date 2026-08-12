@@ -446,6 +446,12 @@ class AnalysisConfig:
     max_worker_retries: int = 2
     max_captain_repairs: int = 2
     allow_repo_tools: bool = True
+    # When True (default), each worker fans out into its own backend subagents
+    # (Claude Agent tool / Codex native spawn) to explore multiple hypotheses in
+    # parallel before synthesizing its single WORKER_JSON result. Codex degrades
+    # to a strong single-pass when its backend lacks real subagent spawning. The
+    # worker's loop position and one-WORKER_JSON output contract are unchanged.
+    worker_dynamic_workflow: bool = True
     max_consecutive_errors: int = 5
     # Rate-limit backoff knobs.
     # `max_single_backoff_seconds`: cap on any individual sleep (default 1h).
@@ -482,6 +488,7 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_worker_retries",
     "max_captain_repairs",
     "allow_repo_tools",
+    "worker_dynamic_workflow",
     "max_consecutive_errors",
     "max_single_backoff_seconds",
     "max_total_backoff_seconds",
@@ -910,6 +917,9 @@ def _parse_analysis_config(
     allow_repo_tools = raw.get("allow_repo_tools", defaults.allow_repo_tools)
     if not isinstance(allow_repo_tools, bool):
         raise ValueError(f"Phase '{phase_id}': analysis.allow_repo_tools must be a boolean")
+    worker_dynamic_workflow = raw.get("worker_dynamic_workflow", defaults.worker_dynamic_workflow)
+    if not isinstance(worker_dynamic_workflow, bool):
+        raise ValueError(f"Phase '{phase_id}': analysis.worker_dynamic_workflow must be a boolean")
     max_consecutive_errors = _parse_analysis_int(
         raw.get("max_consecutive_errors", defaults.max_consecutive_errors),
         phase_id=phase_id,
@@ -1011,6 +1021,7 @@ def _parse_analysis_config(
         max_worker_retries=max_worker_retries,
         max_captain_repairs=max_captain_repairs,
         allow_repo_tools=allow_repo_tools,
+        worker_dynamic_workflow=worker_dynamic_workflow,
         max_consecutive_errors=max_consecutive_errors,
         max_single_backoff_seconds=max_single_backoff_seconds,
         max_total_backoff_seconds=max_total_backoff_seconds,

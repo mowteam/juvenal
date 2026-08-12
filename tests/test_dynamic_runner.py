@@ -1914,7 +1914,68 @@ def test_build_worker_prompt_omits_workflow_scope_when_unset(tmp_path):
     system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
 
     assert "You are a scoped analysis worker" in system_prompt
-    # No trailing scope content — system prompt ends at the framework role.
+    # The default (worker_dynamic_workflow=True) appends the fan-out block, so
+    # the system prompt is the framework role PLUS that block — not bare role.
+    assert "fan out, then synthesize" in system_prompt
+    assert system_prompt.startswith(runner._worker_role_prompt)
+
+
+def test_worker_system_prompt_injects_claude_fanout_by_default(tmp_path):
+    """With worker_dynamic_workflow on (default) and a Claude worker backend,
+    the worker becomes a mini-captain: it gets the Claude Agent-tool fan-out
+    guidance and is reminded its one-WORKER_JSON contract is unchanged."""
+    config = AnalysisConfig(worker_backend="claude")
+    assert config.worker_dynamic_workflow is True
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "mini-captain" in system_prompt
+    assert "How to fan out (Claude)" in system_prompt
+    assert "Agent tool" in system_prompt
+    assert "exactly one WORKER_JSON" in system_prompt
+    # Must NOT emit the Codex path for a Claude worker.
+    assert "How to fan out (Codex)" not in system_prompt
+
+
+def test_worker_system_prompt_injects_codex_fanout_and_degrades(tmp_path):
+    """A Codex worker backend gets the Codex native-spawn guidance AND the
+    graceful single-pass degrade instruction — the runner must not fake
+    Claude-style Agent-tool fan-out for Codex."""
+    config = AnalysisConfig(worker_backend="codex")
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "How to fan out (Codex)" in system_prompt
+    assert ".codex/agents" in system_prompt
+    # Graceful degradation, not faked fan-out.
+    assert "native spawning is unavailable" in system_prompt
+    assert "do NOT fake it" in system_prompt
+    # Must NOT emit the Claude Agent-tool path for a Codex worker.
+    assert "How to fan out (Claude)" not in system_prompt
+
+
+def test_worker_system_prompt_omits_fanout_when_disabled(tmp_path):
+    """worker_dynamic_workflow=False keeps the legacy single-pass worker: no
+    fan-out block, no mini-captain framing."""
+    config = AnalysisConfig(worker_dynamic_workflow=False)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "fan out, then synthesize" not in system_prompt
+    assert "mini-captain" not in system_prompt
+    # No workflow scope + fan-out off => system prompt is exactly the role.
     assert system_prompt == runner._worker_role_prompt
 
 
