@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -607,10 +608,171 @@ class ClaudeSDKBackend(Backend):
         hooks_config: dict[str, Any] | None,
         resume: bool,
     ) -> AgentResult:
-        raise NotImplementedError(
-            "ClaudeSDKBackend._drive_sdk is not implemented yet. "
-            "Fill in the Claude Agent SDK query loop and verify against "
-            "tests/test_e2e_claude.py before relying on this backend."
+        sdk = self._sdk
+        options = self._build_options(
+            working_dir=working_dir,
+            env=env,
+            model=model,
+            system_prompt=system_prompt,
+            session_id=session_id,
+            hooks_config=hooks_config,
+            resume=resume,
+        )
+
+        # The runner calls backends synchronously from worker threads, so the
+        # async query loop is driven to completion here. asyncio.run creates and
+        # tears down a fresh event loop per call, which is safe because each
+        # thread owns its call and never shares a loop.
+        start = time.time()
+        try:
+            result = asyncio.run(
+                self._drain_query(
+                    sdk=sdk,
+                    prompt=prompt,
+                    options=options,
+                    display_callback=display_callback,
+                    timeout=timeout,
+                    start=start,
+                )
+            )
+        except TimeoutError:
+            return AgentResult(
+                exit_code=1,
+                output=f"Agent timed out after {timeout}s",
+                transcript=f"Agent timed out after {timeout}s",
+                duration=time.time() - start,
+            )
+        except sdk.CLINotFoundError as exc:
+            # The SDK drives the `claude` binary under the hood; surface a missing
+            # CLI as a non-zero exit rather than a bare traceback.
+            return AgentResult(
+                exit_code=127,
+                output=str(exc),
+                transcript=str(exc),
+                duration=time.time() - start,
+            )
+        return result
+
+    def _build_options(
+        self,
+        working_dir: str,
+        env: dict[str, str] | None,
+        model: str | None,
+        system_prompt: str | None,
+        session_id: str,
+        hooks_config: dict[str, Any] | None,
+        resume: bool,
+    ) -> Any:
+        sdk = self._sdk
+        # Strip CLAUDECODE so juvenal can be invoked from inside Claude Code, then
+        # layer the caller's env — matching the subprocess ClaudeBackend.
+        proc_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if env:
+            proc_env.update(env)
+
+        kwargs: dict[str, Any] = {
+            "cwd": working_dir,
+            "env": proc_env,
+            # Parity with the subprocess backend's --dangerously-skip-permissions.
+            "permission_mode": "bypassPermissions",
+        }
+        # Pass the model string through unchanged, including the `[1m]` 1M-context
+        # suffix: the SDK forwards `model` verbatim to `claude --model`, and the
+        # CLI parses the suffix (see subprocess_cli._build_command). Stripping it
+        # here would silently drop the 1M context the CLI path grants.
+        if model:
+            kwargs["model"] = model
+        if system_prompt is not None:
+            kwargs["system_prompt"] = system_prompt
+        if hooks_config:
+            # The SDK forwards `settings` to `claude --settings`, accepting an
+            # inline JSON string exactly like ClaudeBackend._extend_with_settings.
+            kwargs["settings"] = json.dumps(hooks_config)
+        if resume:
+            kwargs["resume"] = session_id
+        else:
+            # Pre-allocate the session id so it is persisted before streaming,
+            # surviving a crash mid-call — same guarantee as --session-id.
+            kwargs["session_id"] = session_id
+        return sdk.ClaudeAgentOptions(**kwargs)
+
+    async def _drain_query(
+        self,
+        sdk: Any,
+        prompt: str,
+        options: Any,
+        display_callback: Callable[[str], None] | None,
+        timeout: int | None,
+        start: float,
+    ) -> AgentResult:
+        transcript_lines: list[str] = []
+        assistant_messages: list[str] = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+        rate_limit_status: int | None = None
+        result_is_error = False
+        result_text: str | None = None
+        resolved_session_id: str | None = None
+
+        async def _consume() -> None:
+            nonlocal total_input_tokens, total_output_tokens, rate_limit_status
+            nonlocal result_is_error, result_text, resolved_session_id
+            async for message in sdk.query(prompt=prompt, options=options):
+                for display_text, assistant_text in _render_claude_sdk_message(sdk, message):
+                    if display_text:
+                        transcript_lines.append(display_text)
+                        if display_callback:
+                            display_callback(display_text)
+                    if assistant_text:
+                        assistant_messages.append(assistant_text)
+                # A rate-limited assistant turn (error == "rate_limit") is the
+                # SDK equivalent of the CLI's api_error_status 429.
+                if isinstance(message, sdk.AssistantMessage) and message.error == "rate_limit":
+                    rate_limit_status = 429
+                # RateLimitEvent is informational: it reports remaining quota
+                # (status allowed/allowed_warning) on EVERY turn, including
+                # successful ones. Only status == "rejected" is an actual
+                # rate-limit rejection, so only that maps to a 429 — otherwise a
+                # normal turn would wrongly trip the runner's backoff cadence.
+                if isinstance(message, sdk.RateLimitEvent):
+                    info = getattr(message, "rate_limit_info", None)
+                    if getattr(info, "status", None) == "rejected":
+                        rate_limit_status = 429
+                if isinstance(message, sdk.ResultMessage):
+                    resolved_session_id = message.session_id or resolved_session_id
+                    result_is_error = bool(message.is_error)
+                    if isinstance(message.api_error_status, int):
+                        rate_limit_status = message.api_error_status
+                    usage = message.usage or {}
+                    total_input_tokens += int(usage.get("input_tokens", 0) or 0)
+                    total_output_tokens += int(usage.get("output_tokens", 0) or 0)
+                    if message.result:
+                        result_text = message.result
+
+        if timeout:
+            await asyncio.wait_for(_consume(), timeout=timeout)
+        else:
+            await _consume()
+
+        # Prefer the final `result` text (mirrors the CLI's terminal result event);
+        # fall back to accumulated assistant turns.
+        if result_text:
+            output = result_text
+        else:
+            output = "\n".join(assistant_messages)
+        exit_code = 1 if result_is_error else 0
+        if exit_code != 0 and not output:
+            output = "\n".join(transcript_lines)
+
+        return AgentResult(
+            exit_code=exit_code,
+            output=output,
+            transcript="\n".join(transcript_lines),
+            duration=time.time() - start,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            session_id=resolved_session_id,
+            rate_limit_status=rate_limit_status,
         )
 
 
@@ -1048,6 +1210,32 @@ def _process_claude_event(event: dict) -> tuple[str, str]:
         return f"[system] {msg}" if msg else "", ""
 
     return "", ""
+
+
+def _render_claude_sdk_message(sdk: Any, message: Any) -> list[tuple[str, str]]:
+    """Render a Claude Agent SDK message into (display_text, assistant_text) pairs.
+
+    Mirrors _process_claude_event for the typed SDK message objects: assistant
+    TextBlocks are both displayed and counted as assistant output; tool uses and
+    system messages are display-only. Class lookups go through the loaded `sdk`
+    module so this works whether it imported as claude_agent_sdk or claude_code_sdk.
+    """
+    pairs: list[tuple[str, str]] = []
+    if isinstance(message, sdk.AssistantMessage):
+        for block in message.content:
+            if isinstance(block, sdk.TextBlock):
+                if block.text:
+                    pairs.append((block.text, block.text))
+            elif isinstance(block, sdk.ThinkingBlock):
+                if block.thinking:
+                    pairs.append((f"[thinking] {block.thinking[:200]}", ""))
+            elif isinstance(block, sdk.ToolUseBlock):
+                pairs.append((f"[tool: {block.name}]", ""))
+    elif isinstance(message, sdk.SystemMessage):
+        subtype = message.subtype or ""
+        if subtype:
+            pairs.append((f"[system] {subtype}", ""))
+    return pairs
 
 
 def _process_codex_event(event: dict) -> tuple[str, str]:

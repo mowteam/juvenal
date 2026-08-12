@@ -1,9 +1,11 @@
 # Claude Agent SDK backend — integration status
 
-Developer notes for `ClaudeSDKBackend` (`juvenal/backends.py`). This is a
-scaffolded backend: the class, factory case, model routing, and unit-test
-contract are in place, but the SDK query loop (`ClaudeSDKBackend._drive_sdk`)
-raises `NotImplementedError` until a human wires and E2E-verifies it.
+Developer notes for `ClaudeSDKBackend` (`juvenal/backends.py`). The SDK query
+loop (`ClaudeSDKBackend._drive_sdk`) is **implemented** against the installed
+`claude-agent-sdk` (v0.2.137) and covered by unit tests that mock the SDK's
+`query()` async stream (`tests/test_backends_sdk.py::TestClaudeSDKBackendDriveLoop`).
+It is **opt-in** — the default backend is still the subprocess `ClaudeBackend`.
+Flip the default only after the E2E parity step below passes.
 
 ## Package
 
@@ -37,7 +39,40 @@ identical in shape to `ClaudeBackend`:
 Model strings pass through unchanged, **including the `[1m]` 1M-context suffix**
 (e.g. `claude-opus-4-7[1m]`). The runner routes `claude-sdk` roles to the same
 per-role defaults as `claude` (see `_DEFAULT_MODELS_BY_BACKEND_AND_ROLE` in
-`juvenal/dynamic/runner.py`), so the SDK backend must accept those strings.
+`juvenal/dynamic/runner.py`), so the SDK backend accepts those strings.
+
+**Why the `[1m]` suffix passes through untouched:** the SDK forwards
+`ClaudeAgentOptions.model` verbatim to `claude --model <value>`
+(`claude_agent_sdk/_internal/transport/subprocess_cli.py` `_build_command`),
+and the CLI parses the `[1m]` suffix to select the 1M context window. Stripping
+it and translating to `betas=["context-1m-2025-08-07"]` would be wrong on two
+counts: (1) it double-encodes what the CLI already understands, and (2) that
+beta header was **retired 2026-04-30** — Opus 4.6/4.7/4.8 and Sonnet 4.6 carry
+1M context natively at standard pricing with no beta header
+(https://code.claude.com/docs/en/agent-sdk/python, https://platform.claude.com/docs/en/build-with-claude/context-windows).
+So the backend does not set `betas`; it passes `model=` through exactly as the
+subprocess `ClaudeBackend` passes `--model`.
+
+## How the drive loop maps to the SDK (verified against v0.2.137)
+
+- **Options** (`_build_options`): `cwd=working_dir`; `model=` passthrough;
+  `system_prompt=` on first run; `env=` layered over `os.environ` minus
+  `CLAUDECODE`; `permission_mode="bypassPermissions"` (parity with
+  `--dangerously-skip-permissions`); `settings=json.dumps(hooks_config)` (the SDK
+  accepts an inline JSON string for `--settings`, same fragment as the CLI path);
+  `session_id=` on first run (pre-allocated so it survives a crash), `resume=` on
+  resume.
+- **Drain** (`_drain_query`): async iterate `query(prompt=..., options=...)`
+  under `asyncio.run` (the runner calls backends synchronously from threads, so a
+  fresh event loop per call is created and torn down); `asyncio.wait_for` enforces
+  `timeout`. `AssistantMessage.content` `TextBlock`s become assistant output;
+  `ThinkingBlock`/`ToolUseBlock` are display-only. `ResultMessage` supplies
+  `session_id`, `usage["input_tokens"/"output_tokens"]`, `is_error`
+  (`exit_code`), and `result` (final output text).
+- **429**: `ResultMessage.api_error_status == 429`,
+  `AssistantMessage.error == "rate_limit"`, or a `RateLimitEvent` all map to
+  `AgentResult.rate_limit_status = 429`, matching the CLI's `api_error_status`
+  path the runner uses for backoff cadence.
 
 ## Why this backend exists (session-expiration cold-restart gap)
 
@@ -48,31 +83,31 @@ as a worker crash (`_session_is_stale` in `runner.py` is a reactive age check).
 The SDK keeps session state in-process, so a resume either works or raises —
 eliminating the silent-fresh-session failure mode.
 
-## Human follow-up (network + API key required — not runnable in unit tests)
+## Selecting the SDK backend
 
-1. Ensure `claude-agent-sdk` is installed into the juvenal pyenv.
-2. Implement `ClaudeSDKBackend._drive_sdk` in `juvenal/backends.py`:
-   - Build the SDK options object with `cwd=working_dir`, `model=` (pass the
-     `[1m]` string through as-is — the CLI understands the suffix),
-     `system_prompt=system_prompt` on `run_agent`, and `resume=session_id` /
-     `fork_session=False` on `resume_agent`.
-   - Apply `hooks_config` as CLI `settings` if the SDK exposes a settings hook
-     (same `{"permissions": {"deny": [...]}}` fragment `ClaudeBackend` uses via
-     `--settings`); otherwise document that guardrails ride via `_hooks_for_role`
-     only on the subprocess path.
-   - Drive the async query loop (the SDK is asyncio-based — wrap with
-     `asyncio.run` since the runner calls backends synchronously from threads),
-     enforce `timeout`, accumulate assistant text + tokens, map a 429 to
-     `rate_limit_status`, and set `env` for the child.
-   - Confirm the exact options/query API against the installed package version
-     before relying on any specific field or kwarg name.
-3. Verify E2E parity by running the existing suite against the SDK backend:
+- Per workflow: `backend: claude-sdk` in the YAML, or `--backend claude-sdk`.
+- Fail-loud (for the human verifying the SDK path): `JUVENAL_BACKEND_SDK=1`
+  makes `create_backend("claude-sdk")` raise instead of falling back to the
+  subprocess `ClaudeBackend` when the SDK is missing.
+
+## E2E parity + one-line default flip (network + `ANTHROPIC_API_KEY` required)
+
+The unit tests mock the SDK; the true end-to-end parity check needs a live key:
+
+1. Add a `backend="claude-sdk"` variant of the trivial workflow in
+   `tests/test_e2e_claude.py` and confirm it produces the same `hello.txt`
+   result as `backend="claude"`:
    ```
    pytest tests/test_e2e_claude.py -x -v
    ```
-   and add a `backend="claude-sdk"` variant, confirming it produces the same
-   `hello.txt` result as `backend="claude"`. Requires `ANTHROPIC_API_KEY` and the
-   `claude` CLI.
-4. Once verified, the SDK-guarded unit tests in `tests/test_backends_sdk.py`
-   (skipped when the SDK is absent) exercise `run_agent` / `resume_agent` up to
-   the not-yet-implemented drive loop.
+   Requires `ANTHROPIC_API_KEY` and the `claude` CLI on `PATH` (the SDK shells
+   out to it).
+2. **Only after that passes**, flip the default. The default backend string
+   lives in each workflow's `backend:` field (and `Workflow.backend` default in
+   `juvenal/workflow.py`). Changing a single workflow's `backend: claude` to
+   `backend: claude-sdk` is the one-line flip; there is no global default to
+   change in `create_backend` (it dispatches by name). Keep `claude` (subprocess)
+   as the documented fallback.
+
+Until a real smoke run is verified, the repo keeps the subprocess `claude`
+backend as the default and ships `claude-sdk` as fully-implemented + selectable.

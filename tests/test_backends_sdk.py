@@ -94,24 +94,248 @@ class TestClaudeSDKBackendWithoutSDK:
             backend.resume_agent("sess-1", "hi", working_dir="/tmp")
 
 
-@pytest.mark.skipif(not SDK_INSTALLED, reason="Claude Agent SDK not installed")
-class TestClaudeSDKBackendWithSDK:
-    """Only run once the human installs the SDK. These still avoid the network by
-    stopping at the not-yet-implemented query loop; the true end-to-end check is
-    tests/test_e2e_claude.py with a backend='claude-sdk' variant (see
-    docs/backends/claude-sdk-integration.md)."""
+class _FakeClaudeSDK:
+    """Minimal in-memory stand-in for the claude_agent_sdk module.
 
-    def test_run_agent_reaches_query_loop(self):
-        backend = ClaudeSDKBackend()
-        # _drive_sdk is the human's fill-in point; until implemented it raises
-        # NotImplementedError, proving run_agent routed past the SDK-missing guard.
-        with pytest.raises(NotImplementedError):
-            backend.run_agent("hi", working_dir="/tmp")
+    Reproduces the typed message classes and the async `query` generator the
+    drive loop iterates, so unit tests exercise ClaudeSDKBackend._drive_sdk
+    end-to-end without a network call or the real SDK installed. Message classes
+    are instance attributes so the backend's isinstance() checks resolve against
+    the same objects the tests construct.
+    """
 
-    def test_resume_agent_reaches_query_loop(self):
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.__dict__.update(kwargs)
+
+    class TextBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class ThinkingBlock:
+        def __init__(self, thinking, signature=""):
+            self.thinking = thinking
+            self.signature = signature
+
+    class ToolUseBlock:
+        def __init__(self, id, name, input):
+            self.id = id
+            self.name = name
+            self.input = input
+
+    class AssistantMessage:
+        def __init__(self, content, error=None):
+            self.content = content
+            self.error = error
+
+    class SystemMessage:
+        def __init__(self, subtype, data=None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class ResultMessage:
+        def __init__(self, session_id, usage=None, is_error=False, api_error_status=None, result=None):
+            self.session_id = session_id
+            self.usage = usage
+            self.is_error = is_error
+            self.api_error_status = api_error_status
+            self.result = result
+
+    class RateLimitInfo:
+        def __init__(self, status):
+            self.status = status
+
+    class RateLimitEvent:
+        def __init__(self, rate_limit_info):
+            self.rate_limit_info = rate_limit_info
+
+    class CLINotFoundError(Exception):
+        pass
+
+    def __init__(self, script):
+        # `script` is a list of messages (or a callable capturing options) the
+        # fake query yields in order.
+        self._script = script
+        self.captured_options = None
+        self.captured_prompt = None
+
+    def query(self, *, prompt, options):
+        self.captured_options = options
+        self.captured_prompt = prompt
+        script = self._script
+
+        async def _gen():
+            for message in script:
+                yield message
+
+        return _gen()
+
+
+class TestClaudeSDKBackendDriveLoop:
+    """Exercise _drive_sdk against a mocked SDK — no network, no real SDK needed.
+
+    The true end-to-end parity check is tests/test_e2e_claude.py with a
+    backend='claude-sdk' variant (see docs/backends/claude-sdk-integration.md)."""
+
+    def test_run_agent_maps_result_to_agent_result(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [
+            sdk.AssistantMessage([sdk.TextBlock("hello world")]),
+            sdk.ResultMessage(
+                session_id="sess-xyz",
+                usage={"input_tokens": 11, "output_tokens": 22},
+                result="hello world",
+            ),
+        ]
         backend = ClaudeSDKBackend()
-        with pytest.raises(NotImplementedError):
-            backend.resume_agent("sess-1", "hi", working_dir="/tmp")
+        backend._sdk = sdk
+        result = backend.run_agent(
+            "USER",
+            working_dir="/work",
+            model="claude-opus-4-8[1m]",
+            system_prompt="SYS",
+            session_id="sess-xyz",
+        )
+        assert result.exit_code == 0
+        assert result.output == "hello world"
+        assert result.session_id == "sess-xyz"
+        assert result.input_tokens == 11
+        assert result.output_tokens == 22
+        assert result.rate_limit_status is None
+
+    def test_run_agent_builds_options_faithfully(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [
+            sdk.ResultMessage(session_id="s1", usage={"input_tokens": 1, "output_tokens": 2}, result="ok"),
+        ]
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        backend.run_agent(
+            "USER",
+            working_dir="/work",
+            model="claude-opus-4-8[1m]",
+            system_prompt="SYS",
+            session_id="pre-alloc",
+            hooks_config={"permissions": {"deny": ["Write(//x/**)"]}},
+        )
+        opts = sdk.captured_options.kwargs
+        # Model string passes through unchanged, including the [1m] suffix, so the
+        # SDK-driven `claude --model` grants the same 1M context as the CLI path.
+        assert opts["model"] == "claude-opus-4-8[1m]"
+        assert opts["cwd"] == "/work"
+        assert opts["system_prompt"] == "SYS"
+        assert opts["permission_mode"] == "bypassPermissions"
+        assert opts["settings"] == '{"permissions": {"deny": ["Write(//x/**)"]}}'
+        assert opts["session_id"] == "pre-alloc"
+        assert "resume" not in opts
+        # The dynamic per-call content rides in as the query prompt (stdin parity).
+        assert sdk.captured_prompt == "USER"
+
+    def test_resume_agent_uses_resume_kwarg(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [sdk.ResultMessage(session_id="resume-sid", usage={}, result="ok")]
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        result = backend.resume_agent("resume-sid", "hi", working_dir="/w")
+        opts = sdk.captured_options.kwargs
+        assert opts["resume"] == "resume-sid"
+        assert "session_id" not in opts
+        # Resumed sessions inherit the original system prompt; none is re-sent.
+        assert "system_prompt" not in opts
+        assert result.session_id == "resume-sid"
+
+    def test_run_agent_maps_api_error_status_to_rate_limit(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [
+            sdk.ResultMessage(session_id="s3", usage={}, is_error=True, api_error_status=429, result=None),
+        ]
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("hi", working_dir="/w", session_id="s3")
+        assert result.rate_limit_status == 429
+        assert result.exit_code == 1
+
+    def test_run_agent_maps_assistant_rate_limit_error(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [
+            sdk.AssistantMessage([sdk.TextBlock("partial")], error="rate_limit"),
+            sdk.ResultMessage(session_id="s4", usage={}, is_error=True, result=None),
+        ]
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("hi", working_dir="/w", session_id="s4")
+        assert result.rate_limit_status == 429
+
+    def test_run_agent_maps_rejected_rate_limit_event(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [
+            sdk.RateLimitEvent(sdk.RateLimitInfo(status="rejected")),
+            sdk.ResultMessage(session_id="s6", usage={}, is_error=True, result=None),
+        ]
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("hi", working_dir="/w", session_id="s6")
+        assert result.rate_limit_status == 429
+
+    def test_informational_rate_limit_event_does_not_set_429(self):
+        # The SDK emits a RateLimitEvent reporting remaining quota on every turn,
+        # including successful ones. status="allowed"/"allowed_warning" must NOT
+        # be mistaken for a 429 or the runner would back off after a clean turn.
+        sdk = _FakeClaudeSDK([])
+        for status in ("allowed", "allowed_warning"):
+            sdk._script = [
+                sdk.RateLimitEvent(sdk.RateLimitInfo(status=status)),
+                sdk.AssistantMessage([sdk.TextBlock("ok")]),
+                sdk.ResultMessage(session_id="s6", usage={}, result="ok"),
+            ]
+            backend = ClaudeSDKBackend()
+            backend._sdk = sdk
+            result = backend.run_agent("hi", working_dir="/w", session_id="s6")
+            assert result.rate_limit_status is None, status
+            assert result.exit_code == 0
+
+    def test_run_agent_timeout_returns_exit_one(self):
+        import asyncio
+
+        sdk = _FakeClaudeSDK([])
+
+        def slow_query(*, prompt, options):
+            sdk.captured_options = options
+
+            async def _gen():
+                await asyncio.sleep(5)
+                yield sdk.ResultMessage(session_id="s5", usage={}, result="late")
+
+            return _gen()
+
+        sdk.query = slow_query
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("hi", working_dir="/w", timeout=1, session_id="s5")
+        assert result.exit_code == 1
+        assert "timed out" in result.output
+
+    def test_run_agent_reports_tool_use_and_thinking_in_transcript(self):
+        sdk = _FakeClaudeSDK([])
+        sdk._script = [
+            sdk.AssistantMessage(
+                [
+                    sdk.ThinkingBlock("pondering"),
+                    sdk.ToolUseBlock("t1", "Bash", {"command": "ls"}),
+                    sdk.TextBlock("done"),
+                ]
+            ),
+            sdk.ResultMessage(session_id="s7", usage={}, result="done"),
+        ]
+        backend = ClaudeSDKBackend()
+        backend._sdk = sdk
+        captured_display: list[str] = []
+        result = backend.run_agent("hi", working_dir="/w", session_id="s7", display_callback=captured_display.append)
+        assert "[tool: Bash]" in result.transcript
+        assert any("[thinking]" in line for line in captured_display)
+        # Only TextBlock text counts as assistant output.
+        assert result.output == "done"
 
 
 class TestClaudeSDKModelRouting:
