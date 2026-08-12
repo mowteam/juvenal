@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -956,18 +957,23 @@ class CodexBackend(Backend):
 
 
 def _load_codex_sdk() -> Any | None:
-    """Import the Codex Python SDK, returning the module or None if absent.
+    """Import the official OpenAI Codex Python SDK, returning it or None if absent.
 
-    Ships as `openai_codex_sdk` (`pip install openai-codex-sdk`); some early builds
-    exposed it as `openai_codex`, so we try both. Absence is expected on the default
-    subprocess path, so callers treat None as "SDK backend unavailable".
+    The real, official SDK is `openai-codex` (`pip install openai-codex`, import
+    `openai_codex`): its PyPI project URLs point at github.com/openai/codex and it
+    bundles the pinned Codex binary via `openai-codex-cli-bin`. A separate,
+    third-party lookalike is published as `openai-codex-sdk` (import
+    `openai_codex_sdk`, maintainer 'tomasroda', no openai.com links) — it is NOT
+    OpenAI's SDK and exposes a different `codex exec --experimental-json` shim, so
+    we do not use it. We require the `Codex` client class to confirm we imported
+    the real package. Absence is expected on the default subprocess path, so
+    callers treat None as "SDK backend unavailable".
     """
-    for module_name in ("openai_codex_sdk", "openai_codex"):
-        try:
-            return __import__(module_name)
-        except ImportError:
-            continue
-    return None
+    try:
+        module = __import__("openai_codex")
+    except ImportError:
+        return None
+    return module if hasattr(module, "Codex") else None
 
 
 class CodexSDKBackend(Backend):
@@ -976,10 +982,11 @@ class CodexSDKBackend(Backend):
     Opt-in via `backend: codex-sdk` (or `JUVENAL_BACKEND_CODEX_SDK=1`); the subprocess
     `CodexBackend` remains the default. Targets the `npx @openai/codex@latest` startup
     races (ENOTEMPTY/ETXTBSY on parallel spawns) and transient auth.json 401s: the SDK
-    talks to a persistent local Codex app-server over JSON-RPC and reuses existing Codex
-    auth, so there's no per-call npx unpack. Sessions resume by thread id via the SDK's
-    `resume_thread`, mapping onto Codex's `~/.codex/sessions` store, and it returns the
-    identical `AgentResult` contract (session_id carries the Codex thread id).
+    launches the pinned Codex binary as a persistent `codex app-server` over JSON-RPC
+    (bundled by `openai-codex-cli-bin`) and reuses existing Codex auth, so there's no
+    per-call npx unpack. Sessions resume by thread id via the SDK's `thread_resume`,
+    mapping onto Codex's `~/.codex/sessions` store, and it returns the identical
+    `AgentResult` contract (session_id carries the Codex thread id).
     """
 
     def __init__(self) -> None:
@@ -1071,12 +1078,9 @@ class CodexSDKBackend(Backend):
     ) -> AgentResult:
         if self._sdk is None:
             raise RuntimeError(
-                "codex-sdk backend requires the OpenAI Codex Python SDK. Install with: pip install openai-codex-sdk"
+                "codex-sdk backend requires the official OpenAI Codex Python SDK. "
+                "Install with: pip install openai-codex"
             )
-        # SDK wiring (Codex()/start_thread/resume_thread, run_streamed event drain,
-        # AgentResult mapping) lives in _drive_codex_sdk so it can be filled in and
-        # E2E-verified by a human once the SDK is installed; the contract shape above
-        # is what the runner depends on.
         return self._drive_codex_sdk(
             prompt=prompt,
             working_dir=working_dir,
@@ -1097,11 +1101,143 @@ class CodexSDKBackend(Backend):
         model: str | None,
         resume_thread_id: str | None,
     ) -> AgentResult:
-        raise NotImplementedError(
-            "CodexSDKBackend._drive_codex_sdk is not implemented yet. "
-            "Fill in the OpenAI Codex Python SDK thread loop (Codex().start_thread / "
-            "resume_thread, run_streamed event drain) and verify against "
-            "tests/test_e2e_codex.py before relying on this backend."
+        sdk = self._sdk
+        # The SDK launches the bundled `codex app-server` and reuses Codex auth from
+        # the child env; layer the caller's env over the parent's, matching the
+        # subprocess CodexBackend.
+        proc_env = dict(os.environ)
+        if env:
+            proc_env.update(env)
+        config = sdk.CodexConfig(cwd=working_dir, env=proc_env)
+
+        start = time.time()
+        # Codex().thread_start / thread.run are synchronous and blocking with no
+        # timeout arg, so the turn runs on a helper thread and the caller thread
+        # joins with `timeout`. On timeout we close the Codex client (which kills
+        # the app-server subprocess) and report a non-zero exit, matching the
+        # subprocess backend's timeout contract.
+        box: dict[str, Any] = {}
+
+        def _run_turn(codex: Any) -> None:
+            try:
+                if resume_thread_id:
+                    thread = codex.thread_resume(
+                        resume_thread_id,
+                        sandbox=sdk.Sandbox.full_access,
+                        model=model,
+                    )
+                else:
+                    thread = codex.thread_start(
+                        # full_access + auto_review is full autonomy with no
+                        # approval prompts — parity with the subprocess backend's
+                        # --dangerously-bypass-approvals-and-sandbox.
+                        sandbox=sdk.Sandbox.full_access,
+                        approval_mode=sdk.ApprovalMode.auto_review,
+                        model=model,
+                    )
+                box["thread_id"] = thread.id
+                box["result"] = thread.run(prompt)
+            except BaseException as exc:  # captured and re-raised on the caller thread
+                box["error"] = exc
+
+        codex = sdk.Codex(config)
+        worker = None
+        try:
+            worker = threading.Thread(target=_run_turn, args=(codex,), daemon=True)
+            worker.start()
+            worker.join(timeout)
+            if worker.is_alive():
+                # Timed out: tear down the client to stop the app-server, then
+                # surface a timeout result. The thread is a daemon so it won't
+                # block interpreter exit if teardown races.
+                codex.close()
+                worker.join(timeout=5)
+                return AgentResult(
+                    exit_code=1,
+                    output=f"Agent timed out after {timeout}s",
+                    transcript=f"Agent timed out after {timeout}s",
+                    duration=time.time() - start,
+                    session_id=box.get("thread_id") or resume_thread_id,
+                )
+        finally:
+            if worker is None or not worker.is_alive():
+                try:
+                    codex.close()
+                except Exception:
+                    pass
+
+        if "error" in box:
+            return self._codex_error_result(sdk, box["error"], box.get("thread_id"), resume_thread_id, start)
+
+        result = box.get("result")
+        thread_id = box.get("thread_id") or resume_thread_id
+        return self._map_codex_turn(sdk, result, thread_id, display_callback, start)
+
+    def _map_codex_turn(
+        self,
+        sdk: Any,
+        turn: Any,
+        thread_id: str | None,
+        display_callback: Callable[[str], None] | None,
+        start: float,
+    ) -> AgentResult:
+        output = turn.final_response or ""
+        if output and display_callback:
+            display_callback(output)
+        input_tokens = 0
+        output_tokens = 0
+        usage = getattr(turn, "usage", None)
+        total = getattr(usage, "total", None)
+        if total is not None:
+            input_tokens = int(getattr(total, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(total, "output_tokens", 0) or 0)
+        # TurnStatus.completed is success; interrupted/failed are non-zero.
+        status = getattr(turn, "status", None)
+        status_value = getattr(status, "value", status)
+        exit_code = 0 if status_value == "completed" else 1
+        transcript = output
+        err = getattr(turn, "error", None)
+        if err is not None:
+            err_msg = getattr(err, "message", str(err))
+            transcript = f"{transcript}\n[error] {err_msg}".strip()
+            if not output:
+                output = err_msg
+        return AgentResult(
+            exit_code=exit_code,
+            output=output,
+            transcript=transcript,
+            duration=time.time() - start,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            session_id=thread_id,
+        )
+
+    def _codex_error_result(
+        self,
+        sdk: Any,
+        exc: BaseException,
+        thread_id: str | None,
+        resume_thread_id: str | None,
+        start: float,
+    ) -> AgentResult:
+        # Overload / server-busy errors are the Codex analogue of a 429; flag them
+        # so the runner's backoff cadence fires only when warranted.
+        rate_limit_status = None
+        is_retryable = getattr(sdk, "is_retryable_error", None)
+        if callable(is_retryable):
+            try:
+                if is_retryable(exc):
+                    rate_limit_status = 429
+            except Exception:
+                pass
+        message = str(exc) or exc.__class__.__name__
+        return AgentResult(
+            exit_code=1,
+            output=message,
+            transcript=message,
+            duration=time.time() - start,
+            session_id=thread_id or resume_thread_id,
+            rate_limit_status=rate_limit_status,
         )
 
 
@@ -1144,7 +1280,7 @@ def create_backend(name: str) -> Backend:
         if os.environ.get("JUVENAL_BACKEND_CODEX_SDK", "0") == "1":
             raise RuntimeError(
                 "backend 'codex-sdk' requested with JUVENAL_BACKEND_CODEX_SDK=1 but the "
-                "OpenAI Codex Python SDK is not installed. Install with: pip install openai-codex-sdk"
+                "official OpenAI Codex Python SDK is not installed. Install with: pip install openai-codex"
             )
         return CodexBackend()
     else:

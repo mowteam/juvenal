@@ -87,7 +87,7 @@ class TestCreateBackend:
         monkeypatch.setenv("JUVENAL_BACKEND_CODEX_SDK", "1")
         if CodexSDKBackend().sdk_available:
             pytest.skip("Codex SDK installed; fail-loud path is exercised only when absent")
-        with pytest.raises(RuntimeError, match="openai-codex-sdk"):
+        with pytest.raises(RuntimeError, match="openai-codex"):
             create_backend("codex-sdk")
 
 
@@ -119,24 +119,15 @@ class TestCodexSDKBackend:
         backend = CodexSDKBackend()
         if backend.sdk_available:
             pytest.skip("Codex SDK installed; missing-SDK path not exercised")
-        with pytest.raises(RuntimeError, match="pip install openai-codex-sdk"):
+        with pytest.raises(RuntimeError, match="pip install openai-codex"):
             backend.run_agent("hi", working_dir="/tmp")
 
     def test_resume_agent_without_sdk_raises_runtime_error(self):
         backend = CodexSDKBackend()
         if backend.sdk_available:
             pytest.skip("Codex SDK installed; missing-SDK path not exercised")
-        with pytest.raises(RuntimeError, match="pip install openai-codex-sdk"):
+        with pytest.raises(RuntimeError, match="pip install openai-codex"):
             backend.resume_agent("thread-123", "hi", working_dir="/tmp")
-
-    def test_drive_codex_sdk_seam_is_not_implemented(self):
-        # With the SDK present, run_agent reaches the unimplemented drive seam;
-        # that boundary is where the human fills in + E2E-verifies the SDK loop.
-        backend = CodexSDKBackend()
-        if not backend.sdk_available:
-            backend._sdk = object()  # simulate SDK present to reach the seam
-        with pytest.raises(NotImplementedError, match="_drive_codex_sdk"):
-            backend.run_agent("hi", working_dir="/tmp")
 
     def test_run_agent_folds_system_prompt_before_reaching_sdk(self):
         # Codex has no system-prompt slot; the backend must fold it into the user
@@ -198,6 +189,224 @@ class TestCodexSDKBackend:
         )
         result = backend.resume_agent("thread-keep", "hi", working_dir="/tmp")
         assert result.session_id == "thread-keep"
+
+
+class _FakeCodexSDK:
+    """In-memory stand-in for the official openai_codex module.
+
+    Reproduces just the surface CodexSDKBackend._drive_codex_sdk touches:
+    Codex()/thread_start/thread_resume returning a thread whose run() yields a
+    TurnResult, plus the Sandbox/ApprovalMode enums and is_retryable_error. Lets
+    the drive loop run to completion in a unit test without launching the real
+    Codex app-server or hitting the network.
+    """
+
+    class Sandbox:
+        full_access = "full-access"
+        read_only = "read-only"
+        workspace_write = "workspace-write"
+
+    class ApprovalMode:
+        auto_review = "auto_review"
+        deny_all = "deny_all"
+
+    class CodexConfig:
+        def __init__(self, cwd=None, env=None):
+            self.cwd = cwd
+            self.env = env
+
+    class TurnStatus:
+        def __init__(self, value):
+            self.value = value
+
+    class _Breakdown:
+        def __init__(self, input_tokens, output_tokens):
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+
+    class _Usage:
+        def __init__(self, total):
+            self.total = total
+
+    class TurnResult:
+        def __init__(self, final_response, status, usage=None, error=None):
+            self.final_response = final_response
+            self.status = status
+            self.usage = usage
+            self.error = error
+
+    class ServerBusyError(Exception):
+        pass
+
+    class _Thread:
+        def __init__(self, sdk, thread_id, response, status, usage, error, exc, capture):
+            self._sdk = sdk
+            self.id = thread_id
+            self._response = response
+            self._status = status
+            self._usage = usage
+            self._error = error
+            self._exc = exc
+            self._capture = capture
+
+        def run(self, prompt):
+            if self._capture is not None:
+                self._capture["prompt"] = prompt
+            if self._exc is not None:
+                raise self._exc
+            sdk = self._sdk
+            usage = sdk._Usage(sdk._Breakdown(*self._usage)) if self._usage else None
+            return sdk.TurnResult(self._response, sdk.TurnStatus(self._status), usage, self._error)
+
+    class Codex:
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+            self.start_args = None
+            self.resume_args = None
+            _FakeCodexSDK._active._instances.append(self)
+
+        def thread_start(self, sandbox=None, approval_mode=None, model=None):
+            self.start_args = {"sandbox": sandbox, "approval_mode": approval_mode, "model": model}
+            return _FakeCodexSDK._active._make_thread()
+
+        def thread_resume(self, thread_id, sandbox=None, model=None):
+            self.resume_args = {"thread_id": thread_id, "sandbox": sandbox, "model": model}
+            return _FakeCodexSDK._active._make_thread()
+
+        def close(self):
+            self.closed = True
+
+    _active = None
+
+    def __init__(
+        self,
+        *,
+        thread_id="thread-abc",
+        response="done",
+        status="completed",
+        usage=(15, 25),
+        error=None,
+        exc=None,
+    ):
+        self._thread_id = thread_id
+        self._response = response
+        self._status = status
+        self._usage = usage
+        self._error = error
+        self._exc = exc
+        self._instances = []
+        self.capture = {}
+        self.is_retryable_error = lambda e: isinstance(e, _FakeCodexSDK.ServerBusyError)
+        _FakeCodexSDK._active = self
+
+    def _make_thread(self):
+        return _FakeCodexSDK._Thread(
+            self, self._thread_id, self._response, self._status, self._usage, self._error, self._exc, self.capture
+        )
+
+    @property
+    def instances(self):
+        return self._instances
+
+
+class TestCodexSDKDriveLoop:
+    """Exercise _drive_codex_sdk against a mocked openai_codex — no app-server, no
+    network. The true end-to-end parity check is tests/test_e2e_codex.py with a
+    backend='codex-sdk' variant (see docs/backends/codex-sdk-exploration.md)."""
+
+    def test_run_agent_maps_turn_result(self):
+        sdk = _FakeCodexSDK(thread_id="thread-abc", response="the answer", usage=(15, 25))
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("hello codex", working_dir="/work", model="gpt-5-codex", system_prompt="ROLE")
+        assert result.exit_code == 0
+        assert result.output == "the answer"
+        assert result.session_id == "thread-abc"
+        assert result.input_tokens == 15
+        assert result.output_tokens == 25
+        # Codex has no system-prompt slot: the role folds into the user message.
+        assert sdk.capture["prompt"] == "ROLE\n\nhello codex"
+
+    def test_run_agent_passes_full_autonomy_options(self):
+        sdk = _FakeCodexSDK()
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        backend.run_agent("hi", working_dir="/work", model="gpt-5-codex")
+        codex = sdk.instances[0]
+        # full_access + auto_review == the CLI's --dangerously-bypass-approvals-and-sandbox.
+        assert codex.start_args["sandbox"] == "full-access"
+        assert codex.start_args["approval_mode"] == "auto_review"
+        assert codex.start_args["model"] == "gpt-5-codex"
+        assert codex.config.cwd == "/work"
+        assert isinstance(codex.config.env, dict)
+        # The client is torn down (app-server stopped) after the turn.
+        assert codex.closed is True
+
+    def test_resume_agent_resumes_thread(self):
+        sdk = _FakeCodexSDK(thread_id="thread-resumed")
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.resume_agent("thread-xyz", "again", working_dir="/w", model="gpt-5-codex")
+        codex = sdk.instances[0]
+        assert codex.resume_args["thread_id"] == "thread-xyz"
+        assert codex.resume_args["sandbox"] == "full-access"
+        assert result.session_id == "thread-resumed"
+
+    def test_resume_agent_preserves_thread_id_when_thread_has_none(self):
+        sdk = _FakeCodexSDK(thread_id=None)
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.resume_agent("keep-me", "hi", working_dir="/w")
+        assert result.session_id == "keep-me"
+
+    def test_failed_status_maps_to_nonzero_exit(self):
+        sdk = _FakeCodexSDK(response="", status="failed", error=type("E", (), {"message": "boom"})())
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("x", working_dir="/w")
+        assert result.exit_code == 1
+        assert "boom" in result.output
+        assert "boom" in result.transcript
+
+    def test_server_busy_maps_to_rate_limit(self):
+        sdk = _FakeCodexSDK(exc=_FakeCodexSDK.ServerBusyError("overloaded"))
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("x", working_dir="/w")
+        assert result.exit_code == 1
+        assert result.rate_limit_status == 429
+        assert "overloaded" in result.output
+
+    def test_generic_error_is_not_a_rate_limit(self):
+        sdk = _FakeCodexSDK(exc=RuntimeError("auth failed"))
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("x", working_dir="/w")
+        assert result.exit_code == 1
+        assert result.rate_limit_status is None
+        assert "auth failed" in result.output
+
+    def test_timeout_tears_down_client(self):
+        import time
+
+        class _SlowSDK(_FakeCodexSDK):
+            class _Thread(_FakeCodexSDK._Thread):
+                def run(self, prompt):
+                    time.sleep(10)
+                    raise RuntimeError("should not reach")
+
+            def _make_thread(self):
+                return _SlowSDK._Thread(self, "slow-thread", "", "completed", None, None, None, self.capture)
+
+        sdk = _SlowSDK()
+        backend = CodexSDKBackend()
+        backend._sdk = sdk
+        result = backend.run_agent("x", working_dir="/w", timeout=1)
+        assert result.exit_code == 1
+        assert "timed out" in result.output
+        assert result.session_id == "slow-thread"
+        assert sdk.instances[0].closed is True
 
 
 class TestParseJsonEvent:
