@@ -39,6 +39,19 @@ A deterministic Python runtime orchestrates AI coding agents (Claude or Codex) t
 
 The implementing agent and the checking agent are separate processes, so the implementer can't cheat by weakening tests, etc.
 
+## Backends
+
+Each phase runs on a backend selected per workflow (`backend:` in YAML) or per role (`captain_backend`, `worker_backend`, etc. in an `analysis` block):
+
+| Backend | Mechanism | Status |
+|---------|-----------|--------|
+| `claude` | Subprocess `claude` CLI | Default, always available |
+| `codex` | Subprocess `npx @openai/codex@latest` | Default, always available |
+| `claude-sdk` | In-process [`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) | Implemented, opt-in; live-smoke verified. Falls back to subprocess `claude` if the SDK is not installed |
+| `codex-sdk` | In-process official [`openai-codex`](https://pypi.org/project/openai-codex/) SDK | Implemented, opt-in; app-server/thread plumbing verified locally, but a **green success turn requires valid Codex auth** (`~/.codex/auth.json` from `codex login`, or `OPENAI_API_KEY`). Falls back to subprocess `codex` if the SDK is not installed |
+
+The subprocess backends are the working defaults; the SDK backends are opt-in. Install with the `claude-sdk`, `codex-sdk`, or combined `sdk` extra (`pip install -e ".[sdk]"`). Set `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1` to make backend selection fail loud instead of falling back when the SDK is missing. Details and the E2E parity + default-flip steps are in [`docs/backends/`](docs/backends/).
+
 ## Other Such Frameworks
 
 Juvenal is conceptually similar to [ralph](https://github.com/snarktank/ralph), but it works slightly better for my exact purposes and reinventing the wheel is cheap now!
@@ -258,8 +271,24 @@ can inspect the verified findings or audit trail if they need to summarize resul
 | `max_worker_retries` | `2` | Retry budget per target after rejected claims or interrupted work |
 | `max_captain_repairs` | `2` | Repair attempts when the captain emits malformed structured output |
 | `allow_repo_tools` | `true` | Allow repo-local inspection, build, test, and static-analysis commands |
+| `worker_dynamic_workflow` | `true` | Each worker fans out into its own backend subagents to explore hypotheses, then synthesizes one `WORKER_JSON`. The worker's loop position and output contract are unchanged. Set `false` for a legacy single-pass worker. |
+| `verifiers` | `[]` | Ordered verifier chain (`VerifierSpec` entries); each claim must pass every verifier before it is accepted |
+| `reporter` | `null` | `ReporterSpec` for the write-up agent that owns `output/<bug-id>/` |
+| `exploit_sim` | `null` | Optional non-gating post-verification stage (`ExploitSimSpec`); see below |
+
+Backend fields accept `claude`, `codex`, and the opt-in in-process `claude-sdk` / `codex-sdk` SDK backends.
 
 In v1, `analysis` phases may not appear inside `parallel_groups`.
+
+#### Exploit Simulation (non-gating)
+
+When `analysis.exploit_sim.enabled` is set, a post-verification stage runs after the full verifier chain passes and **before** the reporter. It stands up a real, runnable instance of the target inside a sandbox (env-builder → simulator → attacker → judge roles) and categorizes each verified claim. It **never rejects** a verified claim — an env-build or simulator failure just yields `sim_error` / `sim_inconclusive` while the claim stays verified and the reporter still runs.
+
+Per-claim categories: `exploit_confirmed`, `exploit_confirmed_nondefault`, `exploit_unconfirmed`, `sim_inconclusive`, `sim_error`. `juvenal status` shows the per-claim category (e.g. `... reported · exploit: confirmed`) alongside the existing aggregate summary.
+
+#### Native Role Subagents (Claude + Codex)
+
+The verifier and exploit-sim role bodies ship once in `juvenal/prompts/agents/*.md`. They are discovered natively by Claude Code via repo-root `.claude/agents/*.md` symlinks, and dual-emitted into `.codex/agents/*.toml` from the same source when a Codex-backed role runs (Codex has a real, model-driven in-session subagent mechanism). See [`docs/AGENTS.md`](docs/AGENTS.md).
 
 ### Analysis Chat Dashboard
 
