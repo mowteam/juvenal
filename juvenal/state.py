@@ -37,6 +37,24 @@ def _format_attack_surface_line(attack_surface) -> str:
     return f"[dim]Attack-surface analyst:[/] {status}"
 
 
+def _format_simulation_env_line(env_state) -> str | None:
+    """One-line summary of the exploit-sim environment builder for `juvenal status`.
+
+    Returns None when the env builder was never started (default state) so status
+    output stays clean for workflows without exploit-sim configured."""
+    status = getattr(env_state, "status", "pending")
+    if status == "ready":
+        duration = getattr(env_state, "duration_seconds", None)
+        suffix = f" · {duration:.0f}s" if duration is not None else ""
+        return f"[green]Exploit-sim env:[/] ready{suffix}"
+    if status == "running":
+        return "[yellow]Exploit-sim env:[/] building"
+    if status == "failed":
+        error = getattr(env_state, "error", None) or "unknown error"
+        return f"[red]Exploit-sim env:[/] failed — {error}"
+    return None
+
+
 def _format_claim_chain_progress(claim, dss, reporter_configured: bool) -> str:
     """Compose a short suffix describing where a claim is in the verifier chain.
 
@@ -374,6 +392,18 @@ class PipelineState:
             analyst_line = summary.get("analyst_line")
             if analyst_line:
                 console.print(f"  {analyst_line}")
+            exploit_sim_line = summary.get("exploit_sim_line")
+            if exploit_sim_line:
+                cats = summary.get("exploit_categories", {})
+                total_cat = sum(cats.values()) if cats else 0
+                if total_cat:
+                    exploit_sim_line += (
+                        f" · {cats.get('confirmed', 0)} confirmed"
+                        f" · {cats.get('confirmed_nondefault', 0)} confirmed(non-default)"
+                        f" · {cats.get('unconfirmed', 0)} unconfirmed"
+                        f" · {cats.get('inconclusive', 0)} inconclusive"
+                    )
+                console.print(f"  {exploit_sim_line}")
 
     def _render_analysis_detail(self, analysis_state_file: str) -> tuple[Table, dict[str, Any]] | None:
         """Load analysis child state and render a nested detail table."""
@@ -440,6 +470,13 @@ class PipelineState:
             "claims_report_pending": 0,
             "captain_turns": dss.captain.turn_index,
             "analyst_line": _format_attack_surface_line(dss.attack_surface),
+            "exploit_sim_line": _format_simulation_env_line(dss.simulation_env),
+            "exploit_categories": {
+                "confirmed": 0,
+                "confirmed_nondefault": 0,
+                "unconfirmed": 0,
+                "inconclusive": 0,
+            },
         }
 
         # Heuristic: a reporter is configured if at least one claim has been
@@ -522,6 +559,15 @@ class PipelineState:
                     summary["claims_reported"] += 1
                 elif reporter_configured:
                     summary["claims_report_pending"] += 1
+                cat = getattr(claim, "exploit_category", None) or "sim_inconclusive"
+                if cat == "exploit_confirmed":
+                    summary["exploit_categories"]["confirmed"] += 1
+                elif cat == "exploit_confirmed_nondefault":
+                    summary["exploit_categories"]["confirmed_nondefault"] += 1
+                elif cat == "exploit_unconfirmed":
+                    summary["exploit_categories"]["unconfirmed"] += 1
+                else:
+                    summary["exploit_categories"]["inconclusive"] += 1
 
         return detail, summary
 

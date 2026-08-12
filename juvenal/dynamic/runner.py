@@ -14,13 +14,14 @@ from threading import Event, Lock
 from typing import Any, Literal
 
 from juvenal.backends import AgentResult, Backend, create_backend
-from juvenal.checkers import VerificationReport, parse_verification_report
+from juvenal.checkers import VerificationReport, extract_json_block, parse_verification_report
 from juvenal.display import Display
 from juvenal.dynamic.interaction import UserInteractionChannel
 from juvenal.dynamic.models import (
     AttackSurfaceState,
     CaptainTurn,
     ClaimRecord,
+    SimulationEnvState,
     TargetRecord,
     UserDirective,
     VerificationRecord,
@@ -37,7 +38,16 @@ from juvenal.dynamic.protocol import (
 )
 from juvenal.dynamic.state import DynamicSessionState
 from juvenal.execution import PhaseResult
-from juvenal.workflow import AnalysisConfig, AnalystSpec, Phase, ReporterSpec, VerifierSpec, Workflow, apply_vars
+from juvenal.workflow import (
+    AnalysisConfig,
+    AnalystSpec,
+    ExploitSimSpec,
+    Phase,
+    ReporterSpec,
+    VerifierSpec,
+    Workflow,
+    apply_vars,
+)
 
 _CAPTAIN_EVENT_TYPES = frozenset(
     {
@@ -139,6 +149,14 @@ _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
         # Analyst defaults to opus 4.7 with the 1M-context beta because it
         # reads a lot (codebase, docs, web research) before producing the brief.
         "analyst": "claude-opus-4-7[1m]",
+        # Exploit-sim roles. env_builder reads the codebase + docs to stand up a
+        # runnable sandbox, so it gets the 1M-context model like the analyst.
+        # simulator/attacker run opus 4.7 (they drive/observe a live instance);
+        # exploit_judge runs opus 4.6 for adversarial categorization like verifiers.
+        "env_builder": "claude-opus-4-7[1m]",
+        "simulator": "claude-opus-4-7",
+        "attacker": "claude-opus-4-7",
+        "exploit_judge": "claude-opus-4-6",
     },
     "codex": {
         "captain": None,
@@ -146,6 +164,10 @@ _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
         "verifier": None,
         "reporter": None,
         "analyst": None,
+        "env_builder": None,
+        "simulator": None,
+        "attacker": None,
+        "exploit_judge": None,
     },
 }
 
@@ -197,6 +219,43 @@ class _AnalystExecutionResult:
     error: str | None
 
 
+@dataclass
+class _EnvBuilderExecutionResult:
+    agent_result: AgentResult
+    brief: str
+    artifact_path: str | None
+    instantiate_script: str | None
+    error: str | None
+
+
+@dataclass
+class _ExploitSimExecutionResult:
+    claim_id: str
+    category: Literal[
+        "exploit_confirmed",
+        "exploit_confirmed_nondefault",
+        "exploit_unconfirmed",
+        "sim_inconclusive",
+        "sim_error",
+    ]
+    config_deltas: list[str]
+    transcript_refs: list[str]
+    exchange_rounds: int
+    agent_results: list[AgentResult]
+    error: str | None
+
+
+_EXPLOIT_SIM_CATEGORIES = frozenset(
+    {
+        "exploit_confirmed",
+        "exploit_confirmed_nondefault",
+        "exploit_unconfirmed",
+        "sim_inconclusive",
+        "sim_error",
+    }
+)
+_JUDGE_BEGIN = "EXPLOIT_JUDGE_JSON_BEGIN"
+_JUDGE_END = "EXPLOIT_JUDGE_JSON_END"
 _MAX_REPORTER_ATTEMPTS = 3
 # After this many seconds since CREATION, a Claude session is considered too old
 # to safely resume. The Anthropic CLI does not always error on stale --resume —
@@ -296,6 +355,139 @@ End your output after the Quick-reference section. Do not append meta-commentary
 own process.
 """
 
+# Exploit-sim role prompts. These are fallbacks used only when the workflow does
+# not supply its own. They REQUIRE a real, runnable environment inside a sandbox
+# and forbid pre-provisioning any credential that sits on a trust boundary — the
+# whole point of the stage is to confirm reproduction on a realistic system, not
+# to hand the attacker a shortcut past the boundary the bug is supposed to cross.
+_DEFAULT_ENV_BUILDER_PROMPT = """You are the exploit-simulation environment builder for a Juvenal bug-bounty run.
+
+Build a REAL, RUNNABLE instance of the target inside this sandbox — actually compile / \
+install / configure it so a live process can be started, not a mock or a description. Use \
+the project's own default configuration. Do NOT pre-install, pre-seed, or hand out any \
+credential, token, key, or capability that lies on a trust boundary an attacker would have \
+to cross (admin passwords, signed peer identities, auth cookies, privileged sockets). The \
+simulation must reflect what an unprivileged/remote attacker actually faces.
+
+Repository root: {working_dir}
+Persist all artifacts under: {env_dir}
+
+Mission context:
+{mission}
+
+Write a runnable `instantiate.sh` under {env_dir} that spins up a FRESH, isolated instance \
+from the built artifact each time it is invoked (so per-claim runs never share state).
+
+End your output with a machine-readable block:
+ENV_JSON_BEGIN
+{"artifact_path": "<path under env_dir>", "instantiate_script": "<path to instantiate.sh>"}
+ENV_JSON_END
+"""
+
+_DEFAULT_SIMULATOR_PROMPT = """You are the exploit-simulation SIMULATOR for a Juvenal bug-bounty run \
+(round {round} of {max_rounds}).
+
+Instantiate / manage a fresh instance of the target from the prepared environment and report \
+its observable behavior to the attacker. Run the REAL system; never fabricate output. Start \
+from DEFAULT configuration. If the attacker requests a configuration change, you MAY grant it \
+only if a real operator plausibly would — but you MUST log every granted change verbatim on \
+its own line prefixed `CONFIG_DELTA: `. Never grant a change that simply hands over a \
+trust-boundary credential.
+
+Environment brief:
+{env_brief}
+
+Claim under test:
+{claim_packet}
+
+Attacker's last message: {attacker_last}
+
+Report the instance's actual observed response.
+"""
+
+_DEFAULT_ATTACKER_PROMPT = """You are the exploit-simulation ATTACKER for a Juvenal bug-bounty run \
+(round {round} of {max_rounds}).
+
+Run the verified proof-of-concept for the claim below against the live instance the simulator \
+manages. Use only capabilities a real attacker at the documented trust boundary would have. If \
+you genuinely need a non-default configuration to reproduce, request it explicitly from the \
+simulator (it will decide and log the delta) rather than assuming it.
+
+Claim under test:
+{claim_packet}
+
+Simulator's last message: {simulator_last}
+
+Report concretely whether the exploit reproduced and what you observed.
+"""
+
+_DEFAULT_EXPLOIT_JUDGE_PROMPT = """You are the exploit-simulation JUDGE for a Juvenal bug-bounty run.
+
+Read the attacker<->simulator transcript and the granted config-delta log, then categorize the \
+verified claim. You do NOT re-verify the bug (it already passed the verifier chain) and you \
+NEVER reject it — you only record whether it reproduced live and under what configuration.
+
+Categories:
+- exploit_confirmed: reproduced on the DEFAULT configuration.
+- exploit_confirmed_nondefault: reproduced only after granted non-default config changes.
+- exploit_unconfirmed: valid bug, but it did not reproduce live in this run.
+- sim_inconclusive: the environment/simulator could not exercise the claim.
+
+Claim under test:
+{claim_packet}
+
+Config deltas granted (JSON list): {config_deltas}
+
+Transcript:
+{transcript}
+
+End your output with:
+EXPLOIT_JUDGE_JSON_BEGIN
+{"category": "<one of the four>", "config_deltas": ["..."], "rationale": "one line"}
+EXPLOIT_JUDGE_JSON_END
+"""
+
+
+def _empty_agent_result() -> AgentResult:
+    return AgentResult(exit_code=1, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0)
+
+
+def _parse_env_builder_brief(brief: str) -> tuple[str | None, str | None]:
+    """Extract artifact_path / instantiate_script from the env-builder's ENV_JSON block."""
+    payload = extract_json_block(brief, "ENV_JSON_BEGIN", "ENV_JSON_END")
+    if not isinstance(payload, dict):
+        return None, None
+    artifact = payload.get("artifact_path")
+    script = payload.get("instantiate_script")
+    return (artifact if isinstance(artifact, str) else None, script if isinstance(script, str) else None)
+
+
+def _parse_config_deltas(output: str) -> list[str]:
+    """Collect every `CONFIG_DELTA: ...` line emitted during the dialogue."""
+    deltas: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("CONFIG_DELTA:"):
+            value = stripped[len("CONFIG_DELTA:") :].strip()
+            if value:
+                deltas.append(value)
+    return deltas
+
+
+def _parse_exploit_judge_output(output: str) -> tuple[str, list[str], str | None]:
+    """Return (category, config_deltas, error). Unparseable output degrades to
+    sim_inconclusive — the stage is non-gating, so a judge parse failure must not
+    strand the claim."""
+    payload = extract_json_block(output, _JUDGE_BEGIN, _JUDGE_END)
+    if not isinstance(payload, dict):
+        return "sim_inconclusive", [], "exploit_judge output missing EXPLOIT_JUDGE_JSON block"
+    category = payload.get("category")
+    if category not in _EXPLOIT_SIM_CATEGORIES or category == "sim_error":
+        return "sim_inconclusive", [], f"exploit_judge returned invalid category {category!r}"
+    raw_deltas = payload.get("config_deltas", [])
+    deltas = [d for d in raw_deltas if isinstance(d, str)] if isinstance(raw_deltas, list) else []
+    return category, deltas, None
+
 
 class DynamicAnalysisRunner:
     """Deterministic runner for one dynamic analysis phase."""
@@ -352,6 +544,20 @@ class DynamicAnalysisRunner:
         self._reporter_executor = ThreadPoolExecutor(max_workers=max(1, self.config.max_workers))
         self._analyst_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-analyst")
         self._analyst_future: Future[_AnalystExecutionResult] | None = None
+        # Exploit-sim (non-gating post-verification categorizer). env_builder runs
+        # once in its own single-slot pool; per-claim exploit-sim attempts run
+        # serially in a second single-slot pool so a fresh env instance is used
+        # per claim without cross-claim state pollution.
+        self._env_builder_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-env-builder")
+        self._env_builder_future: Future[_EnvBuilderExecutionResult] | None = None
+        # The env-builder future can be drained from two threads (the main loop
+        # and a per-claim exploit-sim worker waiting on it), so guard the
+        # claim-and-clear so it drains exactly once.
+        self._env_builder_lock = Lock()
+        self._exploit_sim_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-exploit-sim")
+        self._exploit_sim_futures: dict[Future[_ExploitSimExecutionResult], str] = {}
+        self._pending_exploit_sim_claim_ids: list[str] = []
+        self._exploit_sim_attempts: dict[str, int] = {}
         # Stale-session warnings are debounced per-session so a target with N
         # retries doesn't emit N copies of the same warning.
         self._logged_stale_sessions: set[str] = set()
@@ -427,6 +633,16 @@ class DynamicAnalysisRunner:
         if self._analyst_spec is not None and self._analyst_spec.prompt:
             self._rendered_analyst_prompt = apply_vars(self._analyst_spec.prompt, self.workflow.vars)
 
+        self._exploit_sim_spec: ExploitSimSpec | None = self.config.exploit_sim
+        self._rendered_exploit_sim_prompts: dict[str, str] = {}
+        if self._exploit_sim_spec is not None:
+            self._rendered_exploit_sim_prompts = {
+                "env_builder": apply_vars(self._exploit_sim_spec.env_builder.prompt or "", self.workflow.vars),
+                "simulator": apply_vars(self._exploit_sim_spec.simulator.prompt or "", self.workflow.vars),
+                "attacker": apply_vars(self._exploit_sim_spec.attacker.prompt or "", self.workflow.vars),
+                "exploit_judge": apply_vars(self._exploit_sim_spec.judge.prompt or "", self.workflow.vars),
+            }
+
         self._rendered_worker_prompt: str = ""
         if self.config.worker_prompt:
             self._rendered_worker_prompt = apply_vars(self.config.worker_prompt, self.workflow.vars)
@@ -452,7 +668,9 @@ class DynamicAnalysisRunner:
 
         self._rebuild_pending_claim_retries()
         self._rebuild_pending_reporter_claim_ids()
+        self._rebuild_pending_exploit_sim_claim_ids()
         self._maybe_start_analyst()
+        self._maybe_start_env_builder()
 
         # Chat dashboard: --interactive without an injected test channel.
         # Tests inject a ScriptedInteractionChannel and route through _run_batch
@@ -486,6 +704,7 @@ class DynamicAnalysisRunner:
                 made_progress |= self._sweep_dead_dep_targets()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
+                made_progress |= self._schedule_exploit_sim()
                 made_progress |= self._schedule_reporters()
                 made_progress |= self._apply_review_point()
 
@@ -514,6 +733,7 @@ class DynamicAnalysisRunner:
         finally:
             self.kill_active()
             self._finalize_analyst_on_shutdown()
+            self._finalize_env_builder_on_shutdown()
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
             _flush_stdin_buffer()
@@ -521,6 +741,8 @@ class DynamicAnalysisRunner:
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
             self._analyst_executor.shutdown(wait=False, cancel_futures=True)
+            self._env_builder_executor.shutdown(wait=False, cancel_futures=True)
+            self._exploit_sim_executor.shutdown(wait=False, cancel_futures=True)
 
     def _run_chat(self) -> PhaseResult:
         """Chat-dashboard execution: captain runs on a background thread; the user
@@ -558,6 +780,7 @@ class DynamicAnalysisRunner:
                 made_progress |= self._sweep_dead_dep_targets()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
+                made_progress |= self._schedule_exploit_sim()
                 made_progress |= self._schedule_reporters()
                 made_progress |= self._apply_continuous_directives()
                 made_progress |= self._drain_captain_future()
@@ -593,6 +816,7 @@ class DynamicAnalysisRunner:
             # exit while a thread is blocked in subprocess.Popen.wait().
             self.kill_active()
             self._finalize_analyst_on_shutdown()
+            self._finalize_env_builder_on_shutdown()
             if self._captain_executor is not None:
                 self._captain_executor.shutdown(wait=False, cancel_futures=True)
             if self._dashboard is not None:
@@ -609,6 +833,8 @@ class DynamicAnalysisRunner:
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
             self._analyst_executor.shutdown(wait=False, cancel_futures=True)
+            self._env_builder_executor.shutdown(wait=False, cancel_futures=True)
+            self._exploit_sim_executor.shutdown(wait=False, cancel_futures=True)
 
     def _apply_continuous_directives(self) -> bool:
         if self._interaction_channel is None or self.state.control.stop_requested:
@@ -1276,6 +1502,9 @@ class DynamicAnalysisRunner:
         if self._drain_analyst_future():
             progressed = True
 
+        if self._drain_env_builder_future():
+            progressed = True
+
         for future, attempt_id in list(self._worker_futures.items()):
             if not future.done():
                 continue
@@ -1320,6 +1549,24 @@ class DynamicAnalysisRunner:
                         self._handle_verifier_error(verification, claim, target)
                 continue
             self._apply_verifier_result(result)
+
+        for future, claim_id in list(self._exploit_sim_futures.items()):
+            if not future.done():
+                continue
+            progressed = True
+            self._exploit_sim_futures.pop(future, None)
+            try:
+                result = future.result()
+                self._apply_exploit_sim_result(result)
+            except Exception as exc:  # pragma: no cover - defensive, wrapper catches normally
+                # Non-gating: an exploit-sim crash must never strand a verified
+                # claim. Mark it sim_error and still hand it to the reporter.
+                claim = self.state.claims.get(claim_id)
+                if claim is not None:
+                    claim.exploit_category = "sim_error"
+                    self._enqueue_reporter(claim)
+                    self.state.save()
+                self._emit_analyst_message(f"[juvenal] exploit-sim for claim {claim_id} crashed: {exc}")
 
         for future, claim_id in list(self._reporter_futures.items()):
             if not future.done():
@@ -2362,10 +2609,495 @@ class DynamicAnalysisRunner:
             f"```text\n{json.dumps(self._target_prompt_summary(target), indent=2)}\n```\n\n"
             "Verifier consensus (all of these PASSED):\n"
             f"```text\n{json.dumps(verifier_summaries, indent=2)}\n```\n\n"
+            f"{self._exploitation_prompt_block(claim)}"
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
         )
         return system_prompt, user_prompt
+
+    def _exploitation_prompt_block(self, claim: ClaimRecord) -> str:
+        """Render the exploit-sim category into the reporter prompt so the report
+        carries an 'Exploitation' line. Empty when exploit-sim is not configured."""
+        if not self._exploit_sim_enabled():
+            return ""
+        descriptions = {
+            "exploit_confirmed": "reproduced on the default configuration",
+            "exploit_confirmed_nondefault": "reproduced only after granted non-default configuration changes",
+            "exploit_unconfirmed": "valid but did not reproduce live in the simulation this run",
+            "sim_inconclusive": "the simulation environment could not exercise the claim",
+            "sim_error": "an infrastructure error occurred during simulation",
+        }
+        category = claim.exploit_category or "sim_inconclusive"
+        detail = descriptions.get(category, "categorization unavailable")
+        return (
+            "Exploitation result (from the post-verification exploit-simulation stage):\n"
+            f"```text\nexploit_category: {category}\nmeaning: {detail}\n```\n"
+            'Include a one-line "Exploitation" entry in report.md stating this category.\n\n'
+        )
+
+    # --- Exploit-simulation (non-gating post-verification categorizer) ---------
+
+    def _exploit_sim_enabled(self) -> bool:
+        return self._exploit_sim_spec is not None and self._exploit_sim_spec.enabled
+
+    def _enqueue_post_verification(self, claim: ClaimRecord) -> None:
+        """Route a freshly-verified claim to the exploit-sim stage if enabled,
+        otherwise straight to the reporter. Exploit-sim is NON-GATING: it never
+        rejects the claim; on completion _apply_exploit_sim_result enqueues the
+        reporter regardless of category."""
+        if claim.reported_at is not None:
+            return
+        if self._exploit_sim_enabled() and not claim.exploit_sim_attempted:
+            if (
+                claim.claim_id not in self._pending_exploit_sim_claim_ids
+                and claim.claim_id not in self._exploit_sim_futures.values()
+            ):
+                self._pending_exploit_sim_claim_ids.append(claim.claim_id)
+            return
+        self._enqueue_reporter(claim)
+
+    def _enqueue_reporter(self, claim: ClaimRecord) -> None:
+        if (
+            self._reporter_spec is not None
+            and claim.reported_at is None
+            and claim.claim_id not in self._pending_reporter_claim_ids
+            and claim.claim_id not in self._reporter_futures.values()
+        ):
+            self._pending_reporter_claim_ids.append(claim.claim_id)
+
+    def _maybe_start_env_builder(self) -> None:
+        """Submit the env-builder future at startup if exploit-sim is configured.
+
+        NON-BLOCKING: unlike the analyst, workers/verifiers/captain proceed while
+        the env builds. Terminal states (ready/failed) are sticky across resumes.
+        """
+        if not self._exploit_sim_enabled():
+            return
+        status = self.state.simulation_env.status
+        if status in ("ready", "failed", "running"):
+            return
+        if self._env_builder_future is not None:
+            return
+        spec = self._exploit_sim_spec.env_builder
+        now = time.time()
+        self.state.simulation_env = SimulationEnvState(
+            status="running",
+            started_at=now,
+            backend=spec.backend,
+            model=_resolve_model(spec.backend, "env_builder", spec.model),
+        )
+        self.state.save()
+        self._env_builder_future = self._env_builder_executor.submit(self._execute_env_builder)
+
+    def _execute_env_builder(self) -> _EnvBuilderExecutionResult:
+        spec = self._exploit_sim_spec.env_builder if self._exploit_sim_spec else None
+        if spec is None:
+            return _EnvBuilderExecutionResult(
+                agent_result=_empty_agent_result(),
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error="exploit_sim spec missing at execution time",
+            )
+        backend = self._get_backend(spec.backend)
+        mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
+        env_dir = self.working_dir / "output" / ".simulation-env"
+        prompt = (
+            (self._rendered_exploit_sim_prompts.get("env_builder") or _DEFAULT_ENV_BUILDER_PROMPT)
+            .replace("{working_dir}", str(self.working_dir))
+            .replace("{env_dir}", str(env_dir))
+            .replace("{mission}", mission)
+        )
+        try:
+            result = backend.run_agent(
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("env_builder"),
+                model=_resolve_model(spec.backend, "env_builder", spec.model),
+            )
+        except Exception as exc:
+            return _EnvBuilderExecutionResult(
+                agent_result=_empty_agent_result(),
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error=f"env_builder raised: {exc}",
+            )
+        if result.exit_code != 0:
+            return _EnvBuilderExecutionResult(
+                agent_result=result,
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error=f"env_builder exited with code {result.exit_code}: {result.output[-2000:]}",
+            )
+        brief = result.output.strip()
+        if not brief:
+            return _EnvBuilderExecutionResult(
+                agent_result=result,
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error="env_builder returned empty output",
+            )
+        artifact_path, instantiate_script = _parse_env_builder_brief(brief)
+        return _EnvBuilderExecutionResult(
+            agent_result=result,
+            brief=brief,
+            artifact_path=artifact_path,
+            instantiate_script=instantiate_script,
+            error=None,
+        )
+
+    def _drain_env_builder_future(self) -> bool:
+        with self._env_builder_lock:
+            if self._env_builder_future is None or not self._env_builder_future.done():
+                return False
+            future = self._env_builder_future
+            self._env_builder_future = None
+        try:
+            outcome = future.result()
+        except Exception as exc:
+            self._record_env_builder_failure(f"future crashed: {exc}")
+            return True
+        self._add_tokens(outcome.agent_result)
+        if outcome.error is not None:
+            self._record_env_builder_failure(outcome.error, agent_result=outcome.agent_result)
+            return True
+        self._record_env_builder_success(outcome)
+        return True
+
+    def _record_env_builder_success(self, outcome: _EnvBuilderExecutionResult) -> None:
+        now = time.time()
+        (self.working_dir / "output" / ".simulation-env").mkdir(parents=True, exist_ok=True)
+        started = self.state.simulation_env.started_at or now
+        self.state.simulation_env = SimulationEnvState(
+            status="ready",
+            brief=outcome.brief,
+            artifact_path=outcome.artifact_path,
+            instantiate_script=outcome.instantiate_script,
+            error=None,
+            started_at=started,
+            completed_at=now,
+            duration_seconds=max(0.0, now - started),
+            input_tokens=outcome.agent_result.input_tokens,
+            output_tokens=outcome.agent_result.output_tokens,
+            session_id=outcome.agent_result.session_id,
+            backend=self.state.simulation_env.backend,
+            model=self.state.simulation_env.model,
+        )
+        self.state.save()
+        self._emit_analyst_message(
+            f"[juvenal] exploit-sim environment ready ({self.state.simulation_env.duration_seconds:.0f}s)"
+        )
+
+    def _record_env_builder_failure(self, error: str, *, agent_result: AgentResult | None = None) -> None:
+        now = time.time()
+        started = self.state.simulation_env.started_at or now
+        self.state.simulation_env = SimulationEnvState(
+            status="failed",
+            brief=None,
+            artifact_path=None,
+            instantiate_script=None,
+            error=error,
+            started_at=started,
+            completed_at=now,
+            duration_seconds=max(0.0, now - started),
+            input_tokens=agent_result.input_tokens if agent_result is not None else 0,
+            output_tokens=agent_result.output_tokens if agent_result is not None else 0,
+            session_id=agent_result.session_id if agent_result is not None else None,
+            backend=self.state.simulation_env.backend,
+            model=self.state.simulation_env.model,
+        )
+        self.state.save()
+
+    def _finalize_env_builder_on_shutdown(self) -> None:
+        if self._env_builder_future is None:
+            return
+        try:
+            self._env_builder_future.result(timeout=10.0)
+        except Exception:
+            pass
+        try:
+            self._drain_env_builder_future()
+        except Exception:
+            pass
+
+    def _wait_for_env_builder_ready(self) -> bool:
+        """Block (per-claim) until env_builder reaches a terminal state. Returns
+        True if the env is ready, False if it failed or the wait was interrupted."""
+        if self.state.simulation_env.status in ("ready", "failed"):
+            return self.state.simulation_env.status == "ready"
+        while self._env_builder_future is not None and not self._env_builder_future.done():
+            if self._shutdown_event.is_set() or self.state.control.stop_requested:
+                return False
+            time.sleep(_IDLE_SLEEP_SECONDS)
+        if self._env_builder_future is not None:
+            self._drain_env_builder_future()
+        return self.state.simulation_env.status == "ready"
+
+    def _schedule_exploit_sim(self) -> bool:
+        """Submit exploit-sim attempts for verified-but-not-yet-attempted claims.
+
+        NON-GATING: verified claims proceed to the reporter regardless of the
+        exploit-sim outcome. Runs one attempt at a time so each claim gets a
+        fresh env instance without cross-claim state pollution."""
+        if not self._exploit_sim_enabled():
+            return False
+        if self._terminal_failure or self.state.control.stop_requested:
+            return False
+        if not self._pending_exploit_sim_claim_ids:
+            return False
+        available = 1 - len(self._exploit_sim_futures)
+        if available <= 0:
+            return False
+
+        scheduled = False
+        remaining: list[str] = []
+        in_flight = set(self._exploit_sim_futures.values())
+        for claim_id in self._pending_exploit_sim_claim_ids:
+            if available <= 0 or claim_id in in_flight:
+                remaining.append(claim_id)
+                continue
+            claim = self.state.claims.get(claim_id)
+            if claim is None or claim.status != "verified" or claim.exploit_sim_attempted:
+                continue
+            target = self.state.targets.get(claim.target_id)
+            if target is None:
+                continue
+            attempts = self._exploit_sim_attempts.get(claim_id, 0)
+            if attempts >= self._exploit_sim_spec.max_attempts:
+                continue
+            exploit_sim_id = str(uuid.uuid4())
+            claim.exploit_sim_id = exploit_sim_id
+            claim.exploit_sim_attempted = True
+            self.state.save()
+            future = self._exploit_sim_executor.submit(self._execute_exploit_sim, claim, target, exploit_sim_id)
+            self._exploit_sim_futures[future] = claim_id
+            self._exploit_sim_attempts[claim_id] = attempts + 1
+            available -= 1
+            scheduled = True
+
+        self._pending_exploit_sim_claim_ids = remaining
+        return scheduled
+
+    def _execute_exploit_sim(
+        self,
+        claim: ClaimRecord,
+        target: TargetRecord,
+        exploit_sim_id: str,
+    ) -> _ExploitSimExecutionResult:
+        """Env-builder (blocking wait) → runner-bounded attacker<->simulator loop
+        → exploit_judge categorization. Any infra failure yields sim_error /
+        sim_inconclusive with the claim STILL verified."""
+        spec = self._exploit_sim_spec
+        if spec is None:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_inconclusive",
+                config_deltas=[],
+                transcript_refs=[],
+                exchange_rounds=0,
+                agent_results=[],
+                error="exploit_sim spec missing",
+            )
+
+        if not self._wait_for_env_builder_ready():
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_inconclusive",
+                config_deltas=[],
+                transcript_refs=[],
+                exchange_rounds=0,
+                agent_results=[],
+                error=f"simulation environment not ready (status={self.state.simulation_env.status})",
+            )
+
+        sim_dir = self.working_dir / "output" / ".simulation-env" / exploit_sim_id
+        try:
+            sim_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_error",
+                config_deltas=[],
+                transcript_refs=[],
+                exchange_rounds=0,
+                agent_results=[],
+                error=f"could not create sim workspace: {exc}",
+            )
+
+        agent_results: list[AgentResult] = []
+        transcript_refs: list[str] = []
+        config_deltas: list[str] = []
+        transcript_lines: list[str] = []
+        packet = json.dumps(asdict(claim_to_verifier_packet(claim)), indent=2)
+        env_brief = self.state.simulation_env.brief or ""
+
+        try:
+            simulator_backend = self._get_backend(spec.simulator.backend)
+            attacker_backend = self._get_backend(spec.attacker.backend)
+
+            # Runner-owned bounded dialogue. The integer cap — NOT an LLM — decides
+            # when the exchange stops.
+            simulator_session: str | None = None
+            attacker_session: str | None = None
+            rounds_completed = 0
+            for round_index in range(spec.max_exchange_rounds):
+                sim_prompt = (
+                    (self._rendered_exploit_sim_prompts.get("simulator") or _DEFAULT_SIMULATOR_PROMPT)
+                    .replace("{working_dir}", str(self.working_dir))
+                    .replace("{sim_dir}", str(sim_dir))
+                    .replace("{env_brief}", env_brief)
+                    .replace("{claim_packet}", packet)
+                    .replace("{round}", str(round_index + 1))
+                    .replace("{max_rounds}", str(spec.max_exchange_rounds))
+                    .replace("{attacker_last}", transcript_lines[-1] if transcript_lines else "(none yet)")
+                )
+                sim_result = self._run_dialogue_turn(
+                    simulator_backend, "simulator", sim_prompt, sim_dir, simulator_session, spec.simulator.model
+                )
+                agent_results.append(sim_result)
+                simulator_session = sim_result.session_id or simulator_session
+                transcript_lines.append(f"[simulator r{round_index + 1}] {sim_result.output.strip()}")
+                config_deltas.extend(_parse_config_deltas(sim_result.output))
+
+                att_prompt = (
+                    (self._rendered_exploit_sim_prompts.get("attacker") or _DEFAULT_ATTACKER_PROMPT)
+                    .replace("{working_dir}", str(self.working_dir))
+                    .replace("{sim_dir}", str(sim_dir))
+                    .replace("{claim_packet}", packet)
+                    .replace("{round}", str(round_index + 1))
+                    .replace("{max_rounds}", str(spec.max_exchange_rounds))
+                    .replace("{simulator_last}", sim_result.output.strip())
+                )
+                att_result = self._run_dialogue_turn(
+                    attacker_backend, "attacker", att_prompt, sim_dir, attacker_session, spec.attacker.model
+                )
+                agent_results.append(att_result)
+                attacker_session = att_result.session_id or attacker_session
+                transcript_lines.append(f"[attacker r{round_index + 1}] {att_result.output.strip()}")
+                config_deltas.extend(_parse_config_deltas(att_result.output))
+                rounds_completed = round_index + 1
+        except Exception as exc:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_error",
+                config_deltas=config_deltas,
+                transcript_refs=transcript_refs,
+                exchange_rounds=0,
+                agent_results=agent_results,
+                error=f"attacker/simulator dialogue crashed: {exc}",
+            )
+
+        transcript_path = sim_dir / "dialogue.log"
+        try:
+            transcript_path.write_text("\n".join(transcript_lines), encoding="utf-8")
+            transcript_refs.append(str(transcript_path))
+        except Exception:
+            pass
+
+        # exploit_judge categorizes from the transcript + config-delta log.
+        judge_prompt = (
+            (self._rendered_exploit_sim_prompts.get("exploit_judge") or _DEFAULT_EXPLOIT_JUDGE_PROMPT)
+            .replace("{working_dir}", str(self.working_dir))
+            .replace("{claim_packet}", packet)
+            .replace("{transcript}", "\n".join(transcript_lines))
+            .replace("{config_deltas}", json.dumps(sorted(set(config_deltas))))
+        )
+        try:
+            judge_backend = self._get_backend(spec.judge.backend)
+            judge_result = judge_backend.run_agent(
+                judge_prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("exploit_judge"),
+                model=_resolve_model(spec.judge.backend, "exploit_judge", spec.judge.model),
+            )
+            agent_results.append(judge_result)
+        except Exception as exc:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_error",
+                config_deltas=sorted(set(config_deltas)),
+                transcript_refs=transcript_refs,
+                exchange_rounds=rounds_completed,
+                agent_results=agent_results,
+                error=f"exploit_judge raised: {exc}",
+            )
+        if judge_result.exit_code != 0:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_inconclusive",
+                config_deltas=sorted(set(config_deltas)),
+                transcript_refs=transcript_refs,
+                exchange_rounds=rounds_completed,
+                agent_results=agent_results,
+                error=f"exploit_judge exited with code {judge_result.exit_code}",
+            )
+        category, judge_deltas, judge_error = _parse_exploit_judge_output(judge_result.output)
+        merged_deltas = sorted(set(config_deltas) | set(judge_deltas))
+        return _ExploitSimExecutionResult(
+            claim_id=claim.claim_id,
+            category=category,
+            config_deltas=merged_deltas,
+            transcript_refs=transcript_refs,
+            exchange_rounds=rounds_completed,
+            agent_results=agent_results,
+            error=judge_error,
+        )
+
+    def _run_dialogue_turn(
+        self,
+        backend: Backend,
+        role: str,
+        prompt: str,
+        sim_dir: Path,
+        session_id: str | None,
+        model: str | None,
+    ) -> AgentResult:
+        if session_id:
+            return backend.resume_agent(
+                session_id,
+                prompt,
+                working_dir=str(sim_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env(role),
+                model=_resolve_model(backend.name(), role, model),
+            )
+        return backend.run_agent(
+            prompt,
+            working_dir=str(sim_dir),
+            timeout=self.phase.timeout,
+            env=self._role_env(role),
+            model=_resolve_model(backend.name(), role, model),
+        )
+
+    def _apply_exploit_sim_result(self, result: _ExploitSimExecutionResult) -> None:
+        """Record the exploit-sim category on the claim, then enqueue the reporter.
+        NEVER rejects a verified claim or touches claim.status / rejection_class."""
+        for agent_result in result.agent_results:
+            self._add_tokens(agent_result)
+        claim = self.state.claims.get(result.claim_id)
+        if claim is None:
+            return
+        claim.exploit_category = result.category
+        self._enqueue_reporter(claim)
+        self.state.save()
+
+    def _rebuild_pending_exploit_sim_claim_ids(self) -> None:
+        """On resume, enqueue verified claims not yet exploit-sim-attempted."""
+        self._pending_exploit_sim_claim_ids = []
+        if not self._exploit_sim_enabled():
+            return
+        in_flight = set(self._exploit_sim_futures.values())
+        for claim in self.state.claims.values():
+            if claim.status != "verified" or claim.reported_at is not None:
+                continue
+            if claim.exploit_sim_attempted or claim.claim_id in in_flight:
+                continue
+            self._pending_exploit_sim_claim_ids.append(claim.claim_id)
 
     def _schedule_reporters(self) -> bool:
         """Submit reporter agent runs for any verified-but-not-reported claims."""
@@ -2747,13 +3479,7 @@ class DynamicAnalysisRunner:
                 generation=verification.generation,
             )
             self._refresh_target_after_verification(target)
-            if (
-                self._reporter_spec is not None
-                and claim.reported_at is None
-                and claim.claim_id not in self._pending_reporter_claim_ids
-                and claim.claim_id not in self._reporter_futures.values()
-            ):
-                self._pending_reporter_claim_ids.append(claim.claim_id)
+            self._enqueue_post_verification(claim)
             self.state.save()
             return
 
@@ -3118,6 +3844,8 @@ class DynamicAnalysisRunner:
     def _has_active_runtime_work(self) -> bool:
         if self._worker_futures or self._verifier_futures or self._reporter_futures:
             return True
+        if self._exploit_sim_futures or self._pending_exploit_sim_claim_ids:
+            return True
         if self._pending_claim_retries or self._pending_reporter_claim_ids:
             return True
         for verification in self.state.verifications.values():
@@ -3455,12 +4183,18 @@ class DynamicAnalysisRunner:
             return
         in_flight = set(self._reporter_futures.values())
         queued = set(self._pending_reporter_claim_ids)
+        exploit_sim_on = self._exploit_sim_enabled()
         for claim in self.state.claims.values():
             if claim.status != "verified":
                 continue
             if claim.reported_at is not None:
                 continue
             if claim.claim_id in in_flight or claim.claim_id in queued:
+                continue
+            # When exploit-sim is enabled, a claim that has not yet been attempted
+            # belongs in the exploit-sim queue first — the reporter runs only after
+            # categorization. Attempted claims fall through to the reporter here.
+            if exploit_sim_on and not claim.exploit_sim_attempted:
                 continue
             self._pending_reporter_claim_ids.append(claim.claim_id)
 

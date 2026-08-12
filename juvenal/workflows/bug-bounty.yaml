@@ -176,7 +176,7 @@ phases:
       # become visible to the captain (and to variant-analysis fanout) faster
       # than under the legacy independent-pool design.
       shared_agent_budget: true
-      max_agents: 8
+      max_agents: 3
       # max_workers / max_verifiers are unused under shared_agent_budget: true.
       # Set shared_agent_budget: false (and uncomment below) to fall back to
       # legacy independent pools.
@@ -1157,6 +1157,23 @@ phases:
             novelty PASS"). Pull this from the verifier-consensus block in
             your prompt.
 
+          ## Exploitation result
+
+          After the verifier chain passed, a NON-GATING exploit-simulation stage
+          attempted to reproduce this bug on a real, runnable instance of the
+          target inside a sandbox. The runner assigns one category, delivered to
+          you in the "Exploitation result" block of your prompt. Add a one-line
+          **Exploitation** entry to `report.md` reflecting it:
+          - **exploit_confirmed**: reproduced on the default configuration.
+          - **exploit_confirmed_nondefault**: reproduced only after granted
+            non-default configuration changes (note any significant deltas).
+          - **exploit_unconfirmed**: the bug is valid (verifiers passed) but did
+            not reproduce live in this run.
+          - **sim_inconclusive** / **sim_error**: the simulation environment was
+            unavailable or hit an infrastructure error; the finding is still valid.
+          This is descriptive only — never downgrade or drop a verified finding
+          because the simulation did not reproduce it.
+
           The runner gives you BOTH a `Worker scratch directory` and a
           `Report directory` in the system prompt above. Workflow:
           1. Create the report directory if it does not exist.
@@ -1173,6 +1190,116 @@ phases:
 
           Overwriting an existing report at this path is fine — this step
           is idempotent.
+      # NON-GATING post-verification exploit simulation. Runs AFTER the full
+      # verifier chain passes and BEFORE the reporter. It attempts to reproduce
+      # each verified bug on a REAL, runnable instance of the target inside a
+      # sandbox and categorizes the finding — it NEVER rejects a verified claim.
+      # An env-build or simulator failure yields sim_error / sim_inconclusive
+      # while the claim stays verified and the reporter still runs.
+      exploit_sim:
+        enabled: true
+        max_exchange_rounds: 5
+        max_attempts: 1
+        env_builder:
+          backend: claude
+          model: claude-opus-4-7[1m]
+          prompt: |
+            You are the exploit-simulation environment builder for this
+            bug-bounty run. Target repository: {{ REPO }}
+
+            Stand up a REAL, RUNNABLE instance of the target INSIDE THIS
+            SANDBOX. Actually fetch/build/compile/install and configure it so a
+            live process can be started — do NOT mock it, stub it, or merely
+            describe how it would run. Use the project's OWN DEFAULT
+            configuration as an operator would get out of the box.
+
+            Hard rule — trust boundaries: do NOT pre-install, pre-seed, or hand
+            out ANY credential, key, token, cookie, signed-peer identity, or
+            privileged socket that lies on a trust boundary an attacker would
+            have to cross. The simulation must reflect exactly what an
+            unprivileged / remote attacker actually faces. Pre-provisioning a
+            boundary credential would invalidate the whole exercise.
+
+            Persist every artifact under `{env_dir}`. Write an
+            `instantiate.sh` there that spins up a FRESH, ISOLATED instance
+            from the built artifact each time it runs, so per-claim attempts
+            never share state.
+
+            End your output with:
+            ENV_JSON_BEGIN
+            {"artifact_path": "<path under env_dir>", "instantiate_script": "<path to instantiate.sh>"}
+            ENV_JSON_END
+        simulator:
+          backend: claude
+          model: claude-opus-4-7
+          prompt: |
+            You are the exploit-simulation SIMULATOR (round {round} of
+            {max_rounds}). Instantiate and drive a fresh instance of the target
+            from the prepared environment and report its REAL observed behavior
+            to the attacker. Run the actual system; never fabricate output.
+
+            Start from DEFAULT configuration. If the attacker requests a
+            configuration change, grant it ONLY if a real operator plausibly
+            would, and log every granted change verbatim on its own line
+            prefixed `CONFIG_DELTA: `. NEVER grant a change that hands over a
+            trust-boundary credential or otherwise skips the boundary the bug
+            is meant to cross.
+
+            Environment brief:
+            {env_brief}
+
+            Claim under test:
+            {claim_packet}
+
+            Attacker's last message: {attacker_last}
+        attacker:
+          backend: claude
+          model: claude-opus-4-7
+          prompt: |
+            You are the exploit-simulation ATTACKER (round {round} of
+            {max_rounds}). Run the verified proof-of-concept for the claim below
+            against the live instance the simulator manages, using ONLY
+            capabilities a real attacker at the documented trust boundary would
+            have. If you genuinely need a non-default configuration to
+            reproduce, request it explicitly from the simulator (it decides and
+            logs the delta) — do not assume it and do not fabricate a boundary
+            credential for yourself.
+
+            Claim under test:
+            {claim_packet}
+
+            Simulator's last message: {simulator_last}
+
+            Report concretely whether the exploit reproduced and what you saw.
+        judge:
+          backend: claude
+          model: claude-opus-4-6
+          prompt: |
+            You are the exploit-simulation JUDGE. Read the attacker<->simulator
+            transcript and the granted config-delta log, then categorize this
+            already-verified claim. You do NOT re-verify the bug and you NEVER
+            reject it — you only record whether it reproduced live and under
+            what configuration.
+
+            Categories:
+            - exploit_confirmed: reproduced on the DEFAULT configuration.
+            - exploit_confirmed_nondefault: reproduced only after granted
+              non-default config changes.
+            - exploit_unconfirmed: valid bug, did not reproduce live this run.
+            - sim_inconclusive: the environment/simulator could not exercise it.
+
+            Claim under test:
+            {claim_packet}
+
+            Config deltas granted (JSON list): {config_deltas}
+
+            Transcript:
+            {transcript}
+
+            End your output with:
+            EXPLOIT_JUDGE_JSON_BEGIN
+            {"category": "<one of the four>", "config_deltas": ["..."], "rationale": "one line"}
+            EXPLOIT_JUDGE_JSON_END
 
   - id: summarize-findings
     prompt: |
@@ -1196,7 +1323,9 @@ phases:
 
       Read `.juvenal-state-hunt-bugs-analysis.json` for context the per-bug
       reports do not capture: rejected claims (with verifier reasons),
-      blocked targets, no-findings targets, captain coverage notes.
+      blocked targets, no-findings targets, captain coverage notes, and each
+      verified claim's `exploit_category` field (set by the exploit-simulation
+      stage).
       Cross-check that every claim with `status: "verified"` in the state
       file has a matching `output/<claim-id>/report.md`. If any are missing,
       flag them in the report under "Reporter gaps" so the user knows the
@@ -1206,9 +1335,35 @@ phases:
 
       ## Verified Findings
 
-      For each verified finding, emit a compact entry in this index:
+      Group findings by exploitation result (read each verified claim's
+      `exploit_category` from the state JSON), then by severity within each group.
+
+      ### Exploited (default config)
+
+      For each finding whose `exploit_category` is `exploit_confirmed` (reproduced
+      live without special setup), emit a compact index entry:
       - **[Title from report.md](output/<bug-id>/report.md)** — Severity, Location.
         One-sentence summary of impact.
+
+      ### Exploited (non-default config)
+
+      For each finding whose `exploit_category` is `exploit_confirmed_nondefault`
+      (reproduced only after granted configuration changes), emit the same entry
+      plus a short note on any significant config deltas:
+      - **[Title from report.md](output/<bug-id>/report.md)** — Severity, Location.
+        Note: required non-default config.
+
+      ### Verified but unconfirmed in simulation
+
+      For each finding whose `exploit_category` is `exploit_unconfirmed`,
+      `sim_inconclusive`, or `sim_error` (valid finding that did not reproduce
+      live, or the simulation environment was unavailable), emit an entry with a
+      note on the limitation:
+      - **[Title from report.md](output/<bug-id>/report.md)** — Severity, Location.
+        Note: simulation [did not reproduce | environment unavailable].
+
+      Do NOT drop or downgrade any verified finding based on its exploit
+      category — the categories are informational, not a gate.
 
       ## Rejected Claims
 

@@ -95,6 +95,10 @@ class MockBackend(Backend):
             "verifier": [],
             "reporter": [],
             "analyst": [],
+            "env_builder": [],
+            "simulator": [],
+            "attacker": [],
+            "exploit_judge": [],
         }
         self._role_side_effects: dict[str, list] = {}
         self._role_chunks: dict[str, list[list[str]]] = {}
