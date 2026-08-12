@@ -1,35 +1,24 @@
-# Claude Agent SDK — availability and integration status
+# Claude Agent SDK backend — integration status
 
-## Status (as of this branch)
-
-The **Claude Agent SDK is NOT installed** in the pyenv used by juvenal
-(`/home/mowteam/.pyenv/bin/python`, Python 3.12). Verified:
-
-```
-$ /home/mowteam/.pyenv/bin/python -c "import claude_agent_sdk"
-ModuleNotFoundError: No module named 'claude_agent_sdk'
-$ /home/mowteam/.pyenv/bin/python -c "import claude_code_sdk"
-ModuleNotFoundError: No module named 'claude_code_sdk'
-$ /home/mowteam/.pyenv/bin/python -c "import anthropic"
-ModuleNotFoundError: No module named 'anthropic'
-```
-
-Because the SDK is absent, `ClaudeSDKBackend` is **scaffolded**: the class, the
-`AgentResult` / `InteractiveResult` contract, the `claude-sdk` backend name, the
-`create_backend("claude-sdk")` factory case, the `[1m]`-suffix-preserving model
-routing, and the feature flag are all in place and unit-tested, but the actual
-SDK query loop (`ClaudeSDKBackend._drive_sdk`) raises `NotImplementedError`. The
-module imports cleanly and all existing tests pass with the SDK absent.
+Developer notes for `ClaudeSDKBackend` (`juvenal/backends.py`). This is a
+scaffolded backend: the class, factory case, model routing, and unit-test
+contract are in place, but the SDK query loop (`ClaudeSDKBackend._drive_sdk`)
+raises `NotImplementedError` until a human wires and E2E-verifies it.
 
 ## Package
 
-- **Package name**: `claude-agent-sdk` (PyPI). Import name `claude_agent_sdk`.
+- **Package name**: `claude-agent-sdk` (PyPI), import name `claude_agent_sdk`.
   Formerly published as `claude-code-sdk` (import name `claude_code_sdk`); the
   backend's `_load_claude_agent_sdk()` tries both import names.
 - **Install**: `pip install claude-agent-sdk`
 - The SDK drives the Claude Code CLI in-process (it shells out to the `claude`
   binary under the hood but manages the session and event stream from Python),
   so the `claude` CLI must still be on `PATH`.
+
+> Availability note: verify presence against the pyenv juvenal runs under
+> (`/home/mowteam/.pyenv/bin/python -c "import claude_agent_sdk"`). When the
+> module is absent the backend must import cleanly and every unit test must
+> still pass with the SDK missing — that guard is part of the contract.
 
 ## Contract the backend must satisfy (already enforced by the scaffold)
 
@@ -59,9 +48,9 @@ as a worker crash (`_session_is_stale` in `runner.py` is a reactive age check).
 The SDK keeps session state in-process, so a resume either works or raises —
 eliminating the silent-fresh-session failure mode.
 
-## Human follow-up (network + API key required — not runnable here)
+## Human follow-up (network + API key required — not runnable in unit tests)
 
-1. `pip install claude-agent-sdk` into `/home/mowteam/.pyenv`.
+1. Ensure `claude-agent-sdk` is installed into the juvenal pyenv.
 2. Implement `ClaudeSDKBackend._drive_sdk` in `juvenal/backends.py`:
    - Build the SDK options object with `cwd=working_dir`, `model=` (pass the
      `[1m]` string through as-is — the CLI understands the suffix),
@@ -75,12 +64,15 @@ eliminating the silent-fresh-session failure mode.
      `asyncio.run` since the runner calls backends synchronously from threads),
      enforce `timeout`, accumulate assistant text + tokens, map a 429 to
      `rate_limit_status`, and set `env` for the child.
+   - Confirm the exact options/query API against the installed package version
+     before relying on any specific field or kwarg name.
 3. Verify E2E parity by running the existing suite against the SDK backend:
    ```
-   /home/mowteam/.pyenv/bin/python -m pytest tests/test_e2e_claude.py -x -v
+   pytest tests/test_e2e_claude.py -x -v
    ```
    and add a `backend="claude-sdk"` variant, confirming it produces the same
    `hello.txt` result as `backend="claude"`. Requires `ANTHROPIC_API_KEY` and the
    `claude` CLI.
 4. Once verified, the SDK-guarded unit tests in `tests/test_backends_sdk.py`
-   (skipped today) exercise `run_agent` / `resume_agent` end-to-end.
+   (skipped when the SDK is absent) exercise `run_agent` / `resume_agent` up to
+   the not-yet-implemented drive loop.

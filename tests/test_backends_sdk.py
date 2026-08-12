@@ -99,7 +99,7 @@ class TestClaudeSDKBackendWithSDK:
     """Only run once the human installs the SDK. These still avoid the network by
     stopping at the not-yet-implemented query loop; the true end-to-end check is
     tests/test_e2e_claude.py with a backend='claude-sdk' variant (see
-    SDK_AVAILABILITY.md)."""
+    docs/backends/claude-sdk-integration.md)."""
 
     def test_run_agent_reaches_query_loop(self):
         backend = ClaudeSDKBackend()
