@@ -793,6 +793,156 @@ class CodexBackend(Backend):
         )
 
 
+def _load_codex_sdk() -> Any | None:
+    """Import the Codex Python SDK, returning the module or None if absent.
+
+    Ships as `openai_codex_sdk` (`pip install openai-codex-sdk`); some early builds
+    exposed it as `openai_codex`, so we try both. Absence is expected on the default
+    subprocess path, so callers treat None as "SDK backend unavailable".
+    """
+    for module_name in ("openai_codex_sdk", "openai_codex"):
+        try:
+            return __import__(module_name)
+        except ImportError:
+            continue
+    return None
+
+
+class CodexSDKBackend(Backend):
+    """Codex backend driving the OpenAI Codex Python SDK in-process instead of `npx`.
+
+    Opt-in via `backend: codex-sdk` (or `JUVENAL_BACKEND_CODEX_SDK=1`); the subprocess
+    `CodexBackend` remains the default. Targets the `npx @openai/codex@latest` startup
+    races (ENOTEMPTY/ETXTBSY on parallel spawns) and transient auth.json 401s: the SDK
+    talks to a persistent local Codex app-server over JSON-RPC and reuses existing Codex
+    auth, so there's no per-call npx unpack. Sessions resume by thread id via the SDK's
+    `resume_thread`, mapping onto Codex's `~/.codex/sessions` store, and it returns the
+    identical `AgentResult` contract (session_id carries the Codex thread id).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._sdk = _load_codex_sdk()
+
+    @property
+    def sdk_available(self) -> bool:
+        return self._sdk is not None
+
+    def name(self) -> str:
+        return "codex-sdk"
+
+    def run_agent(
+        self,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        session_id: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
+    ) -> AgentResult:
+        # Codex has no separate system-prompt slot; fold it into the user message so
+        # it is not silently dropped, matching subprocess CodexBackend behavior. Codex
+        # assigns its own thread id, so the externally chosen session_id is ignored, as
+        # is hooks_config (no Claude-settings equivalent).
+        del session_id, hooks_config
+        if system_prompt is not None:
+            prompt = f"{system_prompt}\n\n{prompt}"
+        return self._run_codex_sdk_query(
+            prompt=prompt,
+            working_dir=working_dir,
+            display_callback=display_callback,
+            timeout=timeout,
+            env=env,
+            model=model,
+            resume_thread_id=None,
+        )
+
+    def resume_agent(
+        self,
+        session_id: str,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
+    ) -> AgentResult:
+        del hooks_config  # Codex has no Claude-settings equivalent.
+        result = self._run_codex_sdk_query(
+            prompt=prompt,
+            working_dir=working_dir,
+            display_callback=display_callback,
+            timeout=timeout,
+            env=env,
+            model=model,
+            resume_thread_id=session_id,
+        )
+        # Preserve the caller's thread id if the SDK didn't surface a fresh one.
+        if result.session_id is None:
+            result.session_id = session_id
+        return result
+
+    def resume_interactive(
+        self,
+        session_id: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+    ) -> InteractiveResult:
+        # No in-process interactive TUI over the SDK; hand off to the Codex CLI so the
+        # user still gets a terminal on the resumed thread.
+        return CodexBackend().resume_interactive(session_id, working_dir, env=env, model=model)
+
+    def _run_codex_sdk_query(
+        self,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None,
+        timeout: int | None,
+        env: dict[str, str] | None,
+        model: str | None,
+        resume_thread_id: str | None,
+    ) -> AgentResult:
+        if self._sdk is None:
+            raise RuntimeError(
+                "codex-sdk backend requires the OpenAI Codex Python SDK. Install with: pip install openai-codex-sdk"
+            )
+        # SDK wiring (Codex()/start_thread/resume_thread, run_streamed event drain,
+        # AgentResult mapping) lives in _drive_codex_sdk so it can be filled in and
+        # E2E-verified by a human once the SDK is installed; the contract shape above
+        # is what the runner depends on.
+        return self._drive_codex_sdk(
+            prompt=prompt,
+            working_dir=working_dir,
+            display_callback=display_callback,
+            timeout=timeout,
+            env=env,
+            model=model,
+            resume_thread_id=resume_thread_id,
+        )
+
+    def _drive_codex_sdk(
+        self,
+        prompt: str,
+        working_dir: str,
+        display_callback: Callable[[str], None] | None,
+        timeout: int | None,
+        env: dict[str, str] | None,
+        model: str | None,
+        resume_thread_id: str | None,
+    ) -> AgentResult:
+        raise NotImplementedError(
+            "CodexSDKBackend._drive_codex_sdk is not implemented yet. "
+            "Fill in the OpenAI Codex Python SDK thread loop (Codex().start_thread / "
+            "resume_thread, run_streamed event drain) and verify against "
+            "tests/test_e2e_codex.py before relying on this backend."
+        )
+
+
 def _extend_with_settings(cmd: list[str], hooks_config: dict[str, Any] | None) -> None:
     """Append `--settings <json>` to `cmd` when a Claude settings fragment is given.
 
@@ -806,10 +956,10 @@ def _extend_with_settings(cmd: list[str], hooks_config: dict[str, Any] | None) -
 def create_backend(name: str) -> Backend:
     """Factory to create a backend by name.
 
-    `claude-sdk` is opt-in and falls back to the subprocess `ClaudeBackend` when the
-    Claude Agent SDK isn't installed, so existing workflows never break. Set
-    `JUVENAL_BACKEND_SDK=1` to fail loud instead of falling back — for the human
-    verifying the SDK path.
+    `claude-sdk` and `codex-sdk` are opt-in and fall back to their subprocess backends
+    (`ClaudeBackend` / `CodexBackend`) when the corresponding SDK isn't installed, so
+    existing workflows never break. Set `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1`
+    to fail loud instead of falling back — for the human verifying the SDK path.
     """
     if name == "claude":
         return ClaudeBackend()
@@ -825,8 +975,18 @@ def create_backend(name: str) -> Backend:
                 "Claude Agent SDK is not installed. Install with: pip install claude-agent-sdk"
             )
         return ClaudeBackend()
+    elif name == "codex-sdk":
+        codex_sdk_backend = CodexSDKBackend()
+        if codex_sdk_backend.sdk_available:
+            return codex_sdk_backend
+        if os.environ.get("JUVENAL_BACKEND_CODEX_SDK", "0") == "1":
+            raise RuntimeError(
+                "backend 'codex-sdk' requested with JUVENAL_BACKEND_CODEX_SDK=1 but the "
+                "OpenAI Codex Python SDK is not installed. Install with: pip install openai-codex-sdk"
+            )
+        return CodexBackend()
     else:
-        raise ValueError(f"Unknown backend: {name!r}. Must be 'claude', 'claude-sdk', or 'codex'.")
+        raise ValueError(f"Unknown backend: {name!r}. Must be 'claude', 'claude-sdk', 'codex', or 'codex-sdk'.")
 
 
 def _parse_json_event(line: str) -> dict | None:

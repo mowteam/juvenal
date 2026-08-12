@@ -7,10 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from juvenal.backends import (
+    AgentResult,
     Backend,
     ClaudeBackend,
     ClaudeSDKBackend,
     CodexBackend,
+    CodexSDKBackend,
     InteractiveResult,
     _extend_with_settings,
     _extract_claude_tokens,
@@ -71,6 +73,131 @@ class TestCreateBackend:
         # never an error on the default path.
         backend = create_backend("claude-sdk")
         assert isinstance(backend, (ClaudeSDKBackend, ClaudeBackend))
+
+    def test_codex_sdk_returns_backend(self):
+        # Opt-in codex-sdk resolves to the SDK backend when installed, else falls
+        # back transparently to the subprocess CodexBackend — never an error on the
+        # default path (SDK not installed here).
+        backend = create_backend("codex-sdk")
+        assert isinstance(backend, (CodexSDKBackend, CodexBackend))
+
+    def test_codex_sdk_fail_loud_when_forced_without_sdk(self, monkeypatch):
+        # JUVENAL_BACKEND_CODEX_SDK=1 forces the SDK path; without the SDK installed
+        # it must raise rather than silently downgrade to subprocess.
+        monkeypatch.setenv("JUVENAL_BACKEND_CODEX_SDK", "1")
+        if CodexSDKBackend().sdk_available:
+            pytest.skip("Codex SDK installed; fail-loud path is exercised only when absent")
+        with pytest.raises(RuntimeError, match="openai-codex-sdk"):
+            create_backend("codex-sdk")
+
+
+class TestCodexSDKBackend:
+    """The codex-sdk backend is feature-flagged and only its SDK query loop
+    (_drive_codex_sdk) needs the real SDK. Everything else — name, contract
+    parity, the guarded seam — must hold offline without the SDK installed."""
+
+    def test_name(self):
+        assert CodexSDKBackend().name() == "codex-sdk"
+
+    def test_run_agent_signature_matches_codex_backend(self):
+        # The runner is backend-agnostic: codex-sdk must accept the same run_agent
+        # kwargs as the subprocess CodexBackend so a mixed run swaps cleanly.
+        import inspect
+
+        sdk_sig = inspect.signature(CodexSDKBackend().run_agent)
+        cli_sig = inspect.signature(CodexBackend().run_agent)
+        assert list(sdk_sig.parameters.keys()) == list(cli_sig.parameters.keys())
+
+    def test_resume_agent_signature_matches_codex_backend(self):
+        import inspect
+
+        sdk_sig = inspect.signature(CodexSDKBackend().resume_agent)
+        cli_sig = inspect.signature(CodexBackend().resume_agent)
+        assert list(sdk_sig.parameters.keys()) == list(cli_sig.parameters.keys())
+
+    def test_run_agent_without_sdk_raises_runtime_error(self):
+        backend = CodexSDKBackend()
+        if backend.sdk_available:
+            pytest.skip("Codex SDK installed; missing-SDK path not exercised")
+        with pytest.raises(RuntimeError, match="pip install openai-codex-sdk"):
+            backend.run_agent("hi", working_dir="/tmp")
+
+    def test_resume_agent_without_sdk_raises_runtime_error(self):
+        backend = CodexSDKBackend()
+        if backend.sdk_available:
+            pytest.skip("Codex SDK installed; missing-SDK path not exercised")
+        with pytest.raises(RuntimeError, match="pip install openai-codex-sdk"):
+            backend.resume_agent("thread-123", "hi", working_dir="/tmp")
+
+    def test_drive_codex_sdk_seam_is_not_implemented(self):
+        # With the SDK present, run_agent reaches the unimplemented drive seam;
+        # that boundary is where the human fills in + E2E-verifies the SDK loop.
+        backend = CodexSDKBackend()
+        if not backend.sdk_available:
+            backend._sdk = object()  # simulate SDK present to reach the seam
+        with pytest.raises(NotImplementedError, match="_drive_codex_sdk"):
+            backend.run_agent("hi", working_dir="/tmp")
+
+    def test_run_agent_folds_system_prompt_before_reaching_sdk(self):
+        # Codex has no system-prompt slot; the backend must fold it into the user
+        # message (it reaches the drive seam with the merged prompt).
+        backend = CodexSDKBackend()
+        backend._sdk = object()
+        captured = {}
+
+        def fake_drive(**kwargs):
+            captured.update(kwargs)
+            raise NotImplementedError("stub")
+
+        backend._drive_codex_sdk = fake_drive
+        with pytest.raises(NotImplementedError):
+            backend.run_agent("DYNAMIC", working_dir="/tmp", system_prompt="ROLE")
+        assert captured["prompt"] == "ROLE\n\nDYNAMIC"
+        assert captured["resume_thread_id"] is None
+
+    def test_resume_agent_passes_thread_id_to_drive(self):
+        backend = CodexSDKBackend()
+        backend._sdk = object()
+        captured = {}
+
+        def fake_drive(**kwargs):
+            captured.update(kwargs)
+            raise NotImplementedError("stub")
+
+        backend._drive_codex_sdk = fake_drive
+        with pytest.raises(NotImplementedError):
+            backend.resume_agent("thread-abc", "hi", working_dir="/tmp")
+        assert captured["resume_thread_id"] == "thread-abc"
+
+    def test_run_agent_returns_agent_result_contract(self):
+        # When the SDK loop is implemented it must return the same AgentResult
+        # fields the runner reads; this pins that contract via a stubbed drive.
+        backend = CodexSDKBackend()
+        backend._sdk = object()
+        backend._drive_codex_sdk = lambda **kwargs: AgentResult(
+            exit_code=0,
+            output="done",
+            transcript="t",
+            duration=0.1,
+            input_tokens=5,
+            output_tokens=7,
+            session_id="thread-xyz",
+        )
+        result = backend.run_agent("hi", working_dir="/tmp")
+        assert isinstance(result, AgentResult)
+        assert result.exit_code == 0
+        assert result.session_id == "thread-xyz"
+        assert result.input_tokens == 5
+        assert result.output_tokens == 7
+
+    def test_resume_agent_preserves_thread_id_when_sdk_returns_none(self):
+        backend = CodexSDKBackend()
+        backend._sdk = object()
+        backend._drive_codex_sdk = lambda **kwargs: AgentResult(
+            exit_code=0, output="", transcript="", duration=0.1, session_id=None
+        )
+        result = backend.resume_agent("thread-keep", "hi", working_dir="/tmp")
+        assert result.session_id == "thread-keep"
 
 
 class TestParseJsonEvent:
