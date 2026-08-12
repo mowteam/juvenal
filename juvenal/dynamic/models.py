@@ -172,6 +172,9 @@ class ClaimRecord:
     # Reporter session id, persisted so a reporter that crashed mid-call (rate
     # limit, Ctrl-C) is resumed on the next retry rather than cold-restarted.
     reporter_session_id: str | None = None
+    exploit_category: str = "sim_inconclusive"
+    exploit_sim_id: str | None = None
+    exploit_sim_attempted: bool = False
 
 
 @dataclass
@@ -289,6 +292,58 @@ class AttackSurfaceState:
 
 
 @dataclass
+class SimulationEnvState:
+    """Persisted state for the exploit-simulation environment builder.
+
+    Status lifecycle: ``pending`` → ``running`` → ``ready`` | ``failed``.
+    On resume, ``running`` is reset to ``pending`` (so an interrupted env build
+    re-attempts), while ``ready`` and ``failed`` are sticky.
+    """
+
+    status: Literal["pending", "running", "ready", "failed"] = "pending"
+    brief: str | None = None
+    artifact_path: str | None = None
+    instantiate_script: str | None = None
+    error: str | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+    duration_seconds: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    session_id: str | None = None
+    backend: str | None = None
+    model: str | None = None
+
+
+@dataclass
+class ExploitSimRecord:
+    """Result of an exploit-simulation attempt for a verified claim.
+
+    Categories are mutually exclusive; ``exploit_unconfirmed``,
+    ``sim_inconclusive``, and ``sim_error`` all leave the claim verified.
+    """
+
+    claim_id: str
+    exploit_sim_id: str
+    category: Literal[
+        "exploit_confirmed",
+        "exploit_confirmed_nondefault",
+        "exploit_unconfirmed",
+        "sim_inconclusive",
+        "sim_error",
+    ]
+    config_deltas: list[str] = field(default_factory=list)
+    transcript_refs: list[str] = field(default_factory=list)
+    env_mode: str = "default"
+    attempts: int = 0
+    started_at: float | None = None
+    completed_at: float | None = None
+    duration_seconds: float | None = None
+    error: str | None = None
+    raw_output: str = ""
+
+
+@dataclass
 class CaptainDelta:
     verified_claim_ids: list[str]
     rejected_claim_ids: list[str]
@@ -309,8 +364,10 @@ __all__ = [
     "ClaimRecord",
     "CodeLocation",
     "DynamicEvent",
+    "ExploitSimRecord",
     "ProposedClaim",
     "RunControl",
+    "SimulationEnvState",
     "TargetProposal",
     "TargetRecord",
     "UserDirective",
