@@ -119,6 +119,9 @@ class MockBackend(Backend):
         # the system-prompt routing. resume_agent calls don't capture this
         # (system prompt is fixed at session creation).
         self.system_prompt_calls: list[tuple[str | None, str | None]] = []
+        # Each run_agent / resume_agent call records (role, hooks_config) so tests
+        # can assert per-role guardrail plumbing without a live CLI.
+        self.hooks_config_calls: list[tuple[str | None, dict | None]] = []
 
     def add_role_chunks(self, role: str, chunks: list[str]) -> None:
         """Queue a list of streaming chunks delivered to the next display_callback
@@ -256,12 +259,14 @@ class MockBackend(Backend):
         model=None,
         system_prompt=None,
         session_id=None,
+        hooks_config=None,
     ):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
         self.role_calls.append((role, prompt))
         self.model_calls.append((role, model))
         self.system_prompt_calls.append((role, system_prompt))
+        self.hooks_config_calls.append((role, hooks_config))
         self._consume_side_effect(role, prompt, env)
         self._emit_chunks(role, display_callback)
         result = self._next_result(role)
@@ -269,11 +274,22 @@ class MockBackend(Backend):
             result.session_id = session_id
         return result
 
-    def resume_agent(self, session_id, prompt, working_dir, display_callback=None, timeout=None, env=None, model=None):
+    def resume_agent(
+        self,
+        session_id,
+        prompt,
+        working_dir,
+        display_callback=None,
+        timeout=None,
+        env=None,
+        model=None,
+        hooks_config=None,
+    ):
         role = self._detect_role(prompt, env)
         self.resume_calls.append((session_id, prompt))
         self.role_calls.append((role, prompt))
         self.model_calls.append((role, model))
+        self.hooks_config_calls.append((role, hooks_config))
         self._consume_side_effect(role, prompt, env)
         self._emit_chunks(role, display_callback)
         return self._next_result(role)

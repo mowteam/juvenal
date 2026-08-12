@@ -11,6 +11,7 @@ from juvenal.backends import (
     ClaudeBackend,
     CodexBackend,
     InteractiveResult,
+    _extend_with_settings,
     _extract_claude_tokens,
     _extract_codex_tokens,
     _parse_json_event,
@@ -413,3 +414,73 @@ class TestSystemPromptRouting:
         # No argv entry may be the giant prompt.
         for entry in cmd:
             assert big_prompt not in entry
+
+
+def _cmd_from(popen):
+    return popen.call_args.args[0] if popen.call_args.args else popen.call_args.kwargs["args"]
+
+
+class TestSettingsInjection:
+    """hooks_config rides into the Claude CLI as a `--settings <json>` fragment.
+    The confirmed CLI mechanism is `--settings` (accepts an inline JSON string
+    merged over on-disk settings); role guardrails are `permissions.deny` globs."""
+
+    def test_extend_with_settings_appends_json(self):
+        cmd = ["claude"]
+        _extend_with_settings(cmd, {"permissions": {"deny": ["Write(//x/**)"]}})
+        assert "--settings" in cmd
+        payload = cmd[cmd.index("--settings") + 1]
+        import json
+
+        assert json.loads(payload) == {"permissions": {"deny": ["Write(//x/**)"]}}
+
+    def test_extend_with_settings_noop_when_none(self):
+        cmd = ["claude"]
+        _extend_with_settings(cmd, None)
+        assert "--settings" not in cmd
+
+    def test_extend_with_settings_noop_when_empty(self):
+        cmd = ["claude"]
+        _extend_with_settings(cmd, {})
+        assert "--settings" not in cmd
+
+    def test_claude_run_agent_passes_hooks_config_as_settings(self, tmp_path):
+        backend = ClaudeBackend()
+        hooks = {"permissions": {"deny": ["Write(//out/**)"]}}
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent("hi", working_dir=str(tmp_path), hooks_config=hooks)
+        cmd = _cmd_from(popen)
+        assert "--settings" in cmd
+        import json
+
+        assert json.loads(cmd[cmd.index("--settings") + 1]) == hooks
+
+    def test_claude_run_agent_omits_settings_when_no_hooks(self, tmp_path):
+        backend = ClaudeBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent("hi", working_dir=str(tmp_path))
+        assert "--settings" not in _cmd_from(popen)
+
+    def test_claude_resume_agent_reapplies_hooks_config(self, tmp_path):
+        backend = ClaudeBackend()
+        hooks = {"permissions": {"deny": ["Edit"]}}
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.resume_agent(
+                "1d3f0c80-3a0b-4f0c-bfba-5b18e3f9a1e2",
+                "hi",
+                working_dir=str(tmp_path),
+                hooks_config=hooks,
+            )
+        cmd = _cmd_from(popen)
+        assert "--settings" in cmd
+
+    def test_codex_run_agent_ignores_hooks_config(self, tmp_path):
+        backend = CodexBackend()
+        with patch("juvenal.backends.subprocess.Popen", return_value=_stub_popen()) as popen:
+            backend.run_agent(
+                "hi",
+                working_dir=str(tmp_path),
+                hooks_config={"permissions": {"deny": ["Write"]}},
+            )
+        # Codex has no settings-injection equivalent; the flag must not appear.
+        assert "--settings" not in _cmd_from(popen)

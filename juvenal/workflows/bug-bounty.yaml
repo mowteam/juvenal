@@ -153,10 +153,11 @@ phases:
       at parser.c:142") — the verifier will attempt to run it. A claim with no PoC is incomplete:
       report `confidence: low` with a `reasoning` note explaining why.
 
-      **Output:** workers do NOT write under `output/`. The runner gives each
-      worker a private scratch directory under `.juvenal/scratch/<task_id>/` —
-      that is the only place a worker may drop PoC artifacts (a `poc` script,
-      crash log, payload bytes, etc.). On `no_findings` or `blocked`, write
+      **Output:** the runner gives each worker a private scratch directory
+      under `.juvenal/scratch/<task_id>/` for PoC artifacts (a `poc` script,
+      crash log, payload bytes, etc.). Writes under `output/` are blocked for
+      workers at the CLI level via a PreToolUse guardrail, so a worker cannot
+      touch that tree even by accident. On `no_findings` or `blocked`, write
       nothing to disk; just return the structured JSON.
 
       The `output/` tree is owned by the reporter agent. After every verifier
@@ -355,13 +356,15 @@ phases:
         verifier will attempt to run it. A claim with no PoC is incomplete;
         report `confidence: low` with a `reasoning` note explaining why.
 
-        ## Output — the `output/` tree is OFF LIMITS to workers
+        ## Output — write PoC artifacts to your scratch directory
 
         The runner gives you a private scratch directory in your task
         packet at `scratch_dir` (under `.juvenal/scratch/<task_id>/`).
-        That is the ONLY place a worker may write files. Never create
-        anything under `output/` — that path is reserved for the
-        reporter agent, which runs after every verifier passes.
+        Write your PoC artifacts there. The `output/` tree is reserved
+        for the reporter agent (which runs after every verifier passes);
+        the runner enforces this with a CLI PreToolUse guardrail that
+        denies writes under `output/`, so you don't need to police it
+        yourself — just keep artifacts in `scratch_dir`.
 
         For an `outcome: claims` response, drop your PoC artifacts in
         `scratch_dir`:
@@ -1134,8 +1137,10 @@ phases:
           `report.md` exists in the report directory; if it does not, you
           will be retried.
 
-          Do NOT modify project source code. Treat the repository as
-          read-only except for the report directory the runner gives you.
+          Treat the repository as read-only except for the report directory
+          the runner gives you, and do not modify project source. The worker
+          scratch directory is enforced read-only for you by a CLI PreToolUse
+          guardrail — copy artifacts out of it, don't edit them.
 
           The report should be brief but complete:
           - **Title**: one-line summary, suitable for a bug-bounty submission.

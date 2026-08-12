@@ -2352,6 +2352,7 @@ class DynamicAnalysisRunner:
     ) -> _WorkerExecutionResult:
         backend = self._get_backend(self.config.worker_backend)
         worker_model = _resolve_model(self.config.worker_backend, "worker", self.config.worker_model)
+        hooks_config = self._hooks_for_role("worker")
         parent_session_id = attempt.parent_session_id
         cold_restart = False
         if parent_session_id and self._session_is_stale(parent_session_id):
@@ -2384,6 +2385,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("worker"),
                 model=worker_model,
+                hooks_config=hooks_config,
             )
         else:
             # On cold-restart, drop the (stale) attempt.session_id and let the
@@ -2400,6 +2402,7 @@ class DynamicAnalysisRunner:
                 model=worker_model,
                 system_prompt=system_prompt,
                 session_id=effective_session_id,
+                hooks_config=hooks_config,
             )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -2438,6 +2441,7 @@ class DynamicAnalysisRunner:
     ) -> _VerifierExecutionResult:
         backend = self._get_backend(verification.backend)
         spec = self._verifier_chain[verification.verifier_index]
+        hooks_config = self._hooks_for_role("verifier")
         parent_session_id = verification.parent_session_id
         cold_restart = False
         if parent_session_id and self._session_is_stale(parent_session_id):
@@ -2457,6 +2461,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("verifier", verifier_name=verification.verifier_name),
                 model=_resolve_model(spec.backend, "verifier", spec.model),
+                hooks_config=hooks_config,
             )
         else:
             # See _execute_worker_attempt for why cold_restart drops session_id.
@@ -2469,6 +2474,7 @@ class DynamicAnalysisRunner:
                 model=_resolve_model(spec.backend, "verifier", spec.model),
                 system_prompt=system_prompt,
                 session_id=effective_session_id,
+                hooks_config=hooks_config,
             )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -3161,6 +3167,9 @@ class DynamicAnalysisRunner:
         spec_backend = self._reporter_spec.backend if self._reporter_spec else "claude"
         spec_model = self._reporter_spec.model if self._reporter_spec else None
         backend = self._get_backend(spec_backend)
+        worker_attempt = self.state.worker_attempts.get(claim.attempt_id)
+        scratch_dir = self._scratch_dir_for_attempt(worker_attempt) if worker_attempt is not None else None
+        hooks_config = self._hooks_for_role("reporter", scratch_dir=scratch_dir)
         if is_retry and claim.reporter_session_id:
             result = backend.resume_agent(
                 claim.reporter_session_id,
@@ -3169,6 +3178,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("reporter"),
                 model=_resolve_model(spec_backend, "reporter", spec_model),
+                hooks_config=hooks_config,
             )
         else:
             result = backend.run_agent(
@@ -3179,6 +3189,7 @@ class DynamicAnalysisRunner:
                 model=_resolve_model(spec_backend, "reporter", spec_model),
                 system_prompt=system_prompt,
                 session_id=claim.reporter_session_id,
+                hooks_config=hooks_config,
             )
         if result.exit_code != 0:
             return _ReporterExecutionResult(
@@ -4978,3 +4989,17 @@ class DynamicAnalysisRunner:
         if role == "verifier" and verifier_name:
             env["JUVENAL_ANALYSIS_VERIFIER_NAME"] = verifier_name
         return env
+
+    def _hooks_for_role(self, role: str, *, scratch_dir: Path | None = None) -> dict[str, Any] | None:
+        """Per-role `--settings` fragment enforcing write guardrails (`//abs/**` deny globs)."""
+        output_dir = self.working_dir / "output"
+        if role in ("worker", "verifier"):
+            # output/ is the reporter's tree. Verifier source writes stay open —
+            # the poc verifier builds/runs harnesses in-tree, so a broader deny
+            # would also block the sanitizer build it needs to reproduce a claim.
+            deny = [f"Write(//{output_dir}/**)", f"Edit(//{output_dir}/**)"]
+            return {"permissions": {"deny": deny}}
+        if role == "reporter" and scratch_dir is not None:
+            deny = [f"Write(//{scratch_dir}/**)", f"Edit(//{scratch_dir}/**)"]
+            return {"permissions": {"deny": deny}}
+        return None

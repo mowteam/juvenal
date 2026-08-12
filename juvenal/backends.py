@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 
 @dataclass
@@ -91,6 +92,7 @@ class Backend(ABC):
         model: str | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         """Run an agent with the given prompt. Returns AgentResult.
 
@@ -110,6 +112,12 @@ class Backend(ABC):
         Ctrl-C or crash mid-call. When ``None`` the backend generates one.
         Backends that don't accept an externally chosen session id may ignore
         this argument.
+
+        ``hooks_config`` is an optional Claude Code settings fragment (e.g.
+        ``{"permissions": {"deny": ["Write(//abs/**)"]}}``) enforcing role-based
+        tool-use guardrails at the CLI level. The Claude backend passes it to the
+        CLI via ``--settings``; backends without a settings-injection mechanism
+        ignore it.
         """
         ...
 
@@ -122,14 +130,18 @@ class Backend(ABC):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         model: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         """Resume an existing agent session. Default falls back to run_agent.
 
         Resumed sessions inherit the system prompt set at the original
         ``run_agent`` call; resume callers must not pass ``system_prompt``
-        themselves.
+        themselves. ``hooks_config`` is re-applied on resume because CLI
+        ``--settings`` are per-invocation, not persisted with the session.
         """
-        return self.run_agent(prompt, working_dir, display_callback, timeout, env, model=model)
+        return self.run_agent(
+            prompt, working_dir, display_callback, timeout, env, model=model, hooks_config=hooks_config
+        )
 
     def run_interactive(
         self,
@@ -241,6 +253,7 @@ class ClaudeBackend(Backend):
         model: str | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         if session_id is None:
             session_id = str(uuid.uuid4())
@@ -254,6 +267,7 @@ class ClaudeBackend(Backend):
             "--session-id",
             session_id,
         ]
+        _extend_with_settings(cmd, hooks_config)
         if model:
             cmd.extend(["--model", model])
         # When a system_prompt is provided, write it to a file under
@@ -286,6 +300,7 @@ class ClaudeBackend(Backend):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         model: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         cmd = [
             "claude",
@@ -297,6 +312,7 @@ class ClaudeBackend(Backend):
             "--resume",
             session_id,
         ]
+        _extend_with_settings(cmd, hooks_config)
         if model:
             cmd.extend(["--model", model])
         result = self._run_claude_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
@@ -481,10 +497,12 @@ class CodexBackend(Backend):
         model: str | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         # Codex assigns its own thread_id post-hoc; the externally chosen
         # session_id parameter is accepted for interface parity and ignored.
-        del session_id
+        # Codex has no Claude-settings equivalent, so hooks_config is a no-op.
+        del session_id, hooks_config
         # Codex does not currently expose a separate system-prompt slot; if a
         # caller passes one, fold it into the user message so the content is
         # not silently dropped.
@@ -512,7 +530,9 @@ class CodexBackend(Backend):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         model: str | None = None,
+        hooks_config: dict[str, Any] | None = None,
     ) -> AgentResult:
+        del hooks_config  # Codex has no Claude-settings equivalent.
         cmd = [
             "npx",
             "@openai/codex@latest",
@@ -625,6 +645,16 @@ class CodexBackend(Backend):
             output_tokens=total_output_tokens,
             session_id=thread_id,
         )
+
+
+def _extend_with_settings(cmd: list[str], hooks_config: dict[str, Any] | None) -> None:
+    """Append `--settings <json>` to `cmd` when a Claude settings fragment is given.
+
+    The Claude CLI's `--settings` flag accepts an inline JSON string and merges it
+    over on-disk settings; role guardrails ride in as `{"permissions": {"deny": [...]}}`.
+    """
+    if hooks_config:
+        cmd.extend(["--settings", json.dumps(hooks_config)])
 
 
 def create_backend(name: str) -> Backend:

@@ -2793,3 +2793,85 @@ def test_sweep_dead_dep_targets_respects_pending_retry_queue(tmp_path):
 
     assert progressed is False
     assert runner.state.targets[dependent.target_id].status == "queued"
+
+
+def _bare_runner(tmp_path, backend=None):
+    """Construct a runner without running it, for direct method-level assertions."""
+    backend = backend or MockBackend()
+    phase = Phase(id="analyze", type="analysis", prompt="x", analysis=AnalysisConfig())
+    workflow = Workflow(name="x", phases=[phase], working_dir=str(tmp_path))
+    state_file = tmp_path / "state.json"
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        return DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=False,
+        )
+
+
+class TestHooksForRole:
+    def test_worker_denies_output_writes(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        cfg = runner._hooks_for_role("worker")
+        deny = cfg["permissions"]["deny"]
+        output_dir = runner.working_dir / "output"
+        assert f"Write(//{output_dir}/**)" in deny
+        assert f"Edit(//{output_dir}/**)" in deny
+
+    def test_verifier_denies_output_writes(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        cfg = runner._hooks_for_role("verifier")
+        deny = cfg["permissions"]["deny"]
+        output_dir = runner.working_dir / "output"
+        assert f"Write(//{output_dir}/**)" in deny
+        # Verifier must remain able to build/run a PoC in-tree, so source writes
+        # are NOT denied — only the reporter-owned output/ tree is off-limits.
+        assert "Write" not in deny
+        assert "Edit" not in deny
+
+    def test_reporter_denies_scratch_writes_but_not_report_dir(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        scratch = tmp_path / ".juvenal" / "scratch" / "task-1"
+        cfg = runner._hooks_for_role("reporter", scratch_dir=scratch)
+        deny = cfg["permissions"]["deny"]
+        assert f"Write(//{scratch}/**)" in deny
+        assert f"Edit(//{scratch}/**)" in deny
+        # The report dir itself is never denied.
+        report_dir = runner.working_dir / "output"
+        assert not any(str(report_dir) in rule and "scratch" not in rule for rule in deny)
+
+    def test_reporter_without_scratch_is_unrestricted(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        assert runner._hooks_for_role("reporter", scratch_dir=None) is None
+
+    def test_captain_and_analyst_unrestricted(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        assert runner._hooks_for_role("captain") is None
+        assert runner._hooks_for_role("analyst") is None
+
+
+def test_worker_dispatch_passes_hooks_config_to_backend(tmp_path):
+    """The runner threads the worker guardrail through to the backend call."""
+    backend = MockBackend()
+    runner = _bare_runner(tmp_path, backend=backend)
+    # _get_backend caches per name; seed it so the dispatch call routes to the mock.
+    runner._backend_by_name[runner.config.worker_backend] = backend
+    attempt = WorkerAttempt(
+        attempt_id="task-1",
+        target_id="t1",
+        generation=0,
+        backend="claude",
+        session_id="sess-1",
+        status="queued",
+        started_at=None,
+        completed_at=None,
+    )
+    runner._execute_worker_attempt(attempt, "prompt body", system_prompt="sys")
+    worker_calls = [(role, cfg) for role, cfg in backend.hooks_config_calls if cfg is not None]
+    assert worker_calls, "worker call did not carry a hooks_config"
+    _, cfg = worker_calls[-1]
+    output_dir = runner.working_dir / "output"
+    assert f"Write(//{output_dir}/**)" in cfg["permissions"]["deny"]
