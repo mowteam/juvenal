@@ -95,6 +95,31 @@ def _format_claim_chain_progress(claim, dss, reporter_configured: bool) -> str:
     return ""
 
 
+# Short per-claim labels for exploit-sim categories in `juvenal status` detail.
+_EXPLOIT_CATEGORY_LABELS = {
+    "exploit_confirmed": "confirmed",
+    "exploit_confirmed_nondefault": "confirmed(non-default)",
+    "exploit_unconfirmed": "unconfirmed",
+    "sim_inconclusive": "inconclusive",
+    "sim_error": "error",
+}
+
+
+def _format_claim_exploit_label(claim) -> str:
+    """Short exploit-sim outcome for a single claim, or "" when not attempted.
+
+    Only surfaced when exploit-sim actually ran for this claim
+    (``exploit_sim_attempted`` or a non-default category), so status output for
+    workflows without exploit-sim stays clean.
+    """
+    attempted = getattr(claim, "exploit_sim_attempted", False)
+    category = getattr(claim, "exploit_category", None) or "sim_inconclusive"
+    if not attempted and category == "sim_inconclusive":
+        return ""
+    label = _EXPLOIT_CATEGORY_LABELS.get(category, category)
+    return f"exploit: {label}"
+
+
 @dataclass
 class PhaseState:
     """State for a single phase."""
@@ -529,7 +554,12 @@ class PipelineState:
                 claim_style = _claim_styles.get(claim.status, "dim")
                 retry_text = f" retry {claim.retry_count}" if claim.retry_count > 0 else ""
                 chain_text = _format_claim_chain_progress(claim, dss, reporter_configured)
-                trailing = retry_text + (f" · {chain_text}" if chain_text else "")
+                exploit_text = _format_claim_exploit_label(claim)
+                trailing = (
+                    retry_text
+                    + (f" · {chain_text}" if chain_text else "")
+                    + (f" · {exploit_text}" if exploit_text else "")
+                )
                 detail.add_row(
                     f"  [dim]{claim.summary[:45]}[/dim]",
                     f"[{claim_style}]{claim.status}[/]",
