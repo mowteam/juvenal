@@ -766,7 +766,7 @@ class ClaudeSDKBackend(Backend):
                     if isinstance(message.api_error_status, int):
                         rate_limit_status = message.api_error_status
                     usage = message.usage or {}
-                    total_input_tokens += int(usage.get("input_tokens", 0) or 0)
+                    total_input_tokens += _claude_input_tokens(usage)
                     total_output_tokens += int(usage.get("output_tokens", 0) or 0)
                     if message.result:
                         result_text = message.result
@@ -1442,12 +1442,26 @@ def _process_codex_event(event: dict) -> tuple[str, str]:
     return "", ""
 
 
+def _claude_input_tokens(usage: dict) -> int:
+    """Total Claude input tokens including cache reads/creation.
+
+    Anthropic reports cache_read_input_tokens / cache_creation_input_tokens
+    separately from the non-cached input_tokens; all three are billed input, so
+    counting only input_tokens badly under-reports cost on cached turns.
+    """
+    return (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+    )
+
+
 def _extract_claude_tokens(event: dict) -> tuple[int, int]:
     """Extract token usage from a Claude event. Returns (input_tokens, output_tokens)."""
     if event.get("type") == "result":
         usage = event.get("usage", {})
         if usage:
-            return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+            return _claude_input_tokens(usage), int(usage.get("output_tokens", 0) or 0)
     return 0, 0
 
 

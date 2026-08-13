@@ -14,6 +14,7 @@ from juvenal.backends import (
     CodexBackend,
     CodexSDKBackend,
     InteractiveResult,
+    _claude_input_tokens,
     _extend_with_settings,
     _extract_claude_tokens,
     _extract_codex_tokens,
@@ -547,6 +548,24 @@ class TestExtractClaudeTokens:
 
     def test_non_result_event(self):
         assert _extract_claude_tokens({"type": "assistant", "usage": {"input_tokens": 100}}) == (0, 0)
+
+    def test_input_counts_cache_read_and_creation(self):
+        # Anthropic reports cached input separately; all three are billed input.
+        event = {
+            "type": "result",
+            "usage": {
+                "input_tokens": 6,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 200,
+                "output_tokens": 50,
+            },
+        }
+        assert _extract_claude_tokens(event) == (1206, 50)
+
+    def test_claude_input_tokens_helper_tolerates_missing_cache_fields(self):
+        assert _claude_input_tokens({"input_tokens": 10}) == 10
+        assert _claude_input_tokens({"input_tokens": 6, "cache_read_input_tokens": 1000}) == 1006
+        assert _claude_input_tokens({}) == 0
 
 
 class TestExtractCodexTokens:
