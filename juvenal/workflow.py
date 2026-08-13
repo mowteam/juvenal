@@ -371,6 +371,55 @@ class AnalystSpec:
 
 
 @dataclass
+class EnvBuilderSpec:
+    """Environment builder: runs once, persists artifact + instantiate script."""
+
+    backend: str = "claude"
+    model: str | None = None
+    prompt: str = ""
+
+
+@dataclass
+class SimulatorSpec:
+    """Simulator: instantiates a fresh env copy per claim, handles config requests."""
+
+    backend: str = "claude"
+    model: str | None = None
+    prompt: str = ""
+
+
+@dataclass
+class AttackerSpec:
+    """Attacker: runs a verified PoC against the simulator-managed env."""
+
+    backend: str = "claude"
+    model: str | None = None
+    prompt: str = ""
+
+
+@dataclass
+class ExploitJudgeSpec:
+    """Exploit judge: reads transcript + config-delta log, categorizes the finding."""
+
+    backend: str = "claude"
+    model: str | None = None
+    prompt: str = ""
+
+
+@dataclass
+class ExploitSimSpec:
+    """Nested configuration block for the non-gating exploit-sim stage."""
+
+    enabled: bool = True
+    env_builder: EnvBuilderSpec = field(default_factory=EnvBuilderSpec)
+    simulator: SimulatorSpec = field(default_factory=SimulatorSpec)
+    attacker: AttackerSpec = field(default_factory=AttackerSpec)
+    judge: ExploitJudgeSpec = field(default_factory=ExploitJudgeSpec)
+    max_exchange_rounds: int = 5
+    max_attempts: int = 1
+
+
+@dataclass
 class AnalysisConfig:
     """Configuration for a dynamic analysis phase."""
 
@@ -397,6 +446,12 @@ class AnalysisConfig:
     max_worker_retries: int = 2
     max_captain_repairs: int = 2
     allow_repo_tools: bool = True
+    # When True (default), each worker fans out into its own backend subagents
+    # (Claude Agent tool / Codex native spawn) to explore multiple hypotheses in
+    # parallel before synthesizing its single WORKER_JSON result. Codex degrades
+    # to a strong single-pass when its backend lacks real subagent spawning. The
+    # worker's loop position and one-WORKER_JSON output contract are unchanged.
+    worker_dynamic_workflow: bool = True
     max_consecutive_errors: int = 5
     # Rate-limit backoff knobs.
     # `max_single_backoff_seconds`: cap on any individual sleep (default 1h).
@@ -413,10 +468,11 @@ class AnalysisConfig:
     verifiers: list[VerifierSpec] = field(default_factory=list)
     reporter: ReporterSpec | None = None
     analyst: AnalystSpec | None = None
+    exploit_sim: ExploitSimSpec | None = None
     worker_prompt: str = ""
 
 
-_ANALYSIS_BACKENDS = {"claude", "codex"}
+_ANALYSIS_BACKENDS = {"claude", "claude-sdk", "codex", "codex-sdk"}
 _ANALYSIS_CONFIG_KEYS = {
     "captain_backend",
     "captain_model",
@@ -432,6 +488,7 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_worker_retries",
     "max_captain_repairs",
     "allow_repo_tools",
+    "worker_dynamic_workflow",
     "max_consecutive_errors",
     "max_single_backoff_seconds",
     "max_total_backoff_seconds",
@@ -442,12 +499,26 @@ _ANALYSIS_CONFIG_KEYS = {
     "verifiers",
     "reporter",
     "analyst",
+    "exploit_sim",
     "worker_prompt",
 }
 _VERIFIER_SPEC_KEYS = {"name", "backend", "model", "prompt", "prompt_file", "use_attack_surface_subagent"}
 _VERIFIER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _REPORTER_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
 _ANALYST_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file", "enabled", "max_duration_seconds"}
+_ENV_BUILDER_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
+_SIMULATOR_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
+_ATTACKER_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
+_EXPLOIT_JUDGE_SPEC_KEYS = {"backend", "model", "prompt", "prompt_file"}
+_EXPLOIT_SIM_SPEC_KEYS = {
+    "enabled",
+    "env_builder",
+    "simulator",
+    "attacker",
+    "judge",
+    "max_exchange_rounds",
+    "max_attempts",
+}
 
 
 def _parse_analysis_backend(value: Any, *, phase_id: str, field_name: str) -> str:
@@ -686,6 +757,97 @@ def _parse_analyst_spec(
     )
 
 
+def _parse_exploit_sim_config(
+    raw: Any,
+    *,
+    phase_id: str,
+    default_backend: str,
+    default_model: str | None,
+    yaml_path: Path | None,
+) -> ExploitSimSpec:
+    """Validate and load the analysis.exploit_sim block."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Phase '{phase_id}': analysis.exploit_sim must be a mapping")
+    unknown = set(raw.keys()) - _EXPLOIT_SIM_SPEC_KEYS
+    if unknown:
+        raise ValueError(f"Phase '{phase_id}': analysis.exploit_sim has unknown keys {sorted(unknown)}")
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"Phase '{phase_id}': analysis.exploit_sim.enabled must be a boolean")
+
+    def _parse_role_spec(raw_spec: Any, role_name: str, spec_keys: set[str]) -> tuple[str, str | None, str]:
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"Phase '{phase_id}': analysis.exploit_sim.{role_name} must be a mapping")
+        unknown_keys = set(raw_spec.keys()) - spec_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Phase '{phase_id}': analysis.exploit_sim.{role_name} has unknown keys {sorted(unknown_keys)}"
+            )
+        backend = _parse_analysis_backend(
+            raw_spec.get("backend", default_backend),
+            phase_id=phase_id,
+            field_name=f"exploit_sim.{role_name}.backend",
+        )
+        model = _parse_optional_model(
+            raw_spec.get("model", default_model),
+            phase_id=phase_id,
+            field_name=f"exploit_sim.{role_name}.model",
+        )
+        has_prompt = "prompt" in raw_spec
+        has_prompt_file = "prompt_file" in raw_spec
+        if has_prompt and has_prompt_file:
+            raise ValueError(
+                f"Phase '{phase_id}': analysis.exploit_sim.{role_name} cannot set both prompt and prompt_file"
+            )
+        if has_prompt_file:
+            prompt_file = raw_spec["prompt_file"]
+            if not isinstance(prompt_file, str) or not prompt_file:
+                raise ValueError(
+                    f"Phase '{phase_id}': analysis.exploit_sim.{role_name}.prompt_file must be a non-empty string"
+                )
+            if yaml_path is None:
+                raise ValueError(
+                    f"Phase '{phase_id}': analysis.exploit_sim.{role_name}.prompt_file is unsupported in this context"
+                )
+            prompt = (yaml_path / prompt_file).read_text()
+        else:
+            prompt = raw_spec.get("prompt", "")
+            if not isinstance(prompt, str):
+                raise ValueError(f"Phase '{phase_id}': analysis.exploit_sim.{role_name}.prompt must be a string")
+        return backend, model, prompt
+
+    eb_backend, eb_model, eb_prompt = _parse_role_spec(
+        raw.get("env_builder", {}), "env_builder", _ENV_BUILDER_SPEC_KEYS
+    )
+    sim_backend, sim_model, sim_prompt = _parse_role_spec(raw.get("simulator", {}), "simulator", _SIMULATOR_SPEC_KEYS)
+    att_backend, att_model, att_prompt = _parse_role_spec(raw.get("attacker", {}), "attacker", _ATTACKER_SPEC_KEYS)
+    judge_backend, judge_model, judge_prompt = _parse_role_spec(raw.get("judge", {}), "judge", _EXPLOIT_JUDGE_SPEC_KEYS)
+
+    max_exchange_rounds = _parse_analysis_int(
+        raw.get("max_exchange_rounds", ExploitSimSpec().max_exchange_rounds),
+        phase_id=phase_id,
+        field_name="exploit_sim.max_exchange_rounds",
+        minimum=1,
+    )
+    max_attempts = _parse_analysis_int(
+        raw.get("max_attempts", ExploitSimSpec().max_attempts),
+        phase_id=phase_id,
+        field_name="exploit_sim.max_attempts",
+        minimum=1,
+    )
+
+    return ExploitSimSpec(
+        enabled=enabled,
+        env_builder=EnvBuilderSpec(backend=eb_backend, model=eb_model, prompt=eb_prompt),
+        simulator=SimulatorSpec(backend=sim_backend, model=sim_model, prompt=sim_prompt),
+        attacker=AttackerSpec(backend=att_backend, model=att_model, prompt=att_prompt),
+        judge=ExploitJudgeSpec(backend=judge_backend, model=judge_model, prompt=judge_prompt),
+        max_exchange_rounds=max_exchange_rounds,
+        max_attempts=max_attempts,
+    )
+
+
 def _parse_analysis_config(
     raw: dict[str, Any] | None, *, phase_id: str, yaml_path: Path | None = None
 ) -> AnalysisConfig | None:
@@ -755,6 +917,9 @@ def _parse_analysis_config(
     allow_repo_tools = raw.get("allow_repo_tools", defaults.allow_repo_tools)
     if not isinstance(allow_repo_tools, bool):
         raise ValueError(f"Phase '{phase_id}': analysis.allow_repo_tools must be a boolean")
+    worker_dynamic_workflow = raw.get("worker_dynamic_workflow", defaults.worker_dynamic_workflow)
+    if not isinstance(worker_dynamic_workflow, bool):
+        raise ValueError(f"Phase '{phase_id}': analysis.worker_dynamic_workflow must be a boolean")
     max_consecutive_errors = _parse_analysis_int(
         raw.get("max_consecutive_errors", defaults.max_consecutive_errors),
         phase_id=phase_id,
@@ -831,6 +996,16 @@ def _parse_analysis_config(
             yaml_path=yaml_path,
         )
 
+    exploit_sim: ExploitSimSpec | None = None
+    if "exploit_sim" in raw:
+        exploit_sim = _parse_exploit_sim_config(
+            raw["exploit_sim"],
+            phase_id=phase_id,
+            default_backend=captain_backend,
+            default_model=None,
+            yaml_path=yaml_path,
+        )
+
     return AnalysisConfig(
         captain_backend=captain_backend,
         worker_backend=worker_backend,
@@ -846,6 +1021,7 @@ def _parse_analysis_config(
         max_worker_retries=max_worker_retries,
         max_captain_repairs=max_captain_repairs,
         allow_repo_tools=allow_repo_tools,
+        worker_dynamic_workflow=worker_dynamic_workflow,
         max_consecutive_errors=max_consecutive_errors,
         max_single_backoff_seconds=max_single_backoff_seconds,
         max_total_backoff_seconds=max_total_backoff_seconds,
@@ -856,6 +1032,7 @@ def _parse_analysis_config(
         verifiers=verifiers,
         reporter=reporter,
         analyst=analyst,
+        exploit_sim=exploit_sim,
         worker_prompt=worker_prompt,
     )
 

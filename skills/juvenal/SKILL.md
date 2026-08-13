@@ -112,6 +112,7 @@ juvenal run task.md
 | `implement` | Agent executes a prompt to build/modify code (default) |
 | `check` | Separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason` |
 | `workflow` | Sub-workflow: dynamic (from prompt) or static (from file/dir) |
+| `analysis` | Dynamic captain/worker/verifier discovery loop (see Analysis Phases below) |
 
 ### Workflow Phases
 
@@ -133,6 +134,30 @@ juvenal run task.md
 ```
 
 Static sub-workflows skip the LLM planning step. Paths resolve relative to the declaring YAML file. Parent workflow `vars` propagate to sub-workflows. `workflow_file` and `workflow_dir` are mutually exclusive with each other.
+
+### Analysis Phases
+
+An `analysis` phase runs a deterministic dynamic-analysis loop (used by `juvenal/workflows/bug-bounty.yaml`). A long-lived captain maintains a frontier of targets, fresh workers investigate bounded targets, fresh verifiers independently accept/reject each claim, an optional non-gating exploit-sim stage categorizes verified claims, and a reporter writes them up. Child state persists to `.juvenal-state-<phase-id>-analysis.json`.
+
+```yaml
+- id: analyze-repo
+  type: analysis
+  prompt: "Analyze the repository for concrete security defects."
+  analysis:
+    captain_backend: claude          # claude | claude-sdk | codex | codex-sdk
+    worker_backend: codex
+    verifier_backend: claude
+    shared_agent_budget: true        # workers+verifiers share max_agents; verifiers preempt
+    max_agents: 12
+    worker_dynamic_workflow: true    # each worker fans out into its own subagents, then synthesizes one WORKER_JSON
+    allow_repo_tools: true
+    verifiers: [...]                 # ordered verifier chain (VerifierSpec)
+    exploit_sim:                     # optional, non-gating
+      enabled: true
+    reporter: {...}                  # ReporterSpec
+```
+
+Run with `-i` / `--interactive` for the chat dashboard (talk to the captain mid-run). `analysis` phases may not appear inside `parallel_groups`.
 
 ## Inline Checks
 
@@ -287,6 +312,29 @@ juvenal run $(python -c "from pathlib import Path; print(Path(__import__('juvena
 | 13 | `reviewer-b-review` | Reviewer B (skeptical) | check -> `[design-experiments, write-paper]` |
 
 **Artifacts produced:** `PLAN.md`, `DESIGN.md`, `IMPLEMENTATION.md`, `RESULTS.md`, `OUTLINE.md`, `PAPER.md`, `reviews/`
+
+## Analysis Loop — Developer Map & Invariants
+
+For work on the analysis engine (`bug-bounty.yaml` and friends), the source map is:
+
+| Concern | Location |
+|---------|----------|
+| Captain/worker/verifier/exploit-sim/reporter orchestration | `juvenal/dynamic/runner.py` |
+| Structured-output + directive parsing | `juvenal/dynamic/protocol.py` |
+| Protocol/state dataclasses (incl. `ExploitSimRecord`, per-claim exploit fields) | `juvenal/dynamic/models.py` |
+| Child-state persistence + resume normalization | `juvenal/dynamic/state.py` |
+| `AnalysisConfig` / `ExploitSimSpec` parsing | `juvenal/workflow.py` |
+| Per-claim status rendering | `juvenal/state.py` (`_format_claim_exploit_label`) |
+| Shipped native subagent bodies | `juvenal/prompts/agents/*.md` (see `docs/AGENTS.md`) |
+| Backend factory + SDK backends | `juvenal/backends.py`, `docs/backends/` |
+
+Invariants that MUST hold when changing this loop:
+
+- **The loop shape is fixed**: captain enqueues targets → exactly one worker subagent per target/claim → the verifier chain → non-gating exploit-sim → reporter. Deterministic control flow (retry/advance/terminate) is owned by the runner, never by an LLM.
+- **Worker contract is fixed**: each worker keeps its loop position and emits exactly one `WORKER_JSON` (`claims` / `no_findings` / `blocked`). `worker_dynamic_workflow: true` only changes the worker's *internal* investigation method (it spawns its own subagents and synthesizes); it must never emit multiple `WORKER_JSON` blocks or move in the loop. Codex degrades to a strong single pass rather than faking fan-out.
+- **Exploit-sim is non-gating**: it categorizes verified claims (`exploit_confirmed`, `exploit_confirmed_nondefault`, `exploit_unconfirmed`, `sim_inconclusive`, `sim_error`) but never rejects one; infra failures yield `sim_error`/`sim_inconclusive` with the claim still verified.
+- **Write guardrails**: workers/verifiers cannot write under `output/` (the reporter's tree); the reporter cannot write under a worker's `scratch_dir`. Enforced via per-role `--settings` deny globs (`_hooks_for_role`).
+- **Backends stay portable**: subprocess `ClaudeBackend`/`CodexBackend` remain the working defaults and stay importable/functional; SDK backends are opt-in with subprocess fallback. New `models.py` dataclass fields must have defaults.
 
 ## Your Task
 

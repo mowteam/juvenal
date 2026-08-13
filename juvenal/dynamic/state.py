@@ -19,6 +19,7 @@ from juvenal.dynamic.models import (
     ClaimRecord,
     DynamicEvent,
     RunControl,
+    SimulationEnvState,
     TargetRecord,
     UserDirective,
     VerificationRecord,
@@ -36,6 +37,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
         "target.blocked",
         "target.exhausted",
         "directive.received",
+        "captain.proposal_dropped",
     }
 )
 _FRONTIER_STATUSES = (
@@ -146,6 +148,7 @@ class DynamicSessionState:
     ignored_symbols: list[str] = field(default_factory=list)
     events: list[DynamicEvent] = field(default_factory=list)
     attack_surface: AttackSurfaceState = field(default_factory=AttackSurfaceState)
+    simulation_env: SimulationEnvState = field(default_factory=SimulationEnvState)
     _lock: RLock = field(init=False, repr=False, default_factory=RLock)
 
     @classmethod
@@ -172,6 +175,8 @@ class DynamicSessionState:
         state.events = _load_dataclass_list(data.get("events", []), DynamicEvent)
         if "attack_surface" in data:
             state.attack_surface = _dataclass_from_dict(AttackSurfaceState, data["attack_surface"])
+        if "simulation_env" in data:
+            state.simulation_env = _dataclass_from_dict(SimulationEnvState, data["simulation_env"])
         return state
 
     def save(self) -> None:
@@ -328,6 +333,18 @@ class DynamicSessionState:
                         "To force a retry, set attack_surface.status to 'pending' in this file."
                     )
 
+            if self.simulation_env.status == "running":
+                # The env builder was in flight when the run died. Like the analyst,
+                # it does not auto-retry on resume — sticky-fail it so the run
+                # continues without a live simulation environment.
+                self.simulation_env.status = "failed"
+                self.simulation_env.completed_at = now
+                if not self.simulation_env.error:
+                    self.simulation_env.error = (
+                        "interrupted-before-completion; env builder will not auto-retry on resume. "
+                        "To force a retry, set simulation_env.status to 'pending' in this file."
+                    )
+
             self._apply_resume_control_rewrite_locked(now)
             self.save()
 
@@ -397,6 +414,14 @@ class DynamicSessionState:
                     ]
                 ),
                 frontier_counts=frontier_counts,
+                dropped_proposals=[
+                    {
+                        "target_id": event.target_id or "",
+                        "reason": (event.payload or {}).get("reason", ""),
+                    }
+                    for event in unread_events
+                    if event.event_type == "captain.proposal_dropped"
+                ],
             )
 
     def record_captain_turn(self, turn: CaptainTurn, delivered_event_seq: int) -> None:
@@ -575,4 +600,5 @@ class DynamicSessionState:
             "ignored_symbols": list(self.ignored_symbols),
             "events": [asdict(event) for event in self.events],
             "attack_surface": asdict(self.attack_surface),
+            "simulation_env": asdict(self.simulation_env),
         }

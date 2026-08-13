@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "juvenal"
-version = "1.4.0"
+version = "1.5.0"
 description = "Who guards the agents? A framework for orchestrating AI coding agents through verified implementation phases."
 license = {text = "MIT"}
 readme = "README.md"
@@ -21,6 +21,12 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.4",
 ]
+# Opt-in in-process backends. The subprocess `claude` / `npx @openai/codex`
+# backends stay the defaults and need none of these; install an extra only to
+# select the matching `*-sdk` backend.
+claude-sdk = ["claude-agent-sdk>=0.2"]
+codex-sdk = ["openai-codex>=0.144"]
+sdk = ["claude-agent-sdk>=0.2", "openai-codex>=0.144"]
 
 [project.scripts]
 juvenal = "juvenal.cli:main"
@@ -29,7 +35,7 @@ juvenal = "juvenal.cli:main"
 include = ["juvenal*"]
 
 [tool.setuptools.package-data]
-juvenal = ["prompts/*.md", "templates/**/*", "workflows/**/*"]
+juvenal = ["prompts/*.md", "prompts/agents/*.md", "templates/**/*", "workflows/**/*"]
 
 [tool.ruff]
 line-length = 120

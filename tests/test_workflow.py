@@ -197,6 +197,58 @@ phases:
         assert analysis is not None
         assert analysis.worker_prompt == ""
 
+    def test_yaml_analysis_phase_worker_dynamic_workflow_defaults_on(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        analysis = wf.phases[0].analysis
+        assert analysis is not None
+        assert analysis.worker_dynamic_workflow is True
+
+    def test_yaml_analysis_phase_worker_dynamic_workflow_round_trips(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      worker_dynamic_workflow: false
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        wf = load_workflow(yaml_path)
+
+        analysis = wf.phases[0].analysis
+        assert analysis is not None
+        assert analysis.worker_dynamic_workflow is False
+
+    def test_yaml_analysis_phase_worker_dynamic_workflow_must_be_bool(self, tmp_path):
+        yaml_content = """\
+name: test
+phases:
+  - id: analyze
+    type: analysis
+    prompt: "Analyze the repository."
+    analysis:
+      worker_dynamic_workflow: "yes"
+"""
+        yaml_path = tmp_path / "workflow.yaml"
+        yaml_path.write_text(yaml_content)
+
+        with pytest.raises(ValueError, match="worker_dynamic_workflow must be a boolean"):
+            load_workflow(yaml_path)
+
     def test_yaml_analysis_phase_defaults(self, tmp_path):
         yaml_content = """\
 name: test

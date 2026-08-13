@@ -33,8 +33,8 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 |--------|---------|
 | `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups (flat or lane-based). `BounceCounter` for thread-safe global bounce tracking in lanes. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
 | `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. `apply_vars()` handles `{{VAR}}` template substitution. In directory convention, extra `.md` files in a phase dir become check phases; command execution belongs inside agentic checker prompts rather than `.sh` phase discovery. |
-| `backends.py` | Abstract `Backend` base class with `ClaudeBackend` and `CodexBackend`. Manages subprocess invocation and JSON stream parsing. `run_interactive()` for terminal passthrough (Claude only). |
-| `dynamic/` | Dynamic analysis engine package. `runner.py` owns captain/worker/verifier orchestration (with both batch and chat modes), `protocol.py` parses structured outputs and directives, `state.py` persists child analysis state, `models.py` defines protocol/state dataclasses, `interaction.py` collects user input on a background thread, and `chat_display.py` is the line-scrolling chat dashboard for `--interactive` runs (Rich `Live` was removed because it cannot share the cursor cleanly with line-buffered stdin reads). |
+| `backends.py` | Backend factory `create_backend(name)` plus the abstract `Backend` base class. Subprocess `ClaudeBackend` and `CodexBackend` are the working defaults. Opt-in in-process SDK backends `ClaudeSDKBackend` (`backend: claude-sdk`) and `CodexSDKBackend` (`backend: codex-sdk`) drive the vendor SDKs directly; both fall back to their subprocess counterparts when the SDK is not installed (set `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1` to fail loud instead). Manages subprocess invocation, JSON stream parsing, and the shared `hooks_config` `--settings` fragment. `run_interactive()` for terminal passthrough (Claude only). See `docs/backends/`. |
+| `dynamic/` | Dynamic analysis engine package. `runner.py` owns captain/worker/verifier/exploit-sim/reporter orchestration (batch + chat modes), backend-aware subagent wiring, per-role write guardrails, and Codex `.codex/agents/*.toml` dual-emit; `protocol.py` parses structured outputs and directives, `state.py` persists child analysis state, `models.py` defines protocol/state dataclasses (including `ExploitSimRecord` and per-claim exploit fields), `interaction.py` collects user input on a background thread, and `chat_display.py` is the line-scrolling chat dashboard for `--interactive` runs (Rich `Live` was removed because it cannot share the cursor cleanly with line-buffered stdin reads). |
 | `state.py` | Atomic JSON state persistence (`PipelineState`). Thread-safe (RLock). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume, rewind, and scoped invalidation (for lane bounces). |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`). |
 | `display.py` | Rich TUI with rolling 15-line buffer. Thread-safe (Lock). Falls back to plain text with `--plain` or parallel mode. `pause()`/`resume()` for interactive terminal passthrough. |
@@ -46,8 +46,8 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 1. `cli.py` parses args, dispatches to command handler
 2. `workflow.py` loads and validates the workflow definition
 3. `engine.py` iterates phases: implement/check/workflow/analysis → advance or bounce
-4. `backends.py` spawns agent subprocesses, streams JSON events
-5. `dynamic/` handles captain/worker/verifier orchestration for `analysis` phases
+4. `backends.py` spawns agent subprocesses (or drives the SDK in-process), streams JSON events
+5. `dynamic/` handles captain → worker → verifier chain → exploit-sim → reporter orchestration for `analysis` phases
 6. `checkers.py` parses verdicts from checker output
 7. `state.py` persists workflow progress after each phase for resumability, while `dynamic/state.py` persists child analysis state
 
@@ -56,7 +56,13 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 - **implement** — agent executes a prompt to build/modify code. Supports `interactive: true` for terminal passthrough (Claude only, enabled with `--interactive`)
 - **check** — separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason`
 - **workflow** — sub-workflow: dynamic (LLM plans from `prompt`) or static (`workflow_file` / `workflow_dir`). Recursion depth capped by `max_depth`. Parent vars propagate to sub-workflows.
-- **analysis** — dynamic captain/worker/verifier analysis. Uses nested `analysis:` config (`AnalysisConfig`) and persists child state to `.juvenal-state-<phase-id>-analysis.json`. `--interactive` opens a line-scrolling chat dashboard (`juvenal/dynamic/chat_display.py`) that prints captain output, worker/verifier events, and acknowledged directives to stdout as they happen, while the user types directives (`/focus`, `/ignore`, `/target`, `/ask`, `/now`, `/show captain`, `/summary`, `/stop`, `/wrap`, free-form notes) without the cursor fighting a Live redraw. By default workers and verifiers share a single `max_agents` budget with verifiers preempting workers (`shared_agent_budget: true`); set `shared_agent_budget: false` to fall back to legacy independent `max_workers` / `max_verifiers` pools.
+- **analysis** — dynamic captain/worker/verifier analysis. Uses nested `analysis:` config (`AnalysisConfig`) and persists child state to `.juvenal-state-<phase-id>-analysis.json`. The deterministic loop is: captain enqueues targets → exactly one worker subagent per target/claim → the verifier chain → a non-gating exploit-sim stage → the reporter. `--interactive` opens a line-scrolling chat dashboard (`juvenal/dynamic/chat_display.py`) that prints captain output, worker/verifier events, and acknowledged directives to stdout as they happen, while the user types directives (`/focus`, `/ignore`, `/target`, `/ask`, `/now`, `/show captain`, `/chat`, `/summary`, `/stop`, `/wrap`, free-form notes) without the cursor fighting a Live redraw. By default workers and verifiers share a single `max_agents` budget with verifiers preempting workers (`shared_agent_budget: true`); set `shared_agent_budget: false` to fall back to legacy independent `max_workers` / `max_verifiers` pools.
+
+  Additional invariants:
+  - **Worker as its own captain** — `worker_dynamic_workflow: true` (default) lets each worker fan out into its own backend subagents (Claude Agent tool / Codex native spawn) to explore hypotheses before synthesizing. The worker keeps its exact loop position and one-`WORKER_JSON` output contract (`claims` / `no_findings` / `blocked`); only its internal investigation method changes. Codex degrades to a strong single pass when native spawning is unavailable — it never fakes fan-out. Set `worker_dynamic_workflow: false` for the legacy single-pass worker.
+  - **Native subagents for both vendors** — the shipped role bodies in `juvenal/prompts/agents/*.md` are discovered natively by Claude Code via repo-root `.claude/agents/*.md` symlinks, and dual-emitted into `.codex/agents/*.toml` (via `write_codex_agent_definitions`) from the same source when a Codex-backed role runs. The runner swaps the "Agent tool" wording for Codex native-spawn wording per the effective role backend. See `docs/AGENTS.md`.
+  - **Write guardrails** — `_hooks_for_role` emits per-role `--settings` deny globs (`Write`/`Edit`) applied through `hooks_config`: workers and verifiers cannot write under `output/` (the reporter's tree), and the reporter cannot write under a worker's `scratch_dir`. PoC artifacts stay under `.juvenal/scratch/`.
+  - **Exploit-sim stage** — an optional non-gating post-verification stage (`analysis.exploit_sim`, `ExploitSimSpec`; env-builder → simulator → attacker → judge roles). It stands up a real runnable target instance and categorizes each verified claim without ever rejecting it. Categories: `exploit_confirmed`, `exploit_confirmed_nondefault`, `exploit_unconfirmed`, `sim_inconclusive`, `sim_error`. Any infra failure yields `sim_error`/`sim_inconclusive` with the claim still verified. `juvenal status` surfaces the per-claim category (e.g. `exploit: confirmed`).
 
 ### Template Variables
 
@@ -95,16 +101,17 @@ When bumping the version, update it in both `pyproject.toml` and `.claude-plugin
 
 ## Dependencies
 
-**Runtime**: `pyyaml>=6.0` (workflow parsing), `rich>=13.0` (terminal UI)
+**Runtime**: `jinja2>=3.1` + `pyyaml>=6.0` (workflow parsing), `rich>=13.0` (terminal UI)
 **Dev**: `pytest>=8.0`, `ruff>=0.4`
+**Optional SDK extras** (opt-in in-process backends, not needed for the subprocess defaults): `claude-sdk` (`claude-agent-sdk>=0.2`), `codex-sdk` (`openai-codex>=0.144`), `sdk` (both). See `docs/backends/`.
 **External CLIs** (not pip-managed): `claude` (Anthropic CLI), `npx @openai/codex@latest` (OpenAI Codex)
 
 ## Project Layout
 
 ```
 juvenal/
-├── __init__.py          # Version (__version__ = "0.6.0")
-├── backends.py          # Backend ABC + Claude/Codex implementations
+├── __init__.py          # __version__ derived from installed package metadata
+├── backends.py          # Backend factory + subprocess (Claude/Codex) and opt-in SDK backends
 ├── checkers.py          # Verdict parsing helpers
 ├── cli.py               # CLI argument parsing and dispatch
 ├── display.py           # Rich TUI rendering
@@ -118,10 +125,17 @@ juvenal/
 ├── engine.py            # Core execution loop
 ├── notifications.py     # Webhook notifications
 ├── state.py             # Atomic state persistence
-├── workflow.py          # Workflow/Phase models and loading
+├── workflow.py          # Workflow/Phase models and loading (AnalysisConfig, ExploitSimSpec)
 ├── prompts/             # Built-in checker role prompts (.md)
+│   └── agents/          # Shipped role subagents (4 verifiers + 4 exploit-sim roles); repo-root .claude/agents/ symlinks here, and the runner dual-emits Codex .codex/agents/*.toml from the same bodies for codex-backed roles. See docs/AGENTS.md
 ├── templates/           # Workflow scaffolding templates
-└── workflows/           # Built-in workflows and examples (plan.yaml, analysis-example.yaml)
+└── workflows/           # Built-in workflows and examples (plan.yaml, analysis-example.yaml, bug-bounty.yaml)
+docs/
+├── AGENTS.md            # Native subagent (Claude + Codex) resolution and dual-emit
+├── analysis-workflow.md # Analysis-phase author guide
+└── backends/            # SDK backend integration status
+    ├── claude-sdk-integration.md   # ClaudeSDKBackend — implemented, opt-in (subprocess stays default)
+    └── codex-sdk-exploration.md    # CodexSDKBackend — implemented, opt-in; green turn needs Codex auth
 tests/
 ├── conftest.py          # Shared fixtures (MockBackend, etc.)
 ├── test_cli.py          # CLI argument parsing tests

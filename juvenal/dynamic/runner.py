@@ -14,13 +14,14 @@ from threading import Event, Lock
 from typing import Any, Literal
 
 from juvenal.backends import AgentResult, Backend, create_backend
-from juvenal.checkers import VerificationReport, parse_verification_report
+from juvenal.checkers import VerificationReport, extract_json_block, parse_verification_report
 from juvenal.display import Display
 from juvenal.dynamic.interaction import UserInteractionChannel
 from juvenal.dynamic.models import (
     AttackSurfaceState,
     CaptainTurn,
     ClaimRecord,
+    SimulationEnvState,
     TargetRecord,
     UserDirective,
     VerificationRecord,
@@ -37,7 +38,20 @@ from juvenal.dynamic.protocol import (
 )
 from juvenal.dynamic.state import DynamicSessionState
 from juvenal.execution import PhaseResult
-from juvenal.workflow import AnalysisConfig, AnalystSpec, Phase, ReporterSpec, VerifierSpec, Workflow, apply_vars
+from juvenal.workflow import (
+    AnalysisConfig,
+    AnalystSpec,
+    ExploitSimSpec,
+    Phase,
+    ReporterSpec,
+    VerifierSpec,
+    Workflow,
+    apply_vars,
+)
+
+# Canonical shipped location for static role subagent definitions. Native Claude
+# Code discovery is mirrored via repo-root `.claude/agents/*.md` symlinks into here.
+_PACKAGE_AGENTS_DIR = Path(__file__).resolve().parent.parent / "prompts" / "agents"
 
 _CAPTAIN_EVENT_TYPES = frozenset(
     {
@@ -48,6 +62,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
         "target.blocked",
         "target.exhausted",
         "directive.received",
+        "captain.proposal_dropped",
     }
 )
 _NON_TERMINAL_STATUSES = frozenset({"queued", "running", "verifying", "deferred", "requeue_pending"})
@@ -66,6 +81,7 @@ _DASHBOARD_EVENT_KINDS = frozenset(
         "target.deferred",
         "directive.received",
         "directive.acknowledged",
+        "captain.proposal_dropped",
     }
 )
 _IDLE_SLEEP_SECONDS = 0.05
@@ -137,6 +153,14 @@ _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
         # Analyst defaults to opus 4.7 with the 1M-context beta because it
         # reads a lot (codebase, docs, web research) before producing the brief.
         "analyst": "claude-opus-4-7[1m]",
+        # Exploit-sim roles. env_builder reads the codebase + docs to stand up a
+        # runnable sandbox, so it gets the 1M-context model like the analyst.
+        # simulator/attacker run opus 4.7 (they drive/observe a live instance);
+        # exploit_judge runs opus 4.6 for adversarial categorization like verifiers.
+        "env_builder": "claude-opus-4-7[1m]",
+        "simulator": "claude-opus-4-7",
+        "attacker": "claude-opus-4-7",
+        "exploit_judge": "claude-opus-4-6",
     },
     "codex": {
         "captain": None,
@@ -144,8 +168,15 @@ _DEFAULT_MODELS_BY_BACKEND_AND_ROLE: dict[str, dict[str, str | None]] = {
         "verifier": None,
         "reporter": None,
         "analyst": None,
+        "env_builder": None,
+        "simulator": None,
+        "attacker": None,
+        "exploit_judge": None,
     },
 }
+# The SDK-backed Claude backend takes the same model strings (incl. the `[1m]`
+# 1M-context suffix), so it inherits the subprocess backend's per-role defaults.
+_DEFAULT_MODELS_BY_BACKEND_AND_ROLE["claude-sdk"] = _DEFAULT_MODELS_BY_BACKEND_AND_ROLE["claude"]
 
 
 def _resolve_model(backend: str, role: str, configured: str | None) -> str | None:
@@ -195,6 +226,43 @@ class _AnalystExecutionResult:
     error: str | None
 
 
+@dataclass
+class _EnvBuilderExecutionResult:
+    agent_result: AgentResult
+    brief: str
+    artifact_path: str | None
+    instantiate_script: str | None
+    error: str | None
+
+
+@dataclass
+class _ExploitSimExecutionResult:
+    claim_id: str
+    category: Literal[
+        "exploit_confirmed",
+        "exploit_confirmed_nondefault",
+        "exploit_unconfirmed",
+        "sim_inconclusive",
+        "sim_error",
+    ]
+    config_deltas: list[str]
+    transcript_refs: list[str]
+    exchange_rounds: int
+    agent_results: list[AgentResult]
+    error: str | None
+
+
+_EXPLOIT_SIM_CATEGORIES = frozenset(
+    {
+        "exploit_confirmed",
+        "exploit_confirmed_nondefault",
+        "exploit_unconfirmed",
+        "sim_inconclusive",
+        "sim_error",
+    }
+)
+_JUDGE_BEGIN = "EXPLOIT_JUDGE_JSON_BEGIN"
+_JUDGE_END = "EXPLOIT_JUDGE_JSON_END"
 _MAX_REPORTER_ATTEMPTS = 3
 # After this many seconds since CREATION, a Claude session is considered too old
 # to safely resume. The Anthropic CLI does not always error on stale --resume —
@@ -294,6 +362,282 @@ End your output after the Quick-reference section. Do not append meta-commentary
 own process.
 """
 
+# Exploit-sim role prompts. These are fallbacks used only when the workflow does
+# not supply its own. They REQUIRE a real, runnable environment inside a sandbox
+# and forbid pre-provisioning any credential that sits on a trust boundary — the
+# whole point of the stage is to confirm reproduction on a realistic system, not
+# to hand the attacker a shortcut past the boundary the bug is supposed to cross.
+_DEFAULT_ENV_BUILDER_PROMPT = """You are the exploit-simulation environment builder for a Juvenal bug-bounty run.
+
+Build a REAL, RUNNABLE instance of the target inside this sandbox — actually compile / \
+install / configure it so a live process can be started, not a mock or a description. Use \
+the project's own default configuration. Do NOT pre-install, pre-seed, or hand out any \
+credential, token, key, or capability that lies on a trust boundary an attacker would have \
+to cross (admin passwords, signed peer identities, auth cookies, privileged sockets). The \
+simulation must reflect what an unprivileged/remote attacker actually faces.
+
+Repository root: {working_dir}
+Persist all artifacts under: {env_dir}
+
+Mission context:
+{mission}
+
+Write a runnable `instantiate.sh` under {env_dir} that spins up a FRESH, isolated instance \
+from the built artifact each time it is invoked (so per-claim runs never share state).
+
+End your output with a machine-readable block:
+ENV_JSON_BEGIN
+{"artifact_path": "<path under env_dir>", "instantiate_script": "<path to instantiate.sh>"}
+ENV_JSON_END
+"""
+
+_DEFAULT_SIMULATOR_PROMPT = """You are the exploit-simulation SIMULATOR for a Juvenal bug-bounty run \
+(round {round} of {max_rounds}).
+
+Instantiate / manage a fresh instance of the target from the prepared environment and report \
+its observable behavior to the attacker. Run the REAL system; never fabricate output. Start \
+from DEFAULT configuration. If the attacker requests a configuration change, you MAY grant it \
+only if a real operator plausibly would — but you MUST log every granted change verbatim on \
+its own line prefixed `CONFIG_DELTA: `. Never grant a change that simply hands over a \
+trust-boundary credential.
+
+Environment brief:
+{env_brief}
+
+Claim under test:
+{claim_packet}
+
+Attacker's last message: {attacker_last}
+
+Report the instance's actual observed response.
+"""
+
+_DEFAULT_ATTACKER_PROMPT = """You are the exploit-simulation ATTACKER for a Juvenal bug-bounty run \
+(round {round} of {max_rounds}).
+
+Run the verified proof-of-concept for the claim below against the live instance the simulator \
+manages. Use only capabilities a real attacker at the documented trust boundary would have. If \
+you genuinely need a non-default configuration to reproduce, request it explicitly from the \
+simulator (it will decide and log the delta) rather than assuming it.
+
+Claim under test:
+{claim_packet}
+
+Simulator's last message: {simulator_last}
+
+Report concretely whether the exploit reproduced and what you observed.
+"""
+
+_DEFAULT_EXPLOIT_JUDGE_PROMPT = """You are the exploit-simulation JUDGE for a Juvenal bug-bounty run.
+
+Read the attacker<->simulator transcript and the granted config-delta log, then categorize the \
+verified claim. You do NOT re-verify the bug (it already passed the verifier chain) and you \
+NEVER reject it — you only record whether it reproduced live and under what configuration.
+
+Categories:
+- exploit_confirmed: reproduced on the DEFAULT configuration.
+- exploit_confirmed_nondefault: reproduced only after granted non-default config changes.
+- exploit_unconfirmed: valid bug, but it did not reproduce live in this run.
+- sim_inconclusive: the environment/simulator could not exercise the claim.
+
+Claim under test:
+{claim_packet}
+
+Config deltas granted (JSON list): {config_deltas}
+
+Transcript:
+{transcript}
+
+End your output with:
+EXPLOIT_JUDGE_JSON_BEGIN
+{"category": "<one of the four>", "config_deltas": ["..."], "rationale": "one line"}
+EXPLOIT_JUDGE_JSON_END
+"""
+
+
+def _empty_agent_result() -> AgentResult:
+    return AgentResult(exit_code=1, output="", transcript="", duration=0.0, input_tokens=0, output_tokens=0)
+
+
+def _parse_env_builder_brief(brief: str) -> tuple[str | None, str | None]:
+    """Extract artifact_path / instantiate_script from the env-builder's ENV_JSON block."""
+    payload = extract_json_block(brief, "ENV_JSON_BEGIN", "ENV_JSON_END")
+    if not isinstance(payload, dict):
+        return None, None
+    artifact = payload.get("artifact_path")
+    script = payload.get("instantiate_script")
+    return (artifact if isinstance(artifact, str) else None, script if isinstance(script, str) else None)
+
+
+def _parse_config_deltas(output: str) -> list[str]:
+    """Collect every `CONFIG_DELTA: ...` line emitted during the dialogue."""
+    deltas: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("CONFIG_DELTA:"):
+            value = stripped[len("CONFIG_DELTA:") :].strip()
+            if value:
+                deltas.append(value)
+    return deltas
+
+
+def _parse_exploit_judge_output(output: str) -> tuple[str, list[str], str | None]:
+    """Return (category, config_deltas, error). Unparseable output degrades to
+    sim_inconclusive — the stage is non-gating, so a judge parse failure must not
+    strand the claim."""
+    payload = extract_json_block(output, _JUDGE_BEGIN, _JUDGE_END)
+    if not isinstance(payload, dict):
+        return "sim_inconclusive", [], "exploit_judge output missing EXPLOIT_JUDGE_JSON block"
+    category = payload.get("category")
+    if category not in _EXPLOIT_SIM_CATEGORIES or category == "sim_error":
+        return "sim_inconclusive", [], f"exploit_judge returned invalid category {category!r}"
+    raw_deltas = payload.get("config_deltas", [])
+    deltas = [d for d in raw_deltas if isinstance(d, str)] if isinstance(raw_deltas, list) else []
+    return category, deltas, None
+
+
+def _strip_agent_frontmatter(text: str) -> str:
+    """Drop a leading Claude Code `---\\n…\\n---\\n` frontmatter block; return the body."""
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            return text[end + len("\n---\n") :].lstrip("\n")
+    return text
+
+
+def _load_agent_body(name: str, working_dir: Path | None = None) -> str | None:
+    """Return the frontmatter-stripped body of subagent `{name}.md`, or None.
+
+    A per-project `.claude/agents/{name}.md` under ``working_dir`` overrides the
+    canonical package copy so a target repo can specialize a role.
+    """
+    candidates: list[Path] = []
+    if working_dir is not None:
+        candidates.append(Path(working_dir) / ".claude" / "agents" / f"{name}.md")
+    candidates.append(_PACKAGE_AGENTS_DIR / f"{name}.md")
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            body = _strip_agent_frontmatter(path.read_text(encoding="utf-8")).strip()
+        except OSError:
+            continue
+        if body:
+            return body
+    return None
+
+
+# Shipped role subagents whose bodies are dual-emitted as Codex `.codex/agents/*.toml`
+# definitions so a codex-backed worker/verifier can spawn them natively (verified
+# `multi_agent stable true` on codex-cli 0.128.0; defs live in `.codex/agents/<name>.toml`
+# with name/description/developer_instructions — the exact keys the installed binary parses).
+_SHIPPED_AGENT_NAMES = (
+    "attack-surface-verifier",
+    "trust-model-verifier",
+    "poc-verifier",
+    "novelty-verifier",
+    "exploit-sim-env-builder",
+    "exploit-sim-simulator",
+    "exploit-sim-attacker",
+    "exploit-sim-judge",
+)
+
+
+def _backend_is_codex(name: str | None) -> bool:
+    """True for the Codex subprocess/SDK backends (`codex`, `codex-sdk`)."""
+    return name in ("codex", "codex-sdk")
+
+
+def _parse_agent_frontmatter(text: str) -> dict[str, str]:
+    """Return the `name`/`description` (etc.) scalars from a leading `---\\n…\\n---` block.
+
+    Values are single-line in the shipped agent files; anything without a closing
+    delimiter yields an empty mapping (matches `_strip_agent_frontmatter`).
+    """
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}
+    fields: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip():
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def _toml_escape(value: str) -> str:
+    r"""Escape a Python string for a TOML basic (double-quoted) string literal."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "").replace("\t", "\\t")
+
+
+def _codex_agent_toml(name: str, description: str, developer_instructions: str) -> str:
+    """Serialize a Codex subagent definition (`name`/`description`/`developer_instructions`).
+
+    `developer_instructions` uses a TOML multi-line basic string so the role body
+    survives verbatim; `name`/`description` are single-line basic strings.
+    """
+    body = developer_instructions.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    return (
+        f'name = "{_toml_escape(name)}"\n'
+        f'description = "{_toml_escape(description)}"\n'
+        f'developer_instructions = """\n{body}\n"""\n'
+    )
+
+
+def _agent_toml_from_shipped(name: str, working_dir: Path | None = None) -> str | None:
+    """Build a Codex `.codex/agents/<name>.toml` from the shipped Claude agent `.md`.
+
+    Single source of truth: reads the same `juvenal/prompts/agents/<name>.md` (or a
+    per-project `.claude/agents/<name>.md` override) the Claude path uses, so the two
+    formats never drift. Returns None when the source is missing/empty.
+    """
+    candidates: list[Path] = []
+    if working_dir is not None:
+        candidates.append(Path(working_dir) / ".claude" / "agents" / f"{name}.md")
+    candidates.append(_PACKAGE_AGENTS_DIR / f"{name}.md")
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        body = _strip_agent_frontmatter(raw).strip()
+        if not body:
+            continue
+        fm = _parse_agent_frontmatter(raw)
+        description = fm.get("description") or f"{name} role for the Juvenal bug-finding run."
+        return _codex_agent_toml(fm.get("name") or name, description, body)
+    return None
+
+
+def write_codex_agent_definitions(working_dir: Path) -> list[Path]:
+    """Materialize the shipped role subagents into `<working_dir>/.codex/agents/*.toml`.
+
+    Mirrors the Claude `.claude/agents/*.md` path so a codex-backed role can spawn the
+    same specialized roles natively. Best-effort: skips any agent that fails to render
+    or write and returns the paths successfully written.
+    """
+    written: list[Path] = []
+    agents_dir = Path(working_dir) / ".codex" / "agents"
+    try:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return written
+    for name in _SHIPPED_AGENT_NAMES:
+        toml_text = _agent_toml_from_shipped(name, working_dir)
+        if not toml_text:
+            continue
+        target = agents_dir / f"{name}.toml"
+        try:
+            target.write_text(toml_text, encoding="utf-8")
+        except OSError:
+            continue
+        written.append(target)
+    return written
+
 
 class DynamicAnalysisRunner:
     """Deterministic runner for one dynamic analysis phase."""
@@ -350,6 +694,20 @@ class DynamicAnalysisRunner:
         self._reporter_executor = ThreadPoolExecutor(max_workers=max(1, self.config.max_workers))
         self._analyst_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-analyst")
         self._analyst_future: Future[_AnalystExecutionResult] | None = None
+        # Exploit-sim (non-gating post-verification categorizer). env_builder runs
+        # once in its own single-slot pool; per-claim exploit-sim attempts run
+        # serially in a second single-slot pool so a fresh env instance is used
+        # per claim without cross-claim state pollution.
+        self._env_builder_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-env-builder")
+        self._env_builder_future: Future[_EnvBuilderExecutionResult] | None = None
+        # The env-builder future can be drained from two threads (the main loop
+        # and a per-claim exploit-sim worker waiting on it), so guard the
+        # claim-and-clear so it drains exactly once.
+        self._env_builder_lock = Lock()
+        self._exploit_sim_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juvenal-exploit-sim")
+        self._exploit_sim_futures: dict[Future[_ExploitSimExecutionResult], str] = {}
+        self._pending_exploit_sim_claim_ids: list[str] = []
+        self._exploit_sim_attempts: dict[str, int] = {}
         # Stale-session warnings are debounced per-session so a target with N
         # retries doesn't emit N copies of the same warning.
         self._logged_stale_sessions: set[str] = set()
@@ -410,10 +768,13 @@ class DynamicAnalysisRunner:
             if spec.name in seen_names:
                 raise ValueError(f"Phase '{self.phase.id}': verifier chain has duplicate name {spec.name!r}")
             seen_names.add(spec.name)
-        self._rendered_verifier_prompts: dict[str, str] = {
-            spec.name: apply_vars(spec.prompt, self.workflow.vars) if spec.prompt else ""
-            for spec in self._verifier_chain
-        }
+        # Per-spec scope: an explicit YAML `prompt` wins (user override); when it
+        # is empty, fall back to the shipped `.claude/agents/{name}-verifier.md`
+        # subagent body so the role prompt lives in one place. Both empty -> no scope.
+        self._rendered_verifier_prompts: dict[str, str] = {}
+        for spec in self._verifier_chain:
+            source = spec.prompt or _load_agent_body(f"{spec.name}-verifier", self.working_dir) or ""
+            self._rendered_verifier_prompts[spec.name] = apply_vars(source, self.workflow.vars) if source else ""
 
         self._reporter_spec: ReporterSpec | None = self.config.reporter
         self._rendered_reporter_prompt: str = ""
@@ -424,6 +785,23 @@ class DynamicAnalysisRunner:
         self._rendered_analyst_prompt: str = ""
         if self._analyst_spec is not None and self._analyst_spec.prompt:
             self._rendered_analyst_prompt = apply_vars(self._analyst_spec.prompt, self.workflow.vars)
+
+        self._exploit_sim_spec: ExploitSimSpec | None = self.config.exploit_sim
+        self._rendered_exploit_sim_prompts: dict[str, str] = {}
+        if self._exploit_sim_spec is not None:
+            # Effective prompt per role: explicit YAML `prompt` wins; when empty,
+            # fall back to the shipped `.claude/agents/exploit-sim-{role}.md` subagent
+            # body; still empty -> the embedded `_DEFAULT_*_PROMPT` at execution time.
+            # Placeholders ({round}, {mission}, …) survive apply_vars and are filled by
+            # the runner's `.replace(...)`.
+            for role_key, agent_name, yaml_prompt in (
+                ("env_builder", "exploit-sim-env-builder", self._exploit_sim_spec.env_builder.prompt),
+                ("simulator", "exploit-sim-simulator", self._exploit_sim_spec.simulator.prompt),
+                ("attacker", "exploit-sim-attacker", self._exploit_sim_spec.attacker.prompt),
+                ("exploit_judge", "exploit-sim-judge", self._exploit_sim_spec.judge.prompt),
+            ):
+                source = yaml_prompt or _load_agent_body(agent_name, self.working_dir) or ""
+                self._rendered_exploit_sim_prompts[role_key] = apply_vars(source, self.workflow.vars)
 
         self._rendered_worker_prompt: str = ""
         if self.config.worker_prompt:
@@ -450,7 +828,14 @@ class DynamicAnalysisRunner:
 
         self._rebuild_pending_claim_retries()
         self._rebuild_pending_reporter_claim_ids()
+        self._rebuild_pending_exploit_sim_claim_ids()
+        # Mirror the Claude `.claude/agents/*.md` role subagents into Codex's native
+        # `.codex/agents/*.toml` format so a codex-backed role can spawn the same
+        # specialized roles. Best-effort; a codex run without them still works.
+        if self._uses_codex_backend():
+            write_codex_agent_definitions(self.working_dir)
         self._maybe_start_analyst()
+        self._maybe_start_env_builder()
 
         # Chat dashboard: --interactive without an injected test channel.
         # Tests inject a ScriptedInteractionChannel and route through _run_batch
@@ -484,6 +869,7 @@ class DynamicAnalysisRunner:
                 made_progress |= self._sweep_dead_dep_targets()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
+                made_progress |= self._schedule_exploit_sim()
                 made_progress |= self._schedule_reporters()
                 made_progress |= self._apply_review_point()
 
@@ -512,6 +898,7 @@ class DynamicAnalysisRunner:
         finally:
             self.kill_active()
             self._finalize_analyst_on_shutdown()
+            self._finalize_env_builder_on_shutdown()
             if self._interaction_channel is not None:
                 self._interaction_channel.stop()
             _flush_stdin_buffer()
@@ -519,6 +906,8 @@ class DynamicAnalysisRunner:
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
             self._analyst_executor.shutdown(wait=False, cancel_futures=True)
+            self._env_builder_executor.shutdown(wait=False, cancel_futures=True)
+            self._exploit_sim_executor.shutdown(wait=False, cancel_futures=True)
 
     def _run_chat(self) -> PhaseResult:
         """Chat-dashboard execution: captain runs on a background thread; the user
@@ -556,6 +945,7 @@ class DynamicAnalysisRunner:
                 made_progress |= self._sweep_dead_dep_targets()
                 made_progress |= self._schedule_verifiers()
                 made_progress |= self._schedule_workers()
+                made_progress |= self._schedule_exploit_sim()
                 made_progress |= self._schedule_reporters()
                 made_progress |= self._apply_continuous_directives()
                 made_progress |= self._drain_captain_future()
@@ -591,6 +981,7 @@ class DynamicAnalysisRunner:
             # exit while a thread is blocked in subprocess.Popen.wait().
             self.kill_active()
             self._finalize_analyst_on_shutdown()
+            self._finalize_env_builder_on_shutdown()
             if self._captain_executor is not None:
                 self._captain_executor.shutdown(wait=False, cancel_futures=True)
             if self._dashboard is not None:
@@ -607,6 +998,8 @@ class DynamicAnalysisRunner:
             self._verifier_executor.shutdown(wait=False, cancel_futures=True)
             self._reporter_executor.shutdown(wait=False, cancel_futures=True)
             self._analyst_executor.shutdown(wait=False, cancel_futures=True)
+            self._env_builder_executor.shutdown(wait=False, cancel_futures=True)
+            self._exploit_sim_executor.shutdown(wait=False, cancel_futures=True)
 
     def _apply_continuous_directives(self) -> bool:
         if self._interaction_channel is None or self.state.control.stop_requested:
@@ -759,6 +1152,7 @@ class DynamicAnalysisRunner:
             or delta.blocked_target_ids
             or delta.exhausted_target_ids
             or delta.pending_directive_ids
+            or delta.dropped_proposals
         ):
             return True
 
@@ -1273,6 +1667,9 @@ class DynamicAnalysisRunner:
         if self._drain_analyst_future():
             progressed = True
 
+        if self._drain_env_builder_future():
+            progressed = True
+
         for future, attempt_id in list(self._worker_futures.items()):
             if not future.done():
                 continue
@@ -1317,6 +1714,24 @@ class DynamicAnalysisRunner:
                         self._handle_verifier_error(verification, claim, target)
                 continue
             self._apply_verifier_result(result)
+
+        for future, claim_id in list(self._exploit_sim_futures.items()):
+            if not future.done():
+                continue
+            progressed = True
+            self._exploit_sim_futures.pop(future, None)
+            try:
+                result = future.result()
+                self._apply_exploit_sim_result(result)
+            except Exception as exc:  # pragma: no cover - defensive, wrapper catches normally
+                # Non-gating: an exploit-sim crash must never strand a verified
+                # claim. Mark it sim_error and still hand it to the reporter.
+                claim = self.state.claims.get(claim_id)
+                if claim is not None:
+                    claim.exploit_category = "sim_error"
+                    self._enqueue_reporter(claim)
+                    self.state.save()
+                self._emit_analyst_message(f"[juvenal] exploit-sim for claim {claim_id} crashed: {exc}")
 
         for future, claim_id in list(self._reporter_futures.items()):
             if not future.done():
@@ -1706,6 +2121,7 @@ class DynamicAnalysisRunner:
             if (
                 all_terminal
                 and any(target.status == "exhausted" for target in self.state.targets.values())
+                and not any(claim.status == "verified" for claim in self.state.claims.values())
                 and not (
                     delta.verified_claim_ids
                     or delta.rejected_claim_ids
@@ -1713,8 +2129,14 @@ class DynamicAnalysisRunner:
                     or delta.blocked_target_ids
                     or delta.exhausted_target_ids
                     or delta.pending_directive_ids
+                    or delta.dropped_proposals
                 )
             ):
+                # Genuine retry-budget failure: every target reached terminal,
+                # at least one was exhausted, AND no claim ever verified.
+                # If even one claim verified, the run produced real output —
+                # exhausted targets are normal noise on a real run, so the
+                # all-terminal success path below should handle it.
                 return True, False, "analysis exhausted retry budget across all targets"
 
             if (
@@ -1726,6 +2148,7 @@ class DynamicAnalysisRunner:
                     or delta.blocked_target_ids
                     or delta.exhausted_target_ids
                     or delta.pending_directive_ids
+                    or delta.dropped_proposals
                 )
                 and self._last_captain_snapshot == self._captain_snapshot()
                 and self._captain_termination_state != "complete"
@@ -1818,6 +2241,17 @@ class DynamicAnalysisRunner:
         }
         self._atomic_write(ctx / "claims.json", json.dumps(claims, indent=2, sort_keys=True))
 
+        # taken_target_ids.json — every target_id ever registered (terminal
+        # AND non-terminal). The captain proposes new targets via
+        # `enqueue_targets[].target_id`, and `_normalize_captain_targets`
+        # silently drops proposals that collide with any existing id. Without
+        # this list the captain can't tell which ids are taken — terminal
+        # targets are absent from frontier.json, so a captain that re-uses an
+        # old id (e.g. `target-foo-t17` when an old `t17` is already
+        # no_findings) will see its whole batch evaporate with no feedback.
+        taken_ids = sorted(self.state.targets.keys())
+        self._atomic_write(ctx / "taken_target_ids.json", json.dumps(taken_ids, indent=2))
+
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1872,6 +2306,12 @@ class DynamicAnalysisRunner:
             "blocked_targets": list(delta.blocked_target_ids),
             "exhausted_targets": list(delta.exhausted_target_ids),
             "frontier_counts": delta.frontier_counts,
+            # If your previous turn proposed targets that didn't stick, they
+            # show up here with the reason. Most common cause: target_id
+            # collides with an already-terminal target (terminal targets
+            # aren't in frontier.json, so you can't see them — generate
+            # fresher ids, e.g. include a turn-number or hash suffix).
+            "dropped_proposals": delta.dropped_proposals,
         }
         mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         mode_note = (
@@ -1887,11 +2327,14 @@ class DynamicAnalysisRunner:
             f"  - {ctx / 'frontier.json'} — current non-terminal targets with full instructions\n"
             f"  - {ctx / 'mental_model.md'} — your most recent mental model\n"
             f"  - {ctx / 'claims.json'} — every verified and rejected claim with full detail\n"
+            f"  - {ctx / 'taken_target_ids.json'} — every target_id already registered "
+            "(terminal + non-terminal). When proposing new `enqueue_targets`, every "
+            "`target_id` MUST be absent from this list — collisions are silently dropped.\n"
             "  These files are rewritten before every captain turn. Use Read / Grep to pull "
             "specific items when you need them — do not assume the prompt contains complete state.\n"
         )
 
-        brief_block = self._project_brief_block()
+        brief_block = self._project_brief_block(self.config.captain_backend)
         if is_first_turn:
             system_prompt = f"{self._captain_role_prompt}\n\nMission:\n{mission}"
             if brief_block:
@@ -1940,11 +2383,19 @@ class DynamicAnalysisRunner:
         return system_prompt, user_prompt
 
     def _worker_system_prompt(self) -> str:
-        """Static system prompt for the worker: framework role + workflow scope."""
+        """Static system prompt for the worker: framework role + workflow scope.
+
+        When `worker_dynamic_workflow` is on (default), a backend-aware fan-out
+        block turns the worker into a mini-captain of its single target — it
+        spawns its own subagents to explore competing hypotheses in parallel and
+        synthesizes, without changing its loop position or one-WORKER_JSON output.
+        """
         base = self._worker_role_prompt
         if self._rendered_worker_prompt:
             base = f"{base}\n\n{self._rendered_worker_prompt}"
-        brief_block = self._project_brief_block()
+        if self.config.worker_dynamic_workflow:
+            base = f"{base}\n\n{self._worker_fanout_block(self.config.worker_backend)}"
+        brief_block = self._project_brief_block(self.config.worker_backend)
         if brief_block:
             base = f"{base}\n\n{brief_block}"
         return base
@@ -2036,13 +2487,13 @@ class DynamicAnalysisRunner:
         # (analyst failed / hasn't run).
         subagent_scope: str | None = None
         if spec.use_attack_surface_subagent:
-            subagent_scope = self._load_subagent_scope_for_verifier()
+            subagent_scope = self._load_subagent_scope_for_verifier(spec.backend)
         if subagent_scope is not None:
             system_prompt = f"{system_prompt}\n\n{subagent_scope}"
         else:
             if rendered_scope:
                 system_prompt = f"{system_prompt}\n\n{rendered_scope}"
-            brief_block = self._project_brief_block()
+            brief_block = self._project_brief_block(spec.backend)
             if brief_block:
                 system_prompt = f"{system_prompt}\n\n{brief_block}"
         try:
@@ -2074,6 +2525,7 @@ class DynamicAnalysisRunner:
     ) -> _WorkerExecutionResult:
         backend = self._get_backend(self.config.worker_backend)
         worker_model = _resolve_model(self.config.worker_backend, "worker", self.config.worker_model)
+        hooks_config = self._hooks_for_role("worker")
         parent_session_id = attempt.parent_session_id
         cold_restart = False
         if parent_session_id and self._session_is_stale(parent_session_id):
@@ -2106,6 +2558,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("worker"),
                 model=worker_model,
+                hooks_config=hooks_config,
             )
         else:
             # On cold-restart, drop the (stale) attempt.session_id and let the
@@ -2122,6 +2575,7 @@ class DynamicAnalysisRunner:
                 model=worker_model,
                 system_prompt=system_prompt,
                 session_id=effective_session_id,
+                hooks_config=hooks_config,
             )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -2160,6 +2614,7 @@ class DynamicAnalysisRunner:
     ) -> _VerifierExecutionResult:
         backend = self._get_backend(verification.backend)
         spec = self._verifier_chain[verification.verifier_index]
+        hooks_config = self._hooks_for_role("verifier")
         parent_session_id = verification.parent_session_id
         cold_restart = False
         if parent_session_id and self._session_is_stale(parent_session_id):
@@ -2179,6 +2634,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("verifier", verifier_name=verification.verifier_name),
                 model=_resolve_model(spec.backend, "verifier", spec.model),
+                hooks_config=hooks_config,
             )
         else:
             # See _execute_worker_attempt for why cold_restart drops session_id.
@@ -2191,6 +2647,7 @@ class DynamicAnalysisRunner:
                 model=_resolve_model(spec.backend, "verifier", spec.model),
                 system_prompt=system_prompt,
                 session_id=effective_session_id,
+                hooks_config=hooks_config,
             )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -2318,7 +2775,8 @@ class DynamicAnalysisRunner:
         )
         if self._rendered_reporter_prompt:
             system_prompt = f"{system_prompt}\n\n{self._rendered_reporter_prompt}"
-        brief_block = self._project_brief_block()
+        reporter_backend = self._reporter_spec.backend if self._reporter_spec else None
+        brief_block = self._project_brief_block(reporter_backend)
         if brief_block:
             system_prompt = f"{system_prompt}\n\n{brief_block}"
 
@@ -2331,10 +2789,495 @@ class DynamicAnalysisRunner:
             f"```text\n{json.dumps(self._target_prompt_summary(target), indent=2)}\n```\n\n"
             "Verifier consensus (all of these PASSED):\n"
             f"```text\n{json.dumps(verifier_summaries, indent=2)}\n```\n\n"
+            f"{self._exploitation_prompt_block(claim)}"
             "Code context pack:\n"
             f"```text\n{json.dumps(self._code_context_payload(target), indent=2)}\n```\n"
         )
         return system_prompt, user_prompt
+
+    def _exploitation_prompt_block(self, claim: ClaimRecord) -> str:
+        """Render the exploit-sim category into the reporter prompt so the report
+        carries an 'Exploitation' line. Empty when exploit-sim is not configured."""
+        if not self._exploit_sim_enabled():
+            return ""
+        descriptions = {
+            "exploit_confirmed": "reproduced on the default configuration",
+            "exploit_confirmed_nondefault": "reproduced only after granted non-default configuration changes",
+            "exploit_unconfirmed": "valid but did not reproduce live in the simulation this run",
+            "sim_inconclusive": "the simulation environment could not exercise the claim",
+            "sim_error": "an infrastructure error occurred during simulation",
+        }
+        category = claim.exploit_category or "sim_inconclusive"
+        detail = descriptions.get(category, "categorization unavailable")
+        return (
+            "Exploitation result (from the post-verification exploit-simulation stage):\n"
+            f"```text\nexploit_category: {category}\nmeaning: {detail}\n```\n"
+            'Include a one-line "Exploitation" entry in report.md stating this category.\n\n'
+        )
+
+    # --- Exploit-simulation (non-gating post-verification categorizer) ---------
+
+    def _exploit_sim_enabled(self) -> bool:
+        return self._exploit_sim_spec is not None and self._exploit_sim_spec.enabled
+
+    def _enqueue_post_verification(self, claim: ClaimRecord) -> None:
+        """Route a freshly-verified claim to the exploit-sim stage if enabled,
+        otherwise straight to the reporter. Exploit-sim is NON-GATING: it never
+        rejects the claim; on completion _apply_exploit_sim_result enqueues the
+        reporter regardless of category."""
+        if claim.reported_at is not None:
+            return
+        if self._exploit_sim_enabled() and not claim.exploit_sim_attempted:
+            if (
+                claim.claim_id not in self._pending_exploit_sim_claim_ids
+                and claim.claim_id not in self._exploit_sim_futures.values()
+            ):
+                self._pending_exploit_sim_claim_ids.append(claim.claim_id)
+            return
+        self._enqueue_reporter(claim)
+
+    def _enqueue_reporter(self, claim: ClaimRecord) -> None:
+        if (
+            self._reporter_spec is not None
+            and claim.reported_at is None
+            and claim.claim_id not in self._pending_reporter_claim_ids
+            and claim.claim_id not in self._reporter_futures.values()
+        ):
+            self._pending_reporter_claim_ids.append(claim.claim_id)
+
+    def _maybe_start_env_builder(self) -> None:
+        """Submit the env-builder future at startup if exploit-sim is configured.
+
+        NON-BLOCKING: unlike the analyst, workers/verifiers/captain proceed while
+        the env builds. Terminal states (ready/failed) are sticky across resumes.
+        """
+        if not self._exploit_sim_enabled():
+            return
+        status = self.state.simulation_env.status
+        if status in ("ready", "failed", "running"):
+            return
+        if self._env_builder_future is not None:
+            return
+        spec = self._exploit_sim_spec.env_builder
+        now = time.time()
+        self.state.simulation_env = SimulationEnvState(
+            status="running",
+            started_at=now,
+            backend=spec.backend,
+            model=_resolve_model(spec.backend, "env_builder", spec.model),
+        )
+        self.state.save()
+        self._env_builder_future = self._env_builder_executor.submit(self._execute_env_builder)
+
+    def _execute_env_builder(self) -> _EnvBuilderExecutionResult:
+        spec = self._exploit_sim_spec.env_builder if self._exploit_sim_spec else None
+        if spec is None:
+            return _EnvBuilderExecutionResult(
+                agent_result=_empty_agent_result(),
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error="exploit_sim spec missing at execution time",
+            )
+        backend = self._get_backend(spec.backend)
+        mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
+        env_dir = self.working_dir / "output" / ".simulation-env"
+        prompt = (
+            (self._rendered_exploit_sim_prompts.get("env_builder") or _DEFAULT_ENV_BUILDER_PROMPT)
+            .replace("{working_dir}", str(self.working_dir))
+            .replace("{env_dir}", str(env_dir))
+            .replace("{mission}", mission)
+        )
+        try:
+            result = backend.run_agent(
+                prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("env_builder"),
+                model=_resolve_model(spec.backend, "env_builder", spec.model),
+            )
+        except Exception as exc:
+            return _EnvBuilderExecutionResult(
+                agent_result=_empty_agent_result(),
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error=f"env_builder raised: {exc}",
+            )
+        if result.exit_code != 0:
+            return _EnvBuilderExecutionResult(
+                agent_result=result,
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error=f"env_builder exited with code {result.exit_code}: {result.output[-2000:]}",
+            )
+        brief = result.output.strip()
+        if not brief:
+            return _EnvBuilderExecutionResult(
+                agent_result=result,
+                brief="",
+                artifact_path=None,
+                instantiate_script=None,
+                error="env_builder returned empty output",
+            )
+        artifact_path, instantiate_script = _parse_env_builder_brief(brief)
+        return _EnvBuilderExecutionResult(
+            agent_result=result,
+            brief=brief,
+            artifact_path=artifact_path,
+            instantiate_script=instantiate_script,
+            error=None,
+        )
+
+    def _drain_env_builder_future(self) -> bool:
+        with self._env_builder_lock:
+            if self._env_builder_future is None or not self._env_builder_future.done():
+                return False
+            future = self._env_builder_future
+            self._env_builder_future = None
+        try:
+            outcome = future.result()
+        except Exception as exc:
+            self._record_env_builder_failure(f"future crashed: {exc}")
+            return True
+        self._add_tokens(outcome.agent_result)
+        if outcome.error is not None:
+            self._record_env_builder_failure(outcome.error, agent_result=outcome.agent_result)
+            return True
+        self._record_env_builder_success(outcome)
+        return True
+
+    def _record_env_builder_success(self, outcome: _EnvBuilderExecutionResult) -> None:
+        now = time.time()
+        (self.working_dir / "output" / ".simulation-env").mkdir(parents=True, exist_ok=True)
+        started = self.state.simulation_env.started_at or now
+        self.state.simulation_env = SimulationEnvState(
+            status="ready",
+            brief=outcome.brief,
+            artifact_path=outcome.artifact_path,
+            instantiate_script=outcome.instantiate_script,
+            error=None,
+            started_at=started,
+            completed_at=now,
+            duration_seconds=max(0.0, now - started),
+            input_tokens=outcome.agent_result.input_tokens,
+            output_tokens=outcome.agent_result.output_tokens,
+            session_id=outcome.agent_result.session_id,
+            backend=self.state.simulation_env.backend,
+            model=self.state.simulation_env.model,
+        )
+        self.state.save()
+        self._emit_analyst_message(
+            f"[juvenal] exploit-sim environment ready ({self.state.simulation_env.duration_seconds:.0f}s)"
+        )
+
+    def _record_env_builder_failure(self, error: str, *, agent_result: AgentResult | None = None) -> None:
+        now = time.time()
+        started = self.state.simulation_env.started_at or now
+        self.state.simulation_env = SimulationEnvState(
+            status="failed",
+            brief=None,
+            artifact_path=None,
+            instantiate_script=None,
+            error=error,
+            started_at=started,
+            completed_at=now,
+            duration_seconds=max(0.0, now - started),
+            input_tokens=agent_result.input_tokens if agent_result is not None else 0,
+            output_tokens=agent_result.output_tokens if agent_result is not None else 0,
+            session_id=agent_result.session_id if agent_result is not None else None,
+            backend=self.state.simulation_env.backend,
+            model=self.state.simulation_env.model,
+        )
+        self.state.save()
+
+    def _finalize_env_builder_on_shutdown(self) -> None:
+        if self._env_builder_future is None:
+            return
+        try:
+            self._env_builder_future.result(timeout=10.0)
+        except Exception:
+            pass
+        try:
+            self._drain_env_builder_future()
+        except Exception:
+            pass
+
+    def _wait_for_env_builder_ready(self) -> bool:
+        """Block (per-claim) until env_builder reaches a terminal state. Returns
+        True if the env is ready, False if it failed or the wait was interrupted."""
+        if self.state.simulation_env.status in ("ready", "failed"):
+            return self.state.simulation_env.status == "ready"
+        while self._env_builder_future is not None and not self._env_builder_future.done():
+            if self._shutdown_event.is_set() or self.state.control.stop_requested:
+                return False
+            time.sleep(_IDLE_SLEEP_SECONDS)
+        if self._env_builder_future is not None:
+            self._drain_env_builder_future()
+        return self.state.simulation_env.status == "ready"
+
+    def _schedule_exploit_sim(self) -> bool:
+        """Submit exploit-sim attempts for verified-but-not-yet-attempted claims.
+
+        NON-GATING: verified claims proceed to the reporter regardless of the
+        exploit-sim outcome. Runs one attempt at a time so each claim gets a
+        fresh env instance without cross-claim state pollution."""
+        if not self._exploit_sim_enabled():
+            return False
+        if self._terminal_failure or self.state.control.stop_requested:
+            return False
+        if not self._pending_exploit_sim_claim_ids:
+            return False
+        available = 1 - len(self._exploit_sim_futures)
+        if available <= 0:
+            return False
+
+        scheduled = False
+        remaining: list[str] = []
+        in_flight = set(self._exploit_sim_futures.values())
+        for claim_id in self._pending_exploit_sim_claim_ids:
+            if available <= 0 or claim_id in in_flight:
+                remaining.append(claim_id)
+                continue
+            claim = self.state.claims.get(claim_id)
+            if claim is None or claim.status != "verified" or claim.exploit_sim_attempted:
+                continue
+            target = self.state.targets.get(claim.target_id)
+            if target is None:
+                continue
+            attempts = self._exploit_sim_attempts.get(claim_id, 0)
+            if attempts >= self._exploit_sim_spec.max_attempts:
+                continue
+            exploit_sim_id = str(uuid.uuid4())
+            claim.exploit_sim_id = exploit_sim_id
+            claim.exploit_sim_attempted = True
+            self.state.save()
+            future = self._exploit_sim_executor.submit(self._execute_exploit_sim, claim, target, exploit_sim_id)
+            self._exploit_sim_futures[future] = claim_id
+            self._exploit_sim_attempts[claim_id] = attempts + 1
+            available -= 1
+            scheduled = True
+
+        self._pending_exploit_sim_claim_ids = remaining
+        return scheduled
+
+    def _execute_exploit_sim(
+        self,
+        claim: ClaimRecord,
+        target: TargetRecord,
+        exploit_sim_id: str,
+    ) -> _ExploitSimExecutionResult:
+        """Env-builder (blocking wait) → runner-bounded attacker<->simulator loop
+        → exploit_judge categorization. Any infra failure yields sim_error /
+        sim_inconclusive with the claim STILL verified."""
+        spec = self._exploit_sim_spec
+        if spec is None:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_inconclusive",
+                config_deltas=[],
+                transcript_refs=[],
+                exchange_rounds=0,
+                agent_results=[],
+                error="exploit_sim spec missing",
+            )
+
+        if not self._wait_for_env_builder_ready():
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_inconclusive",
+                config_deltas=[],
+                transcript_refs=[],
+                exchange_rounds=0,
+                agent_results=[],
+                error=f"simulation environment not ready (status={self.state.simulation_env.status})",
+            )
+
+        sim_dir = self.working_dir / "output" / ".simulation-env" / exploit_sim_id
+        try:
+            sim_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_error",
+                config_deltas=[],
+                transcript_refs=[],
+                exchange_rounds=0,
+                agent_results=[],
+                error=f"could not create sim workspace: {exc}",
+            )
+
+        agent_results: list[AgentResult] = []
+        transcript_refs: list[str] = []
+        config_deltas: list[str] = []
+        transcript_lines: list[str] = []
+        packet = json.dumps(asdict(claim_to_verifier_packet(claim)), indent=2)
+        env_brief = self.state.simulation_env.brief or ""
+
+        try:
+            simulator_backend = self._get_backend(spec.simulator.backend)
+            attacker_backend = self._get_backend(spec.attacker.backend)
+
+            # Runner-owned bounded dialogue. The integer cap — NOT an LLM — decides
+            # when the exchange stops.
+            simulator_session: str | None = None
+            attacker_session: str | None = None
+            rounds_completed = 0
+            for round_index in range(spec.max_exchange_rounds):
+                sim_prompt = (
+                    (self._rendered_exploit_sim_prompts.get("simulator") or _DEFAULT_SIMULATOR_PROMPT)
+                    .replace("{working_dir}", str(self.working_dir))
+                    .replace("{sim_dir}", str(sim_dir))
+                    .replace("{env_brief}", env_brief)
+                    .replace("{claim_packet}", packet)
+                    .replace("{round}", str(round_index + 1))
+                    .replace("{max_rounds}", str(spec.max_exchange_rounds))
+                    .replace("{attacker_last}", transcript_lines[-1] if transcript_lines else "(none yet)")
+                )
+                sim_result = self._run_dialogue_turn(
+                    simulator_backend, "simulator", sim_prompt, sim_dir, simulator_session, spec.simulator.model
+                )
+                agent_results.append(sim_result)
+                simulator_session = sim_result.session_id or simulator_session
+                transcript_lines.append(f"[simulator r{round_index + 1}] {sim_result.output.strip()}")
+                config_deltas.extend(_parse_config_deltas(sim_result.output))
+
+                att_prompt = (
+                    (self._rendered_exploit_sim_prompts.get("attacker") or _DEFAULT_ATTACKER_PROMPT)
+                    .replace("{working_dir}", str(self.working_dir))
+                    .replace("{sim_dir}", str(sim_dir))
+                    .replace("{claim_packet}", packet)
+                    .replace("{round}", str(round_index + 1))
+                    .replace("{max_rounds}", str(spec.max_exchange_rounds))
+                    .replace("{simulator_last}", sim_result.output.strip())
+                )
+                att_result = self._run_dialogue_turn(
+                    attacker_backend, "attacker", att_prompt, sim_dir, attacker_session, spec.attacker.model
+                )
+                agent_results.append(att_result)
+                attacker_session = att_result.session_id or attacker_session
+                transcript_lines.append(f"[attacker r{round_index + 1}] {att_result.output.strip()}")
+                config_deltas.extend(_parse_config_deltas(att_result.output))
+                rounds_completed = round_index + 1
+        except Exception as exc:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_error",
+                config_deltas=config_deltas,
+                transcript_refs=transcript_refs,
+                exchange_rounds=0,
+                agent_results=agent_results,
+                error=f"attacker/simulator dialogue crashed: {exc}",
+            )
+
+        transcript_path = sim_dir / "dialogue.log"
+        try:
+            transcript_path.write_text("\n".join(transcript_lines), encoding="utf-8")
+            transcript_refs.append(str(transcript_path))
+        except Exception:
+            pass
+
+        # exploit_judge categorizes from the transcript + config-delta log.
+        judge_prompt = (
+            (self._rendered_exploit_sim_prompts.get("exploit_judge") or _DEFAULT_EXPLOIT_JUDGE_PROMPT)
+            .replace("{working_dir}", str(self.working_dir))
+            .replace("{claim_packet}", packet)
+            .replace("{transcript}", "\n".join(transcript_lines))
+            .replace("{config_deltas}", json.dumps(sorted(set(config_deltas))))
+        )
+        try:
+            judge_backend = self._get_backend(spec.judge.backend)
+            judge_result = judge_backend.run_agent(
+                judge_prompt,
+                working_dir=str(self.working_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env("exploit_judge"),
+                model=_resolve_model(spec.judge.backend, "exploit_judge", spec.judge.model),
+            )
+            agent_results.append(judge_result)
+        except Exception as exc:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_error",
+                config_deltas=sorted(set(config_deltas)),
+                transcript_refs=transcript_refs,
+                exchange_rounds=rounds_completed,
+                agent_results=agent_results,
+                error=f"exploit_judge raised: {exc}",
+            )
+        if judge_result.exit_code != 0:
+            return _ExploitSimExecutionResult(
+                claim_id=claim.claim_id,
+                category="sim_inconclusive",
+                config_deltas=sorted(set(config_deltas)),
+                transcript_refs=transcript_refs,
+                exchange_rounds=rounds_completed,
+                agent_results=agent_results,
+                error=f"exploit_judge exited with code {judge_result.exit_code}",
+            )
+        category, judge_deltas, judge_error = _parse_exploit_judge_output(judge_result.output)
+        merged_deltas = sorted(set(config_deltas) | set(judge_deltas))
+        return _ExploitSimExecutionResult(
+            claim_id=claim.claim_id,
+            category=category,
+            config_deltas=merged_deltas,
+            transcript_refs=transcript_refs,
+            exchange_rounds=rounds_completed,
+            agent_results=agent_results,
+            error=judge_error,
+        )
+
+    def _run_dialogue_turn(
+        self,
+        backend: Backend,
+        role: str,
+        prompt: str,
+        sim_dir: Path,
+        session_id: str | None,
+        model: str | None,
+    ) -> AgentResult:
+        if session_id:
+            return backend.resume_agent(
+                session_id,
+                prompt,
+                working_dir=str(sim_dir),
+                timeout=self.phase.timeout,
+                env=self._role_env(role),
+                model=_resolve_model(backend.name(), role, model),
+            )
+        return backend.run_agent(
+            prompt,
+            working_dir=str(sim_dir),
+            timeout=self.phase.timeout,
+            env=self._role_env(role),
+            model=_resolve_model(backend.name(), role, model),
+        )
+
+    def _apply_exploit_sim_result(self, result: _ExploitSimExecutionResult) -> None:
+        """Record the exploit-sim category on the claim, then enqueue the reporter.
+        NEVER rejects a verified claim or touches claim.status / rejection_class."""
+        for agent_result in result.agent_results:
+            self._add_tokens(agent_result)
+        claim = self.state.claims.get(result.claim_id)
+        if claim is None:
+            return
+        claim.exploit_category = result.category
+        self._enqueue_reporter(claim)
+        self.state.save()
+
+    def _rebuild_pending_exploit_sim_claim_ids(self) -> None:
+        """On resume, enqueue verified claims not yet exploit-sim-attempted."""
+        self._pending_exploit_sim_claim_ids = []
+        if not self._exploit_sim_enabled():
+            return
+        in_flight = set(self._exploit_sim_futures.values())
+        for claim in self.state.claims.values():
+            if claim.status != "verified" or claim.reported_at is not None:
+                continue
+            if claim.exploit_sim_attempted or claim.claim_id in in_flight:
+                continue
+            self._pending_exploit_sim_claim_ids.append(claim.claim_id)
 
     def _schedule_reporters(self) -> bool:
         """Submit reporter agent runs for any verified-but-not-reported claims."""
@@ -2398,6 +3341,9 @@ class DynamicAnalysisRunner:
         spec_backend = self._reporter_spec.backend if self._reporter_spec else "claude"
         spec_model = self._reporter_spec.model if self._reporter_spec else None
         backend = self._get_backend(spec_backend)
+        worker_attempt = self.state.worker_attempts.get(claim.attempt_id)
+        scratch_dir = self._scratch_dir_for_attempt(worker_attempt) if worker_attempt is not None else None
+        hooks_config = self._hooks_for_role("reporter", scratch_dir=scratch_dir)
         if is_retry and claim.reporter_session_id:
             result = backend.resume_agent(
                 claim.reporter_session_id,
@@ -2406,6 +3352,7 @@ class DynamicAnalysisRunner:
                 timeout=self.phase.timeout,
                 env=self._role_env("reporter"),
                 model=_resolve_model(spec_backend, "reporter", spec_model),
+                hooks_config=hooks_config,
             )
         else:
             result = backend.run_agent(
@@ -2416,6 +3363,7 @@ class DynamicAnalysisRunner:
                 model=_resolve_model(spec_backend, "reporter", spec_model),
                 system_prompt=system_prompt,
                 session_id=claim.reporter_session_id,
+                hooks_config=hooks_config,
             )
         if result.exit_code != 0:
             return _ReporterExecutionResult(
@@ -2716,13 +3664,7 @@ class DynamicAnalysisRunner:
                 generation=verification.generation,
             )
             self._refresh_target_after_verification(target)
-            if (
-                self._reporter_spec is not None
-                and claim.reported_at is None
-                and claim.claim_id not in self._pending_reporter_claim_ids
-                and claim.claim_id not in self._reporter_futures.values()
-            ):
-                self._pending_reporter_claim_ids.append(claim.claim_id)
+            self._enqueue_post_verification(claim)
             self.state.save()
             return
 
@@ -3007,13 +3949,43 @@ class DynamicAnalysisRunner:
         normalized: list[TargetRecord] = []
         seen_ids: set[str] = set()
         for proposal in turn.enqueue_targets:
-            if proposal.target_id in seen_ids or proposal.target_id in self.state.targets:
+            # Surface drops as events so the captain sees them on its next
+            # delta and can self-correct (and so users on --interactive see
+            # the reason in the dashboard). Without this, the captain
+            # repeatedly proposes targets that get silently filtered and
+            # never learns why — its frontier-context files only list
+            # non-terminal targets, so it can't tell which ids are taken.
+            if proposal.target_id in seen_ids:
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason="duplicate-in-this-batch",
+                )
+                continue
+            if proposal.target_id in self.state.targets:
+                existing_status = self.state.targets[proposal.target_id].status
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason=f"target-id-already-exists (status={existing_status})",
+                )
                 continue
             try:
                 validate_target_scope(proposal.scope_paths, self.working_dir)
-            except ValueError:
+            except ValueError as exc:
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason=f"scope-invalid: {exc}",
+                )
                 continue
-            if any(dependency_id not in self.state.claims for dependency_id in proposal.depends_on_claim_ids):
+            missing_deps = [d for d in proposal.depends_on_claim_ids if d not in self.state.claims]
+            if missing_deps:
+                self.state.append_event(
+                    "captain.proposal_dropped",
+                    target_id=proposal.target_id,
+                    reason=f"depends_on_claim_ids references unknown claim(s): {missing_deps}",
+                )
                 continue
             seen_ids.add(proposal.target_id)
             normalized.append(
@@ -3056,6 +4028,8 @@ class DynamicAnalysisRunner:
 
     def _has_active_runtime_work(self) -> bool:
         if self._worker_futures or self._verifier_futures or self._reporter_futures:
+            return True
+        if self._exploit_sim_futures or self._pending_exploit_sim_claim_ids:
             return True
         if self._pending_claim_retries or self._pending_reporter_claim_ids:
             return True
@@ -3394,12 +4368,18 @@ class DynamicAnalysisRunner:
             return
         in_flight = set(self._reporter_futures.values())
         queued = set(self._pending_reporter_claim_ids)
+        exploit_sim_on = self._exploit_sim_enabled()
         for claim in self.state.claims.values():
             if claim.status != "verified":
                 continue
             if claim.reported_at is not None:
                 continue
             if claim.claim_id in in_flight or claim.claim_id in queued:
+                continue
+            # When exploit-sim is enabled, a claim that has not yet been attempted
+            # belongs in the exploit-sim queue first — the reporter runs only after
+            # categorization. Attempted claims fall through to the reporter here.
+            if exploit_sim_on and not claim.exploit_sim_attempted:
                 continue
             self._pending_reporter_claim_ids.append(claim.claim_id)
 
@@ -3945,7 +4925,7 @@ class DynamicAnalysisRunner:
         except Exception:
             pass
 
-    def _load_subagent_scope_for_verifier(self) -> str | None:
+    def _load_subagent_scope_for_verifier(self, backend: str | None = None) -> str | None:
         """Return the body of `.claude/agents/attack-surface.md` wrapped in a
         verifier-mode framing for the ``trust-model`` verifier, or None if
         unavailable.
@@ -3958,6 +4938,11 @@ class DynamicAnalysisRunner:
         its own is analyst-mode and would just answer questions). The body
         already embeds the project brief, so the caller skips the standard
         brief-block injection for this verifier.
+
+        The subagent body is identical across vendors (the runtime-written
+        `.claude/agents/attack-surface.md` is the source; the codex-side
+        `.codex/agents/attack-surface.toml` carries the same body), so the only
+        backend-dependent bit is which definition path the framing cites.
 
         Falls back to None when the subagent file is missing (analyst failed
         / hasn't run); the caller then uses the YAML scope.
@@ -3976,10 +4961,13 @@ class DynamicAnalysisRunner:
         body = content.lstrip()
         if not body:
             return None
+        def_path = (
+            ".codex/agents/attack-surface.toml" if _backend_is_codex(backend) else ".claude/agents/attack-surface.md"
+        )
         verifier_framing = (
             "## Specialized scope: trust-model gate\n\n"
             "**You are this run's `attack-surface` subagent — the same role and same project "
-            "knowledge as the file at `.claude/agents/attack-surface.md`. The body of that "
+            f"knowledge as the file at `{def_path}`. The body of that "
             "subagent definition is reproduced verbatim below, including the project brief.**\n\n"
             "You are operating in **verifier mode** for the trust-model gate (verifier 2 of 4). "
             "The previous verifier (`attack-surface`) already classified the bug class and "
@@ -4012,6 +5000,78 @@ class DynamicAnalysisRunner:
         )
         return f"{verifier_framing}{body}"
 
+    _ATTACK_SURFACE_DESCRIPTION = (
+        "Project-specific trust-model and attack-surface analyst. Invoke this "
+        "subagent before assuming anything about what is in/out of scope, what is "
+        "attacker-reachable, or what the project considers by-design. The subagent has the "
+        "full project brief in context and can do additional code/web research per question."
+    )
+
+    def _attack_surface_body(self, brief: str) -> str:
+        """The runtime attack-surface subagent body (shared by the Claude `.md` and Codex `.toml`)."""
+        return (
+            "You are the project's attack-surface analyst for this Juvenal bug-finding run. "
+            "The project brief below is your source of truth — quote and cite it when answering. "
+            "If the question goes beyond the brief, you may use Read / Grep / Glob over "
+            f"`{self.working_dir}` and WebFetch / WebSearch to do additional research before "
+            "answering. Keep answers focused and cite specific files, docs, or URLs whenever "
+            "possible. Reply with a concise direct answer; do not dump the entire brief back.\n\n"
+            "If the calling agent's question does not have a confident answer, say so plainly — "
+            "do not fabricate scope rules or trust-model claims that are not in the brief.\n\n"
+            "## Default scoping rule: pure-DoS is a bug, not a bug-bounty vulnerability\n\n"
+            "A pure-DoS / crash-only finding (`the parser segfaults on malformed input`, "
+            "`the daemon hangs on a crafted packet`) IS a real bug — it just is NOT a "
+            "vulnerability for bug-bounty / VRP purposes. Unless the project brief below "
+            "explicitly says otherwise, treat pure-DoS findings as **out of bug-bounty scope** "
+            "and tell the calling agent to reject the claim on scope grounds. The bar for an "
+            "in-scope memory-safety report is a corruption primitive that goes beyond a crash: "
+            "UAF, OOB write into attacker-controlled state, type confusion exploitable for "
+            "code execution, heap overflow, double-free, etc. Crashes that imply such "
+            "corruption (e.g., an ASan write-of-N report, a UAF backtrace) remain in scope "
+            "unless the brief excludes them. When a calling agent asks whether a crash-only "
+            "finding is in scope, default to NO and direct them to the brief's bounty-scope "
+            "section to confirm.\n\n"
+            "<<PROJECT_BRIEF_BEGIN>>\n"
+            f"{brief}\n"
+            "<<PROJECT_BRIEF_END>>\n"
+        )
+
+    def _write_codex_attack_surface_subagent(self, brief: str) -> Path | None:
+        """Emit the runtime attack-surface subagent as `.codex/agents/attack-surface.toml`.
+
+        Mirrors the Claude `.md` write from the same body so a codex-backed role can spawn
+        the analyst natively. Best-effort — a failure here never blocks the Claude write.
+        """
+        try:
+            agents_dir = self.working_dir / ".codex" / "agents"
+            agents_dir.mkdir(parents=True, exist_ok=True)
+            toml_file = agents_dir / "attack-surface.toml"
+            toml_file.write_text(
+                _codex_agent_toml("attack-surface", self._ATTACK_SURFACE_DESCRIPTION, self._attack_surface_body(brief)),
+                encoding="utf-8",
+            )
+            return toml_file
+        except Exception as exc:
+            self._emit_analyst_message(f"[juvenal] failed to write codex attack-surface subagent: {exc}")
+            return None
+
+    def _uses_codex_backend(self) -> bool:
+        """True when any orchestrated role (captain/worker/verifier/reporter/analyst/exploit-sim) runs on Codex."""
+        names: list[str | None] = [
+            self.config.captain_backend,
+            self.config.worker_backend,
+            self.config.verifier_backend,
+        ]
+        names.extend(spec.backend for spec in self._verifier_chain)
+        if self._reporter_spec is not None:
+            names.append(self._reporter_spec.backend)
+        if self._analyst_spec is not None:
+            names.append(self._analyst_spec.backend)
+        if self._exploit_sim_spec is not None:
+            es = self._exploit_sim_spec
+            names.extend([es.env_builder.backend, es.simulator.backend, es.attacker.backend, es.judge.backend])
+        return any(_backend_is_codex(n) for n in names)
+
     def _write_subagent_definition(self, brief: str) -> Path | None:
         try:
             agents_dir = self.working_dir / ".claude" / "agents"
@@ -4020,54 +5080,116 @@ class DynamicAnalysisRunner:
             content = (
                 "---\n"
                 "name: attack-surface\n"
-                "description: Project-specific trust-model and attack-surface analyst. Invoke this "
-                "subagent before assuming anything about what is in/out of scope, what is "
-                "attacker-reachable, or what the project considers by-design. The subagent has the "
-                "full project brief in context and can do additional code/web research per question.\n"
+                f"description: {self._ATTACK_SURFACE_DESCRIPTION}\n"
                 "tools: Read, Grep, Glob, WebFetch, WebSearch\n"
-                "---\n\n"
-                "You are the project's attack-surface analyst for this Juvenal bug-finding run. "
-                "The project brief below is your source of truth — quote and cite it when answering. "
-                "If the question goes beyond the brief, you may use Read / Grep / Glob over "
-                f"`{self.working_dir}` and WebFetch / WebSearch to do additional research before "
-                "answering. Keep answers focused and cite specific files, docs, or URLs whenever "
-                "possible. Reply with a concise direct answer; do not dump the entire brief back.\n\n"
-                "If the calling agent's question does not have a confident answer, say so plainly — "
-                "do not fabricate scope rules or trust-model claims that are not in the brief.\n\n"
-                "## Default scoping rule: pure-DoS is a bug, not a bug-bounty vulnerability\n\n"
-                "A pure-DoS / crash-only finding (`the parser segfaults on malformed input`, "
-                "`the daemon hangs on a crafted packet`) IS a real bug — it just is NOT a "
-                "vulnerability for bug-bounty / VRP purposes. Unless the project brief below "
-                "explicitly says otherwise, treat pure-DoS findings as **out of bug-bounty scope** "
-                "and tell the calling agent to reject the claim on scope grounds. The bar for an "
-                "in-scope memory-safety report is a corruption primitive that goes beyond a crash: "
-                "UAF, OOB write into attacker-controlled state, type confusion exploitable for "
-                "code execution, heap overflow, double-free, etc. Crashes that imply such "
-                "corruption (e.g., an ASan write-of-N report, a UAF backtrace) remain in scope "
-                "unless the brief excludes them. When a calling agent asks whether a crash-only "
-                "finding is in scope, default to NO and direct them to the brief's bounty-scope "
-                "section to confirm.\n\n"
-                "<<PROJECT_BRIEF_BEGIN>>\n"
-                f"{brief}\n"
-                "<<PROJECT_BRIEF_END>>\n"
+                "---\n\n" + self._attack_surface_body(brief)
             )
             agent_file.write_text(content, encoding="utf-8")
+            # Dual-emit the Codex definition when a codex-backed role may spawn it.
+            if self._uses_codex_backend():
+                self._write_codex_attack_surface_subagent(brief)
             return agent_file
         except Exception as exc:
             self._emit_analyst_message(f"[juvenal] failed to write attack-surface subagent: {exc}")
             return None
 
-    def _project_brief_block(self) -> str:
-        """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt."""
+    def _subagent_invoke_phrase(self, backend: str | None) -> str:
+        """Backend-specific instruction for reaching the `attack-surface` subagent.
+
+        Claude spawns subagents via its native Agent tool; Codex spawns them natively
+        from the `.codex/agents/attack-surface.toml` definition this runner emits. Only
+        the invocation verb differs — the role and its project knowledge are identical.
+        """
+        if _backend_is_codex(backend):
+            return (
+                "**spawn the `attack-surface` subagent** (defined in "
+                "`.codex/agents/attack-surface.toml`), wait for its result, then use it"
+            )
+        return "**invoke the `attack-surface` subagent via the Agent tool**"
+
+    def _worker_fanout_block(self, backend: str | None) -> str:
+        """Backend-aware 'fan out into your own subagents, then synthesize' guidance.
+
+        Injected into the worker system prompt when `worker_dynamic_workflow` is on
+        (default). The worker's loop position and one-WORKER_JSON output contract do
+        NOT change — only its INTERNAL investigation method does: it spawns its own
+        subagents to explore competing hypotheses/attack-angles in parallel, then
+        folds their findings into the single structured result it already returns.
+        Claude fans out via the native Agent tool; Codex spawns natively from its
+        `.codex/agents/*.toml` definitions and degrades to a strong single pass when
+        that mechanism is unavailable rather than faking parallelism.
+        """
+        header = (
+            "## Investigate as a mini-captain: fan out, then synthesize\n\n"
+            "You have ONE assigned target, but that target usually admits several "
+            "competing hypotheses (different sink candidates, attack angles, guard-bypass "
+            "theories, or PoC strategies). Instead of exploring them one at a time in your "
+            "own context, delegate them to subagents that run in parallel, then SYNTHESIZE "
+            "their evidence into your result. This does not change your job: you still "
+            "return **exactly one WORKER_JSON block** with the same outcome "
+            "(`claims` / `no_findings` / `blocked`) and the same claim shape. The fan-out is "
+            "purely your internal method — the runner still treats you as a single worker on "
+            "a single target.\n\n"
+        )
+        if _backend_is_codex(backend):
+            mechanism = (
+                "### How to fan out (Codex)\n\n"
+                "If your Codex backend has native subagent spawning (multi-agent) enabled, "
+                "spawn 2-4 parallel subagents — one per distinct hypothesis or attack angle — "
+                "wait for all of them, then reconcile their findings. Reuse the "
+                "`.codex/agents/*.toml` roles this run emits (e.g. `attack-surface`) where "
+                "they fit. Keep the fan-out shallow (one layer): subagents investigate and "
+                "report evidence; YOU alone decide the final claims and emit the single "
+                "WORKER_JSON.\n\n"
+                "If native spawning is unavailable in this environment, do NOT fake it and do "
+                "NOT emit multiple WORKER_JSON blocks. Instead run a strong single pass: "
+                "enumerate the competing hypotheses explicitly, work each to a conclusion "
+                "yourself, and note in your `summary` that you investigated sequentially "
+                "because subagent spawning was unavailable.\n\n"
+            )
+        else:
+            mechanism = (
+                "### How to fan out (Claude)\n\n"
+                "Use the **Agent tool** to spawn 2-4 subagents in parallel, one per distinct "
+                "hypothesis or attack angle. Each subagent runs in its own fresh context, so "
+                "put every file path, error string, and code excerpt it needs directly in the "
+                "Agent prompt, and ask it to return a compact evidence summary (what it "
+                "confirmed/refuted, the exact sink/guard, any sanitizer output). Where a "
+                "named role fits — e.g. the project-scoped `attack-surface` subagent, or the "
+                "`.claude/agents/*` roles present in this repo — invoke it by name. Keep the "
+                "fan-out shallow: subagents gather evidence; YOU alone reconcile it and emit "
+                "the single WORKER_JSON. Spawn only as many as the target warrants — each "
+                "subagent costs tokens and wall-clock.\n\n"
+            )
+        guardrail = (
+            "### Fan-out guardrails (unchanged)\n\n"
+            "- Keep all PoC artifacts in your assigned `scratch_dir`; the `output/` tree "
+            "stays off-limits to you and every subagent you spawn (the runner denies writes "
+            "there).\n"
+            "- Stay inside your assigned target's scope — do not let a subagent sprawl into "
+            "adjacent surfaces the captain owns.\n"
+            "- One layer of fan-out is enough; do not build deep recursive agent trees.\n"
+            "- The final synthesis is yours: emit exactly one WORKER_JSON, never one per "
+            "subagent.\n"
+        )
+        return header + mechanism + guardrail
+
+    def _project_brief_block(self, backend: str | None = None) -> str:
+        """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt.
+
+        ``backend`` tailors the subagent-invocation wording (Claude Agent tool vs. Codex
+        native spawn); ``None`` keeps the Claude phrasing (default backend).
+        """
         spec = self._analyst_spec
         if spec is None or not spec.enabled:
             return ""
         state = self.state.attack_surface
+        invoke = self._subagent_invoke_phrase(backend)
         guidance = (
             "## Attack-surface subagent (always available)\n\n"
             "Before assuming anything about the project's trust model, attack surface, what is "
             "attacker-reachable, what is in/out of scope, or what the project considers by-design, "
-            "**invoke the `attack-surface` subagent via the Agent tool**. It is fast, has the full "
+            f"{invoke}. It is fast, has the full "
             "project brief in context, and can do additional code/web research per question. "
             "Treat its answers as authoritative for project-specific trust assumptions.\n"
         )
@@ -4084,7 +5206,7 @@ class DynamicAnalysisRunner:
                 "## Project brief (attack-surface analyst)\n\n"
                 "PROJECT_BRIEF: not ready yet — the attack-surface analyst is still running. "
                 "Proceed with the information you have and consult the `attack-surface` subagent "
-                "via the Agent tool if it has finished by the time you reach a project-specific "
+                "if it has finished by the time you reach a project-specific "
                 "trust-model question. The subagent will respond `BRIEF_NOT_READY` until the "
                 "analyst completes.\n"
             )
@@ -4183,3 +5305,17 @@ class DynamicAnalysisRunner:
         if role == "verifier" and verifier_name:
             env["JUVENAL_ANALYSIS_VERIFIER_NAME"] = verifier_name
         return env
+
+    def _hooks_for_role(self, role: str, *, scratch_dir: Path | None = None) -> dict[str, Any] | None:
+        """Per-role `--settings` fragment enforcing write guardrails (`//abs/**` deny globs)."""
+        output_dir = self.working_dir / "output"
+        if role in ("worker", "verifier"):
+            # output/ is the reporter's tree. Verifier source writes stay open —
+            # the poc verifier builds/runs harnesses in-tree, so a broader deny
+            # would also block the sanitizer build it needs to reproduce a claim.
+            deny = [f"Write(//{output_dir}/**)", f"Edit(//{output_dir}/**)"]
+            return {"permissions": {"deny": deny}}
+        if role == "reporter" and scratch_dir is not None:
+            deny = [f"Write(//{scratch_dir}/**)", f"Edit(//{scratch_dir}/**)"]
+            return {"permissions": {"deny": deny}}
+        return None

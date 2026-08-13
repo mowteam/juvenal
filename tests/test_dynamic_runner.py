@@ -1914,7 +1914,68 @@ def test_build_worker_prompt_omits_workflow_scope_when_unset(tmp_path):
     system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
 
     assert "You are a scoped analysis worker" in system_prompt
-    # No trailing scope content — system prompt ends at the framework role.
+    # The default (worker_dynamic_workflow=True) appends the fan-out block, so
+    # the system prompt is the framework role PLUS that block — not bare role.
+    assert "fan out, then synthesize" in system_prompt
+    assert system_prompt.startswith(runner._worker_role_prompt)
+
+
+def test_worker_system_prompt_injects_claude_fanout_by_default(tmp_path):
+    """With worker_dynamic_workflow on (default) and a Claude worker backend,
+    the worker becomes a mini-captain: it gets the Claude Agent-tool fan-out
+    guidance and is reminded its one-WORKER_JSON contract is unchanged."""
+    config = AnalysisConfig(worker_backend="claude")
+    assert config.worker_dynamic_workflow is True
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "mini-captain" in system_prompt
+    assert "How to fan out (Claude)" in system_prompt
+    assert "Agent tool" in system_prompt
+    assert "exactly one WORKER_JSON" in system_prompt
+    # Must NOT emit the Codex path for a Claude worker.
+    assert "How to fan out (Codex)" not in system_prompt
+
+
+def test_worker_system_prompt_injects_codex_fanout_and_degrades(tmp_path):
+    """A Codex worker backend gets the Codex native-spawn guidance AND the
+    graceful single-pass degrade instruction — the runner must not fake
+    Claude-style Agent-tool fan-out for Codex."""
+    config = AnalysisConfig(worker_backend="codex")
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "How to fan out (Codex)" in system_prompt
+    assert ".codex/agents" in system_prompt
+    # Graceful degradation, not faked fan-out.
+    assert "native spawning is unavailable" in system_prompt
+    assert "do NOT fake it" in system_prompt
+    # Must NOT emit the Claude Agent-tool path for a Codex worker.
+    assert "How to fan out (Claude)" not in system_prompt
+
+
+def test_worker_system_prompt_omits_fanout_when_disabled(tmp_path):
+    """worker_dynamic_workflow=False keeps the legacy single-pass worker: no
+    fan-out block, no mini-captain framing."""
+    config = AnalysisConfig(worker_dynamic_workflow=False)
+    runner = _make_unstarted_runner(tmp_path, config)
+    target = _system_split_target("target-x")
+    runner.state.targets[target.target_id] = target
+    attempt = _system_split_attempt("attempt-x", target.target_id)
+
+    system_prompt, _user_prompt = runner._build_worker_prompt(target, attempt)
+
+    assert "fan out, then synthesize" not in system_prompt
+    assert "mini-captain" not in system_prompt
+    # No workflow scope + fan-out off => system prompt is exactly the role.
     assert system_prompt == runner._worker_role_prompt
 
 
@@ -2576,6 +2637,164 @@ def test_sweep_dead_dep_targets_walks_retry_chain(tmp_path):
     assert runner.state.targets[dependent.target_id].status == "queued"
 
 
+def test_normalize_captain_targets_emits_drop_event_on_id_collision(tmp_path):
+    """When the captain proposes a target_id that already exists (likely a
+    terminal-status target the captain can't see in frontier.json), the
+    proposal is silently filtered. The runner must emit a
+    `captain.proposal_dropped` event so (a) the user sees it in the
+    interactive dashboard and (b) the captain sees it on its next delta
+    and self-corrects. Production regression: in the openthread run, the
+    captain proposed batches of 12 targets that all evaporated because
+    their ids collided with old terminal targets — captain had no
+    feedback and just kept retrying the same pattern."""
+    from juvenal.dynamic.models import CaptainTurn, TargetProposal
+
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    existing = _system_split_target("target-collide")
+    existing.status = "no_findings"
+    runner.state.targets[existing.target_id] = existing
+
+    src_path = tmp_path / "src"
+    src_path.mkdir()
+    (src_path / "app.py").write_text("# stub\n", encoding="utf-8")
+
+    turn = CaptainTurn(
+        message_to_user="",
+        acknowledged_directive_ids=[],
+        mental_model_summary="",
+        open_questions=[],
+        enqueue_targets=[
+            TargetProposal(
+                target_id="target-collide",
+                title="Collides with the existing terminal target id",
+                kind="module-level",
+                priority=80,
+                scope_paths=["src/app.py"],
+                scope_symbols=[],
+                instructions="Doesn't matter; will be dropped.",
+                depends_on_claim_ids=[],
+                spawn_reason="Test fixture.",
+            ),
+        ],
+        defer_target_ids=[],
+        termination_state="continue",
+        termination_reason="",
+    )
+
+    normalized = runner._normalize_captain_targets(turn)
+
+    assert normalized == []
+    drop_events = [e for e in runner.state.events if e.event_type == "captain.proposal_dropped"]
+    assert len(drop_events) == 1
+    assert drop_events[0].target_id == "target-collide"
+    assert "already-exists" in (drop_events[0].payload or {}).get("reason", "")
+
+
+def test_pending_captain_delta_includes_dropped_proposals(tmp_path):
+    """The CaptainDelta surfaces dropped proposals so the captain sees them
+    on its next turn and can fix the cause."""
+    from juvenal.dynamic.models import CaptainTurn, TargetProposal
+
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    existing = _system_split_target("target-already")
+    existing.status = "blocked"
+    runner.state.targets[existing.target_id] = existing
+    src_path = tmp_path / "src"
+    src_path.mkdir()
+    (src_path / "app.py").write_text("# stub\n", encoding="utf-8")
+
+    turn = CaptainTurn(
+        message_to_user="",
+        acknowledged_directive_ids=[],
+        mental_model_summary="",
+        open_questions=[],
+        enqueue_targets=[
+            TargetProposal(
+                target_id="target-already",
+                title="Collides",
+                kind="module-level",
+                priority=80,
+                scope_paths=["src/app.py"],
+                scope_symbols=[],
+                instructions="Will be dropped.",
+                depends_on_claim_ids=[],
+                spawn_reason="Test fixture.",
+            ),
+        ],
+        defer_target_ids=[],
+        termination_state="continue",
+        termination_reason="",
+    )
+
+    runner._normalize_captain_targets(turn)
+    delta = runner.state.pending_captain_delta()
+
+    assert any(d["target_id"] == "target-already" for d in delta.dropped_proposals)
+
+
+def test_should_terminate_succeeds_when_some_exhausted_but_claims_verified(tmp_path):
+    """All-terminal frontier with at least one verified claim is a SUCCESS,
+    even if some targets exhausted along the way. Production regression: in
+    the openthread run, 23 completed targets + 28 verified claims + 11
+    exhausted targets exited with `analysis exhausted retry budget across
+    all targets` because the failure check tripped on the exhausted count
+    before the all-terminal-success check could fire."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    # Bump captain past turn 0 so the secondary all-terminal check is reachable.
+    runner.state.captain.turn_index = 5
+    runner._last_captain_snapshot = runner._captain_snapshot()
+
+    completed = _system_split_target("target-completed")
+    completed.status = "completed"
+    runner.state.targets[completed.target_id] = completed
+    verified_claim = _system_split_claim("claim-verified", completed.target_id)
+    verified_claim.status = "verified"
+    runner.state.claims[verified_claim.claim_id] = verified_claim
+
+    exhausted = _system_split_target("target-exhausted")
+    exhausted.status = "exhausted"
+    runner.state.targets[exhausted.target_id] = exhausted
+
+    # Captain has consumed everything (no pending delta).
+    runner.state.captain.last_delivered_event_seq = max((e.seq for e in runner.state.events), default=0)
+
+    terminate, success, reason = runner._should_terminate()
+
+    assert terminate is True
+    assert success is True
+    assert reason == ""
+
+
+def test_should_terminate_fails_when_no_verified_claims(tmp_path):
+    """A run where every target hits terminal AND no claim was ever
+    verified is a genuine failure — the analysis produced nothing."""
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4)
+    runner = _make_unstarted_runner(tmp_path, config)
+    runner.state.captain.turn_index = 5
+    runner._last_captain_snapshot = runner._captain_snapshot()
+
+    exhausted = _system_split_target("target-exhausted")
+    exhausted.status = "exhausted"
+    runner.state.targets[exhausted.target_id] = exhausted
+    rejected_claim = _system_split_claim("claim-rejected", exhausted.target_id)
+    rejected_claim.status = "rejected"
+    rejected_claim.retry_count = 10
+    runner.state.claims[rejected_claim.claim_id] = rejected_claim
+
+    runner.state.captain.last_delivered_event_seq = max((e.seq for e in runner.state.events), default=0)
+
+    terminate, success, reason = runner._should_terminate()
+
+    assert terminate is True
+    assert success is False
+    assert "exhausted retry budget" in reason
+
+
 def test_sweep_dead_dep_targets_treats_terminal_target_claim_as_dead(tmp_path):
     """A rejected dep claim with retry budget remaining is functionally dead
     if its target is in a terminal status (blocked/exhausted/no_findings/
@@ -2635,3 +2854,85 @@ def test_sweep_dead_dep_targets_respects_pending_retry_queue(tmp_path):
 
     assert progressed is False
     assert runner.state.targets[dependent.target_id].status == "queued"
+
+
+def _bare_runner(tmp_path, backend=None):
+    """Construct a runner without running it, for direct method-level assertions."""
+    backend = backend or MockBackend()
+    phase = Phase(id="analyze", type="analysis", prompt="x", analysis=AnalysisConfig())
+    workflow = Workflow(name="x", phases=[phase], working_dir=str(tmp_path))
+    state_file = tmp_path / "state.json"
+    with patch("juvenal.dynamic.runner.create_backend", side_effect=lambda name: backend):
+        return DynamicAnalysisRunner(
+            phase=phase,
+            workflow=workflow,
+            state_file=state_file,
+            run_mode="fresh",
+            display=Display(plain=True),
+            interactive=False,
+        )
+
+
+class TestHooksForRole:
+    def test_worker_denies_output_writes(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        cfg = runner._hooks_for_role("worker")
+        deny = cfg["permissions"]["deny"]
+        output_dir = runner.working_dir / "output"
+        assert f"Write(//{output_dir}/**)" in deny
+        assert f"Edit(//{output_dir}/**)" in deny
+
+    def test_verifier_denies_output_writes(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        cfg = runner._hooks_for_role("verifier")
+        deny = cfg["permissions"]["deny"]
+        output_dir = runner.working_dir / "output"
+        assert f"Write(//{output_dir}/**)" in deny
+        # Verifier must remain able to build/run a PoC in-tree, so source writes
+        # are NOT denied — only the reporter-owned output/ tree is off-limits.
+        assert "Write" not in deny
+        assert "Edit" not in deny
+
+    def test_reporter_denies_scratch_writes_but_not_report_dir(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        scratch = tmp_path / ".juvenal" / "scratch" / "task-1"
+        cfg = runner._hooks_for_role("reporter", scratch_dir=scratch)
+        deny = cfg["permissions"]["deny"]
+        assert f"Write(//{scratch}/**)" in deny
+        assert f"Edit(//{scratch}/**)" in deny
+        # The report dir itself is never denied.
+        report_dir = runner.working_dir / "output"
+        assert not any(str(report_dir) in rule and "scratch" not in rule for rule in deny)
+
+    def test_reporter_without_scratch_is_unrestricted(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        assert runner._hooks_for_role("reporter", scratch_dir=None) is None
+
+    def test_captain_and_analyst_unrestricted(self, tmp_path):
+        runner = _bare_runner(tmp_path)
+        assert runner._hooks_for_role("captain") is None
+        assert runner._hooks_for_role("analyst") is None
+
+
+def test_worker_dispatch_passes_hooks_config_to_backend(tmp_path):
+    """The runner threads the worker guardrail through to the backend call."""
+    backend = MockBackend()
+    runner = _bare_runner(tmp_path, backend=backend)
+    # _get_backend caches per name; seed it so the dispatch call routes to the mock.
+    runner._backend_by_name[runner.config.worker_backend] = backend
+    attempt = WorkerAttempt(
+        attempt_id="task-1",
+        target_id="t1",
+        generation=0,
+        backend="claude",
+        session_id="sess-1",
+        status="queued",
+        started_at=None,
+        completed_at=None,
+    )
+    runner._execute_worker_attempt(attempt, "prompt body", system_prompt="sys")
+    worker_calls = [(role, cfg) for role, cfg in backend.hooks_config_calls if cfg is not None]
+    assert worker_calls, "worker call did not carry a hooks_config"
+    _, cfg = worker_calls[-1]
+    output_dir = runner.working_dir / "output"
+    assert f"Write(//{output_dir}/**)" in cfg["permissions"]["deny"]
