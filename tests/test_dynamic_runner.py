@@ -2568,12 +2568,20 @@ def test_sweep_dead_dep_targets_blocks_when_dep_exhausted(tmp_path):
     assert progressed is True
     blocked = runner.state.targets[dependent.target_id]
     assert blocked.status == "blocked"
-    # Event recorded so the captain sees the blocker on the next delta.
+    # Reported as dependency_stranded, NOT blocked: the captain is told never to
+    # respawn a blocked target, which would silently discard work that was never
+    # attempted. The stranded event carries the opposite instruction.
     blocker_events = [
-        e for e in runner.state.events if e.event_type == "target.blocked" and e.target_id == "target-dependent"
+        e
+        for e in runner.state.events
+        if e.event_type == "target.dependency_stranded" and e.target_id == "target-dependent"
     ]
     assert len(blocker_events) == 1
-    assert "claim-parent" in blocker_events[0].payload.get("blocker", "")
+    payload = blocker_events[0].payload
+    assert "claim-parent" in payload.get("blocker", "")
+    assert payload.get("stranded_dependencies") == ["claim-parent"]
+    assert "depends_on_claim_ids: []" in payload.get("remedy", "")
+    assert not [e for e in runner.state.events if e.event_type == "target.blocked"]
 
 
 def test_sweep_dead_dep_targets_leaves_alive_dep_alone(tmp_path):
@@ -2996,3 +3004,36 @@ def test_dead_session_error_cold_restarts_without_burning_budget(tmp_path):
     target.active_attempt_id = successor.attempt_id
     runner._apply_worker_result(_failure(successor.attempt_id))
     assert runner.state.targets[target.target_id].error_retry_count == 1
+
+
+def test_dependency_stranded_reaches_the_captain_as_its_own_delta(tmp_path):
+    """A stranded target must arrive as a distinct, actionable delta.
+
+    Regression for: the sweep emitted `target.blocked`, and the captain is
+    instructed never to respawn a blocked target. Nine targets — seven of them
+    the highest-priority in the run — were discarded that way without a single
+    worker dispatch, because the one recoverable kind of block was
+    indistinguishable from the kinds that genuinely need a new approach.
+    """
+    config = AnalysisConfig(shared_agent_budget=True, max_agents=4, max_worker_retries=1)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    parent = _system_split_target("target-parent")
+    parent.status = "blocked"
+    runner.state.targets[parent.target_id] = parent
+    parent_claim = _system_split_claim("claim-parent", parent.target_id)
+    parent_claim.status = "rejected"
+    parent_claim.retry_count = 99
+    runner.state.claims[parent_claim.claim_id] = parent_claim
+
+    dependent = _system_split_target("target-dependent")
+    dependent.status = "queued"
+    dependent.depends_on_claim_ids = [parent_claim.claim_id]
+    runner.state.targets[dependent.target_id] = dependent
+
+    assert runner._sweep_dead_dep_targets() is True
+
+    delta = runner.state.pending_captain_delta()
+    assert delta.dependency_stranded_target_ids == ["target-dependent"]
+    # Must NOT be folded in with the blocked targets, whose policy is "leave it".
+    assert "target-dependent" not in delta.blocked_target_ids

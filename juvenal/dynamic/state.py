@@ -35,6 +35,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
         "claim.retry_scheduled",
         "target.no_findings",
         "target.blocked",
+        "target.dependency_stranded",
         "target.exhausted",
         "directive.received",
         "captain.proposal_dropped",
@@ -404,6 +405,13 @@ class DynamicSessionState:
                         event.target_id
                         for event in unread_events
                         if event.event_type == "target.exhausted" and event.target_id
+                    ]
+                ),
+                dependency_stranded_target_ids=_dedupe_preserve_order(
+                    [
+                        event.target_id
+                        for event in unread_events
+                        if event.event_type == "target.dependency_stranded" and event.target_id
                     ]
                 ),
                 pending_directive_ids=_dedupe_preserve_order(

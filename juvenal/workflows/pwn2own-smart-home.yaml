@@ -839,6 +839,10 @@ phases:
       - **No-findings target**: do NOT re-investigate the same scope. Only spawn
         an adjacent fresh-angle target if you have a concrete new reason.
       - **Blocked target**: do NOT respawn until the blocker is addressed.
+      - **Dependency-stranded target**: the exception — DO re-enqueue it, with
+        `depends_on_claim_ids: []`. It never ran; its dependency claim was
+        rejected so the gate could never open. Inline whatever the rejected
+        claim established into `instructions` and keep going.
 
       Priority order, adjusted by what the recap says the device runs:
       1. Unauthenticated network services and the parsers behind them
@@ -1012,6 +1016,8 @@ phases:
            - No-findings target: do NOT re-investigate; only spawn an adjacent fresh-angle
              target if you have a concrete new reason.
            - Blocked target: do NOT respawn until the blocker is addressed.
+           - Dependency-stranded target: DO re-enqueue with `depends_on_claim_ids: []` —
+             it never ran, so nothing is known about the work itself.
         4. Enqueue 4-8 non-duplicate targets across applicable evidence lanes. Bias toward
            proven unauthenticated reach: active discovery parsers, broadcast/multicast
            listeners, RF handlers the recap confirms exist, and authentication machinery.

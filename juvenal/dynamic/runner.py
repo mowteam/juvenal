@@ -60,6 +60,7 @@ _CAPTAIN_EVENT_TYPES = frozenset(
         "claim.retry_scheduled",
         "target.no_findings",
         "target.blocked",
+        "target.dependency_stranded",
         "target.exhausted",
         "directive.received",
         "captain.proposal_dropped",
@@ -77,6 +78,7 @@ _DASHBOARD_EVENT_KINDS = frozenset(
         "target.completed",
         "target.no_findings",
         "target.blocked",
+        "target.dependency_stranded",
         "target.exhausted",
         "target.deferred",
         "directive.received",
@@ -128,6 +130,9 @@ _DEFAULT_CONTINUE_NUDGE = (
     "you have a concrete reason.\n"
     "   - Blocked target: do NOT respawn until the blocker is addressed (different build path, "
     "static-only approach, alternative tooling).\n"
+    "   - Dependency-stranded target: DO re-enqueue, with `depends_on_claim_ids: []`. It was never "
+    "dispatched — its dependency claim was rejected so the gate can never open — so nothing is "
+    "known about the work itself.\n"
     "3. Enqueue at least 8 new targets pivoting to UNCOVERED SURFACE or following the "
     "variant-analysis rules above.\n"
     '4. Return `termination_state: "continue"`. Do not declare `complete` again until both '
@@ -1169,6 +1174,7 @@ class DynamicAnalysisRunner:
             or delta.rejected_claim_ids
             or delta.no_findings_target_ids
             or delta.blocked_target_ids
+            or delta.dependency_stranded_target_ids
             or delta.exhausted_target_ids
             or delta.pending_directive_ids
             or delta.dropped_proposals
@@ -2146,6 +2152,7 @@ class DynamicAnalysisRunner:
                     or delta.rejected_claim_ids
                     or delta.no_findings_target_ids
                     or delta.blocked_target_ids
+                    or delta.dependency_stranded_target_ids
                     or delta.exhausted_target_ids
                     or delta.pending_directive_ids
                     or delta.dropped_proposals
@@ -2165,6 +2172,7 @@ class DynamicAnalysisRunner:
                     or delta.rejected_claim_ids
                     or delta.no_findings_target_ids
                     or delta.blocked_target_ids
+                    or delta.dependency_stranded_target_ids
                     or delta.exhausted_target_ids
                     or delta.pending_directive_ids
                     or delta.dropped_proposals
@@ -2323,6 +2331,7 @@ class DynamicAnalysisRunner:
             "rejected_claims": list(delta.rejected_claim_ids),
             "no_findings_targets": list(delta.no_findings_target_ids),
             "blocked_targets": list(delta.blocked_target_ids),
+            "dependency_stranded_targets": list(delta.dependency_stranded_target_ids),
             "exhausted_targets": list(delta.exhausted_target_ids),
             "frontier_counts": delta.frontier_counts,
             # If your previous turn proposed targets that didn't stick, they
@@ -4763,19 +4772,27 @@ class DynamicAnalysisRunner:
                 continue
             if not target.depends_on_claim_ids:
                 continue
-            dead = next(
-                (dep_id for dep_id in target.depends_on_claim_ids if self._dep_claim_unverifiable(dep_id)),
-                None,
-            )
-            if dead is None:
+            dead = [dep_id for dep_id in target.depends_on_claim_ids if self._dep_claim_unverifiable(dep_id)]
+            if not dead:
                 continue
             target.status = "blocked"
             target.updated_at = now
+            # Distinct from `target.blocked` because the remedy is the opposite
+            # one. A blocked target needs a different approach and the captain
+            # is told not to respawn it; this target's work was never attempted
+            # and is recovered by re-enqueuing it with no dependency gate. Both
+            # reach the captain as deltas, but only this one says "requeue me".
             self.state.append_event(
-                "target.blocked",
+                "target.dependency_stranded",
                 target_id=target.target_id,
                 generation=target.active_generation,
-                blocker=f"dependency claim {dead} is unverifiable (rejected, retry budget exhausted)",
+                blocker=(
+                    f"dependency claim(s) {', '.join(dead)} can never verify (rejected, retry budget "
+                    f"exhausted), so this target was never dispatched. The work itself was not attempted "
+                    f"and is not known to be infeasible."
+                ),
+                stranded_dependencies=list(dead),
+                remedy="re-enqueue with depends_on_claim_ids: [] if the work is still worth doing",
             )
             progressed = True
         if progressed:

@@ -250,6 +250,7 @@ class DynamicEvent:
         "target.completed",
         "target.no_findings",
         "target.blocked",
+        "target.dependency_stranded",
         "target.exhausted",
         "claim.proposed",
         "claim.verified",
@@ -354,6 +355,10 @@ class CaptainDelta:
     pending_directive_ids: list[str]
     frontier_counts: dict[str, int]
     dropped_proposals: list[dict[str, str]] = field(default_factory=list)
+    # Kept separate from blocked_target_ids because the remedy is opposite:
+    # a blocked target needs a different approach, a stranded one needs only
+    # to be re-enqueued without its dependency gate.
+    dependency_stranded_target_ids: list[str] = field(default_factory=list)
 
 
 __all__ = [
