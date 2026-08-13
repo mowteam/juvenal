@@ -1666,7 +1666,9 @@ phases:
             and the cited code matches. You judge TWO tightly-coupled things:
 
             1. **Does the attacker start unauthenticated**, or does the chain
-               itself supply the authentication bypass?
+               itself supply what gets them past the boundary — an
+               authentication bypass, or the code execution a downstream
+               link begins from?
             2. **Is the outcome a contest win** — arbitrary code execution or
                retrieval of sensitive information?
 
@@ -1720,6 +1722,22 @@ phases:
                  would have to defeat, so the captain spawns targets for it. This
                  rejection is a routing decision, not a dismissal — the finding
                  may become half of a winning chain.
+               - **Starts from code execution or privilege inside the
+                 target** — the attacker's starting position is not a
+                 credential but an already-compromised process: code
+                 running in the container, root on the device, a foothold
+                 in a peer service. Authentication is not the question
+                 here; **anchoring** is. A claim that begins past the
+                 authentication boundary does not "start unauthenticated"
+                 merely because it holds no credential — do not route it to
+                 the first outcome. Apply the anchor test: the claim
+                 proceeds only if a sibling claim it names explicitly is
+                 `status: verified` in `.juvenal-state-*-analysis.json` AND
+                 that sibling actually establishes this starting position.
+                 If no such sibling exists, REJECT
+                 `presupposes-attacker-position`. Candor is not an anchor —
+                 a claim that accurately describes the link it is missing
+                 is still missing it.
             4. **Apply the intended-functionality test.** Does the claimed effect
                fall within capabilities the product documents as belonging to the
                attacker's role? Check the brief's by-design section. If an
@@ -1763,6 +1781,12 @@ phases:
                the candidate escape paths from the brief. Only reject here if the
                claim asserts a complete entry while ignoring a sandbox the brief
                says is present; in that case use `incomplete-chain-overclaimed`.
+               The mirror case is the one this gate has let through before: a
+               claim supplying ONLY the escape, starting from code execution
+               inside the sandbox that no verified claim provides. A sandbox
+               escape is a legitimate and necessary link, but an escape with
+               nothing verified beneath it is unanchored — that is the step-3
+               anchor test, and it is rejected there, not here.
 
             ### Reject buckets (set `verdict: REJECT` and pick one)
 
@@ -1777,26 +1801,42 @@ phases:
               credential or secret disclosure, and no capability uplift.
             - **`presupposes-attacker-position`** — The attacker prerequisite IS
               the boundary the bug claims to attack (already-executing code on
-              the device, already-root, already-inside the container) and the
-              claim does not present itself as a downstream escape link.
+              the device, already-root, already-inside the container) and no
+              verified sibling claim supplies that position. A downstream
+              escape link is legitimate research and may become half of a
+              winning entry, but it is not *verified* until something the run
+              has actually verified puts the attacker where the claim begins.
+              Presenting itself honestly as a downstream link does not exempt a
+              claim from this bucket — that framing is what the bucket is for.
+              In `follow_up_action`, name the upstream link the chain needs and
+              say the claim should be resubmitted once a sibling supplies it.
+              Like `requires-authentication`, this is a routing decision, not a
+              dismissal.
             - **`incomplete-chain-overclaimed`** — The report asserts a complete
               contest entry while a required link (pre-auth reach, code
               execution, sandbox escape) is neither supplied nor acknowledged.
-              Note: acknowledging a missing link is fine and passes; pretending
-              it is not there is not.
+              Note the direction: a missing *downstream* link — the claim starts
+              from a real position and reaches a real primitive but not yet full
+              impact — is fine and passes when acknowledged. A missing *upstream*
+              link is the anchor problem above, and acknowledging it does not
+              cure it.
             - **`unreachable`** — The sink is not reachable from a realistic
               attack path against the shipped configuration.
 
             ### Pass criteria (ALL must hold)
 
-            1. The attacker starts unauthenticated, or the chain supplies the
-               authentication bypass (verified sibling claim named).
+            1. The attacker starts unauthenticated at the network boundary, or
+               the chain supplies what gets them past it — an authentication
+               bypass, or the code execution the claim begins from — in this
+               claim or in a named sibling confirmed `verified` in state.
             2. The effect is not a documented capability of the attacker's role.
             3. The impact is code execution, Sponsor-defined sensitive-information
                retrieval, another concrete security-sensitive disclosure primitive,
                a corruption primitive, or an authentication bypass.
-            4. Any missing chain link — code execution, sandbox escape — is
-               explicitly acknowledged rather than glossed over.
+            4. Any missing *downstream* link — code execution, sandbox escape —
+               is explicitly acknowledged rather than glossed over. A missing
+               *upstream* link fails criterion 1 no matter how clearly it is
+               acknowledged.
 
             ### What is out of scope for THIS verifier
 
@@ -1810,12 +1850,23 @@ phases:
             **State your reasoning with structure.** Your `reason` must include,
             in order: (1) the trust boundary from the brief, with where it is
             enforced in code; (2) the attacker's starting position; (3) the
-            authentication verdict — unauthenticated, bypass-supplied, or
-            requires-authentication; (4) the intended-functionality verdict; (5)
-            the impact class; (6) the chain-completeness note, including whether
-            a sandbox escape is still required. If any of those is missing your
-            verdict is incomplete — return `verdict: REJECT` rather than passing
-            on weak evidence.
+            authentication verdict — unauthenticated, bypass-supplied,
+            requires-authentication, or starts-from-code-execution, and for that
+            last one the anchor verdict naming the verified sibling or its
+            absence; (4) the intended-functionality verdict; (5) the impact
+            class; (6) the chain-completeness note, including whether a sandbox
+            escape is still required. If any of those is missing your verdict is
+            incomplete — return `verdict: REJECT` rather than passing on weak
+            evidence.
+
+            **The failure mode this gate has actually exhibited:** a claim that
+            begins from UID-0 code execution inside a container, states plainly
+            that it supplies no pre-auth reach and no code-execution link, and
+            is passed *because* it was forthright about that. Forthrightness is
+            how a claim earns an accurate rejection, not how it earns a pass. If
+            your own reasoning contains a sentence of the form "it candidly
+            acknowledges the missing link, so this bucket does not apply," you
+            have inverted this gate — the acknowledgment is the finding.
 
             When you reject with `requires-authentication`, be constructive: this
             is the most common rejection in this workflow and the captain depends
