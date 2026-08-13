@@ -359,6 +359,12 @@ class TestClaudeSDKModelRouting:
 
         assert _resolve_model("claude-sdk", "worker", "claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
 
+    def test_pwn2own_models_pass_through_both_sdk_backends(self):
+        from juvenal.dynamic.runner import _resolve_model
+
+        assert _resolve_model("claude-sdk", "captain", "claude-opus-5") == "claude-opus-5"
+        assert _resolve_model("codex-sdk", "worker", "gpt-5.6-sol") == "gpt-5.6-sol"
+
 
 class TestCreateBackendClaudeSDK:
     """Flag selection and fallback — runnable without the SDK."""

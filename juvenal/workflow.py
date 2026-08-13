@@ -357,10 +357,11 @@ class AnalystSpec:
     The analyst reads the codebase, project documentation, and (when allowed) does
     web research to produce a structured project brief covering the project's trust
     model, attack surface, and any documented out-of-scope behaviors. The brief is
-    injected as a cacheable prefix into every captain/worker/verifier system prompt,
-    and is also used to seed a `.claude/agents/attack-surface.md` Claude Code subagent
-    that consulting agents can invoke for follow-up questions. Codex consulting
-    agents only get the brief in their prompt — codex has no subagent equivalent.
+    injected as a cacheable prefix into every captain/worker/verifier system prompt.
+    It also seeds matching `.claude/agents/attack-surface.md` and
+    `.codex/agents/attack-surface.toml` subagent definitions for follow-up questions.
+    The runner blocks captain/worker/verifier dispatch until this one-shot analyst
+    reaches a terminal ``ready`` or ``failed`` state.
     """
 
     backend: str = "claude"

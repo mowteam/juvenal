@@ -4,8 +4,9 @@ Developer notes for `CodexSDKBackend` (`juvenal/backends.py`). The SDK thread
 loop (`CodexSDKBackend._drive_codex_sdk`) is **implemented** against the official
 `openai-codex` SDK (v0.144.4) and covered by unit tests that mock the SDK's
 `Codex`/`Thread`/`TurnResult` surface
-(`tests/test_backends.py::TestCodexSDKDriveLoop`). It is **opt-in** — the default
-backend is still the subprocess `CodexBackend` (`npx @openai/codex@latest`).
+(`tests/test_backends.py::TestCodexSDKDriveLoop`). Bare `backend: codex` selects
+this SDK backend by default when the package is installed and falls back to
+subprocess `CodexBackend` otherwise.
 
 ## Package (verified from primary sources + local introspection)
 
@@ -85,23 +86,25 @@ success turn needs valid Codex auth (`~/.codex/auth.json` from `codex login`, or
 
 ## Selecting the SDK backend
 
-- Per workflow: `backend: codex-sdk` in the YAML, or `--backend codex-sdk`.
+- Recommended: use `backend: codex`; the factory selects this backend when the
+  SDK is installed and otherwise uses the subprocess fallback.
+- Explicit preference: use `backend: codex-sdk` in YAML. This still falls back
+  when the package is absent unless fail-loud mode is enabled.
+- Force subprocess execution with `JUVENAL_BACKEND_NO_SDK=1`.
 - Fail-loud: `JUVENAL_BACKEND_CODEX_SDK=1` makes `create_backend("codex-sdk")`
   raise instead of falling back to the subprocess `CodexBackend` when the SDK is
   missing.
 
-## E2E parity + one-line default flip (Codex auth required)
+## E2E parity (Codex auth required)
 
 The unit tests mock the SDK; the true end-to-end check needs real auth:
 
 1. Ensure Codex auth is present (`codex login`, or export `OPENAI_API_KEY`).
-2. Add a `backend="codex-sdk"` variant of `test_trivial_workflow_codex` in
+2. Run a `backend="codex-sdk"` variant of `test_trivial_workflow_codex` in
    `tests/test_e2e_codex.py` and confirm it produces the same `hello.txt` result
    as `backend="codex"`:
    ```
    pytest tests/test_e2e_codex.py -x -v
    ```
-3. **Only after that passes**, flip a workflow's `backend: codex` to
-   `backend: codex-sdk` (the one-line flip; `create_backend` dispatches by name,
-   so there is no global default to change). Keep `codex` (subprocess) as the
-   documented fallback.
+3. Run the same test with bare `backend="codex"` to exercise SDK-default
+   resolution, then use `JUVENAL_BACKEND_NO_SDK=1` to verify CLI fallback parity.

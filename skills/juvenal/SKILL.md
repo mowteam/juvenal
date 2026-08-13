@@ -1,13 +1,6 @@
 ---
 name: juvenal
-description: Create and run verified AI agent workflows using Juvenal
-argument-hint: "[goal or command]"
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Glob
-  - Edit
+description: Create, validate, run, and troubleshoot verified AI-agent workflows with Juvenal. Use when a user asks about Juvenal YAML or directory workflows, implement/check/bounce phases, dynamic captain-worker-verifier analysis, Claude or Codex backends, workflow variables, resume/rewind, or Juvenal CLI commands. Do not trigger for generic agent design that does not use Juvenal.
 ---
 
 # Juvenal — Verified AI Agent Workflows
@@ -331,14 +324,16 @@ For work on the analysis engine (`bug-bounty.yaml` and friends), the source map 
 Invariants that MUST hold when changing this loop:
 
 - **The loop shape is fixed**: captain enqueues targets → exactly one worker subagent per target/claim → the verifier chain → non-gating exploit-sim → reporter. Deterministic control flow (retry/advance/terminate) is owned by the runner, never by an LLM.
-- **Worker contract is fixed**: each worker keeps its loop position and emits exactly one `WORKER_JSON` (`claims` / `no_findings` / `blocked`). `worker_dynamic_workflow: true` only changes the worker's *internal* investigation method (it spawns its own subagents and synthesizes); it must never emit multiple `WORKER_JSON` blocks or move in the loop. Codex degrades to a strong single pass rather than faking fan-out.
+- **Analyst is the initialization barrier**: when configured, the analyst runs once and must reach `ready` or definitively `failed` before the captain, workers, or verifiers dispatch. Its brief is injected into later roles and dual-emitted as Claude/Codex attack-surface subagent definitions.
+- **Worker contract is fixed**: each worker keeps its loop position and emits exactly one `WORKER_JSON` (`claims` / `no_findings` / `blocked`). `worker_dynamic_workflow: true` only changes the worker's *internal* investigation method (it spawns its own backend-native subagents and synthesizes); it must never emit multiple `WORKER_JSON` blocks or move in the loop. If native spawning is unavailable, use a strong single pass rather than pretending fan-out occurred.
 - **Exploit-sim is non-gating**: it categorizes verified claims (`exploit_confirmed`, `exploit_confirmed_nondefault`, `exploit_unconfirmed`, `sim_inconclusive`, `sim_error`) but never rejects one; infra failures yield `sim_error`/`sim_inconclusive` with the claim still verified.
 - **Write guardrails**: workers/verifiers cannot write under `output/` (the reporter's tree); the reporter cannot write under a worker's `scratch_dir`. Enforced via per-role `--settings` deny globs (`_hooks_for_role`).
-- **Backends stay portable**: subprocess `ClaudeBackend`/`CodexBackend` remain the working defaults and stay importable/functional; SDK backends are opt-in with subprocess fallback. New `models.py` dataclass fields must have defaults.
+- **Backends stay portable**: bare `claude`/`codex` prefer installed SDK backends and fall back to subprocess `ClaudeBackend`/`CodexBackend`; `JUVENAL_BACKEND_NO_SDK=1` forces the fallback. Both paths must remain importable and functional. New `models.py` dataclass fields must have defaults.
 
 ## Your Task
 
-When the user invokes `/juvenal`, help them by:
+When the user invokes the Juvenal skill (`/juvenal` in Claude Code or
+`$juvenal`/`/skills` in Codex), help them by:
 
 1. If they provide a goal, create a `workflow.yaml` file for that goal
 2. If they ask to run something, invoke `juvenal run` via Bash

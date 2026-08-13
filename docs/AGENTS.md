@@ -1,4 +1,9 @@
-# Native subagents (AGENTS migration)
+# Documentation Guidance And Native Subagents
+
+When editing files under `docs/`, keep Claude and Codex behavior described from
+the same canonical role bodies. Do not document one backend as the default
+semantic behavior when the runner supports both. Verify volatile CLI feature or
+model claims before updating them.
 
 Juvenal's static analysis role prompts are shipped as Claude Code subagent
 definitions so they can be edited in one place, discovered natively by Claude
@@ -64,12 +69,21 @@ not the in-session collab tools.
 The verifier subagents reference the `bug-report-reviewer` and
 `design-critique-detector` skills when available.
 
+## Analyst initialization ordering
+
+When an analysis phase configures `analysis.analyst`, the runner launches it once
+and blocks captain, worker, and verifier dispatch until the analyst reaches
+`ready` or definitively `failed`. A successful brief is injected into every later
+role and produces both runtime attack-surface definitions above. The exploit-sim
+environment builder has its own executor and may initialize concurrently.
+
 ## Resolution order (fallback, additive & reversible)
 
 The runner resolves each role's effective prompt in this order:
 
-1. **Explicit config `prompt`** — a `prompt` set on the verifier / exploit-sim
-   spec in the workflow YAML always wins (user override).
+1. **Explicit config `prompt`** - a `prompt` set on the verifier / exploit-sim
+   spec in the workflow YAML wins unless the verifier explicitly opts into
+   `use_attack_surface_subagent: true` as described below.
 2. **Per-project subagent** — `<working_dir>/.claude/agents/<name>.md` (lets a
    target repo specialize a role).
 3. **Shipped subagent** — the packaged `juvenal/prompts/agents/<name>.md` body.
@@ -88,3 +102,9 @@ Note: the `trust-model` verifier additionally supports
 `.claude/agents/attack-surface.md` (the analyst's project brief) as its scope;
 that path takes priority for that verifier and falls back to the resolution
 order above when the analyst file is absent.
+
+This option **replaces** the verifier's configured prompt; it does not append the
+brief. Use it only when Juvenal's generic trust-model verifier semantics are
+desired. A workflow with a specialized contest, policy, or impact verifier should
+leave it false and rely on the normal project-brief injection, otherwise its
+custom procedure is discarded.

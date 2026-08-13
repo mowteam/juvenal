@@ -13,11 +13,16 @@ graph TB
         State["State Persistence<br/><i>.juvenal-state-*-analysis.json</i>"]
     end
 
-    subgraph Captain["Captain (Claude Code)"]
+    Analyst["Initialization analyst<br/><i>one-shot project brief</i>"]
+
+    subgraph Captain["Captain (Claude or Codex)"]
         direction TB
         Mental["Mental Model<br/><i>tracks attack surface,<br/>verified findings, open questions</i>"]
         Targets["Target Proposals<br/><i>bounded analysis tasks<br/>with scope + priority</i>"]
     end
+
+    Analyst -->|"brief ready/failed barrier"| Engine
+    Analyst -->|"shared project brief"| Captain
 
     subgraph Workers["Workers (parallel)"]
         direction TB
@@ -51,11 +56,16 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant U as User (optional)
+    participant A as Analyst (optional)
     participant C as Captain
     participant E as Engine
     participant W as Worker
     participant V as Verifier
 
+    A->>A: Build project brief<br/>and attack-surface context
+    A->>E: Ready or definitively failed
+    Note over A,E: Captain/workers/verifiers<br/>do not dispatch before this barrier
+    E->>C: Start with analyst brief
     Note over C: Build mental model<br/>of attack surface
 
     C->>E: Propose targets<br/>(priority, scope, instructions)

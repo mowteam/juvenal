@@ -6,7 +6,15 @@ import time
 
 import pytest
 
-from juvenal.cli import _parse_defines, _parse_phased_implementer, build_parser, cmd_plan, cmd_run, cmd_status
+from juvenal.cli import (
+    _parse_defines,
+    _parse_phased_implementer,
+    build_parser,
+    cmd_plan,
+    cmd_run,
+    cmd_status,
+    cmd_validate,
+)
 from juvenal.state import PipelineState
 
 
@@ -17,7 +25,7 @@ class TestArgumentParsing:
         assert args.command == "run"
         assert args.workflow == "workflow.yaml"
         assert args.backend == "claude"
-        assert args.max_bounces == 999
+        assert args.max_bounces is None
         assert not args.resume
 
     def test_run_all_flags(self):
@@ -86,6 +94,7 @@ class TestArgumentParsing:
         args = parser.parse_args(["do", "build a web app"])
         assert args.command == "do"
         assert args.goal == "build a web app"
+        assert args.max_bounces is None
 
     def test_status(self):
         parser = build_parser()
@@ -115,6 +124,24 @@ class TestArgumentParsing:
         args = parser.parse_args(["validate", "workflow.yaml"])
         assert args.command == "validate"
         assert args.workflow == "workflow.yaml"
+        assert args.max_bounces is None
+
+    def test_validate_preserves_workflow_max_bounces(self, tmp_path, capsys):
+        workflow_path = tmp_path / "workflow.yaml"
+        workflow_path.write_text(
+            """\
+name: bounded
+max_bounces: 6
+phases:
+  - id: work
+    prompt: Do the work.
+"""
+        )
+        args = build_parser().parse_args(["validate", str(workflow_path)])
+        args.plain = True
+
+        assert cmd_validate(args) == 0
+        assert "Max bounces: 6" in capsys.readouterr().out
 
     def test_run_checker_single(self):
         parser = build_parser()

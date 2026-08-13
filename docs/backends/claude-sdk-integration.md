@@ -4,8 +4,8 @@ Developer notes for `ClaudeSDKBackend` (`juvenal/backends.py`). The SDK query
 loop (`ClaudeSDKBackend._drive_sdk`) is **implemented** against the installed
 `claude-agent-sdk` (v0.2.137) and covered by unit tests that mock the SDK's
 `query()` async stream (`tests/test_backends_sdk.py::TestClaudeSDKBackendDriveLoop`).
-It is **opt-in** — the default backend is still the subprocess `ClaudeBackend`.
-Flip the default only after the E2E parity step below passes.
+Bare `backend: claude` selects this SDK backend by default when the package is
+installed and falls back to subprocess `ClaudeBackend` otherwise.
 
 ## Package
 
@@ -85,16 +85,20 @@ eliminating the silent-fresh-session failure mode.
 
 ## Selecting the SDK backend
 
-- Per workflow: `backend: claude-sdk` in the YAML, or `--backend claude-sdk`.
+- Recommended: use `backend: claude`; the factory selects this backend when the
+  SDK is installed and otherwise uses the subprocess fallback.
+- Explicit preference: use `backend: claude-sdk` in YAML. This still falls back
+  when the package is absent unless fail-loud mode is enabled.
+- Force subprocess execution with `JUVENAL_BACKEND_NO_SDK=1`.
 - Fail-loud (for the human verifying the SDK path): `JUVENAL_BACKEND_SDK=1`
   makes `create_backend("claude-sdk")` raise instead of falling back to the
   subprocess `ClaudeBackend` when the SDK is missing.
 
-## E2E parity + one-line default flip (network + `ANTHROPIC_API_KEY` required)
+## E2E parity (network + `ANTHROPIC_API_KEY` required)
 
 The unit tests mock the SDK; the true end-to-end parity check needs a live key:
 
-1. Add a `backend="claude-sdk"` variant of the trivial workflow in
+1. Run a `backend="claude-sdk"` variant of the trivial workflow in
    `tests/test_e2e_claude.py` and confirm it produces the same `hello.txt`
    result as `backend="claude"`:
    ```
@@ -102,12 +106,5 @@ The unit tests mock the SDK; the true end-to-end parity check needs a live key:
    ```
    Requires `ANTHROPIC_API_KEY` and the `claude` CLI on `PATH` (the SDK shells
    out to it).
-2. **Only after that passes**, flip the default. The default backend string
-   lives in each workflow's `backend:` field (and `Workflow.backend` default in
-   `juvenal/workflow.py`). Changing a single workflow's `backend: claude` to
-   `backend: claude-sdk` is the one-line flip; there is no global default to
-   change in `create_backend` (it dispatches by name). Keep `claude` (subprocess)
-   as the documented fallback.
-
-Until a real smoke run is verified, the repo keeps the subprocess `claude`
-backend as the default and ships `claude-sdk` as fully-implemented + selectable.
+Bare `backend: claude` exercises the same SDK path whenever the package is
+installed; use `JUVENAL_BACKEND_NO_SDK=1` for explicit CLI parity testing.

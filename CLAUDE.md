@@ -33,7 +33,7 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 |--------|---------|
 | `engine.py` | Main orchestration loop (`Engine.run()`). Executes phases sequentially or in parallel groups (flat or lane-based). `BounceCounter` for thread-safe global bounce tracking in lanes. Global bounce counter (`max_bounces`) limits total bounces across all phases. Supports `--resume`, `--rewind N`, and `--rewind-to PHASE_ID` for resuming/rewinding pipeline state. |
 | `workflow.py` | Workflow loading and `Phase`/`Workflow`/`ParallelGroup` dataclasses. Supports YAML, directory convention (including `parallel` directories for lane groups), and bare `.md` formats. `apply_vars()` handles `{{VAR}}` template substitution. In directory convention, extra `.md` files in a phase dir become check phases; command execution belongs inside agentic checker prompts rather than `.sh` phase discovery. |
-| `backends.py` | Backend factory `create_backend(name)` plus the abstract `Backend` base class. Subprocess `ClaudeBackend` and `CodexBackend` are the working defaults. Opt-in in-process SDK backends `ClaudeSDKBackend` (`backend: claude-sdk`) and `CodexSDKBackend` (`backend: codex-sdk`) drive the vendor SDKs directly; both fall back to their subprocess counterparts when the SDK is not installed (set `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1` to fail loud instead). Manages subprocess invocation, JSON stream parsing, and the shared `hooks_config` `--settings` fragment. `run_interactive()` for terminal passthrough (Claude only). See `docs/backends/`. |
+| `backends.py` | Backend factory `create_backend(name)` plus the abstract `Backend` base class. Bare `claude`/`codex` prefer the installed in-process SDK (`ClaudeSDKBackend` / `CodexSDKBackend`) and fall back to `ClaudeBackend` / `CodexBackend`; `JUVENAL_BACKEND_NO_SDK=1` forces subprocess execution. Explicit `claude-sdk` / `codex-sdk` selectors support fail-loud environment flags. Manages subprocess invocation, SDK event mapping, and the shared `hooks_config` settings fragment. See `docs/backends/`. |
 | `dynamic/` | Dynamic analysis engine package. `runner.py` owns captain/worker/verifier/exploit-sim/reporter orchestration (batch + chat modes), backend-aware subagent wiring, per-role write guardrails, and Codex `.codex/agents/*.toml` dual-emit; `protocol.py` parses structured outputs and directives, `state.py` persists child analysis state, `models.py` defines protocol/state dataclasses (including `ExploitSimRecord` and per-claim exploit fields), `interaction.py` collects user input on a background thread, and `chat_display.py` is the line-scrolling chat dashboard for `--interactive` runs (Rich `Live` was removed because it cannot share the cursor cleanly with line-buffered stdin reads). |
 | `state.py` | Atomic JSON state persistence (`PipelineState`). Thread-safe (RLock). Writes to `.tmp`, fsyncs, then atomic renames. Supports resume, rewind, and scoped invalidation (for lane bounces). |
 | `checkers.py` | Verdict parsing (`VERDICT: PASS` / `VERDICT: FAIL: reason`). |
@@ -56,7 +56,7 @@ The system uses a **non-agentic, deterministic execution loop**. All control flo
 - **implement** — agent executes a prompt to build/modify code. Supports `interactive: true` for terminal passthrough (Claude only, enabled with `--interactive`)
 - **check** — separate agent verifies work, emits `VERDICT: PASS` or `VERDICT: FAIL: reason`
 - **workflow** — sub-workflow: dynamic (LLM plans from `prompt`) or static (`workflow_file` / `workflow_dir`). Recursion depth capped by `max_depth`. Parent vars propagate to sub-workflows.
-- **analysis** — dynamic captain/worker/verifier analysis. Uses nested `analysis:` config (`AnalysisConfig`) and persists child state to `.juvenal-state-<phase-id>-analysis.json`. The deterministic loop is: captain enqueues targets → exactly one worker subagent per target/claim → the verifier chain → a non-gating exploit-sim stage → the reporter. `--interactive` opens a line-scrolling chat dashboard (`juvenal/dynamic/chat_display.py`) that prints captain output, worker/verifier events, and acknowledged directives to stdout as they happen, while the user types directives (`/focus`, `/ignore`, `/target`, `/ask`, `/now`, `/show captain`, `/chat`, `/summary`, `/stop`, `/wrap`, free-form notes) without the cursor fighting a Live redraw. By default workers and verifiers share a single `max_agents` budget with verifiers preempting workers (`shared_agent_budget: true`); set `shared_agent_budget: false` to fall back to legacy independent `max_workers` / `max_verifiers` pools.
+- **analysis** — dynamic analyst/captain/worker/verifier analysis. Uses nested `analysis:` config (`AnalysisConfig`) and persists child state to `.juvenal-state-<phase-id>-analysis.json`. When configured, the one-shot analyst is an initialization barrier: it reaches `ready` or definitively `failed` before captain/worker/verifier dispatch. The deterministic loop is then: captain enqueues targets → exactly one worker subagent per target/claim → the verifier chain → a non-gating exploit-sim stage → the reporter. `--interactive` opens a line-scrolling chat dashboard (`juvenal/dynamic/chat_display.py`) that prints captain output, worker/verifier events, and acknowledged directives to stdout as they happen, while the user types directives (`/focus`, `/ignore`, `/target`, `/ask`, `/now`, `/show captain`, `/chat`, `/summary`, `/stop`, `/wrap`, free-form notes) without the cursor fighting a Live redraw. By default workers and verifiers share a single `max_agents` budget with verifiers preempting workers (`shared_agent_budget: true`); set `shared_agent_budget: false` to fall back to legacy independent `max_workers` / `max_verifiers` pools.
 
   Additional invariants:
   - **Worker as its own captain** — `worker_dynamic_workflow: true` (default) lets each worker fan out into its own backend subagents (Claude Agent tool / Codex native spawn) to explore hypotheses before synthesizing. The worker keeps its exact loop position and one-`WORKER_JSON` output contract (`claims` / `no_findings` / `blocked`); only its internal investigation method changes. Codex degrades to a strong single pass when native spawning is unavailable — it never fakes fan-out. Set `worker_dynamic_workflow: false` for the legacy single-pass worker.
@@ -92,18 +92,33 @@ Multi-value `-D VAR=VAL1 -D VAR=VAL2` duplicates phases referencing `{{VAR}}` in
 - `conftest.py` provides shared fixtures: `MockBackend`, `tmp_workflow`, `sample_yaml`, `bare_md`, `simple_workflow`
 - `MockBackend` simulates agent responses — use it instead of hitting real APIs
 - E2E tests (`test_e2e_claude.py`, `test_e2e_codex.py`) require API keys and are skipped in PRs (run on push to main only)
-- `test_skill.py` tests the Claude Code skill integration
+- `test_skill.py` exercises live skill integration; `test_agent_assets.py` checks
+  shared Claude/Codex instruction and skill discovery without API calls
 - CI runs: lint → unit → e2e (on push only)
 
 ## Versioning
 
 When bumping the version, update it in both `pyproject.toml` and `.claude-plugin/plugin.json`.
 
+## Shared Agent Guidance And Skills
+
+- `CLAUDE.md` is the canonical repository instruction file. Root `AGENTS.md` is a
+  symlink to it, so Claude Code and Codex read identical guidance. Do not replace
+  the symlink with a divergent copy.
+- `skills/juvenal/SKILL.md` is the canonical cross-agent skill and follows the
+  portable Agent Skills format. `.claude/skills/juvenal` and
+  `.agents/skills/juvenal` symlink to that directory for native Claude and Codex
+  repository discovery. Keep `plugin/skills/juvenal/SKILL.md` byte-identical for
+  standalone plugin packaging.
+- Skill frontmatter must keep portable `name` and `description` fields. Put
+  backend-specific invocation wording in the body only when both equivalents are
+  stated (`/juvenal` for Claude, `$juvenal` or `/skills` for Codex).
+
 ## Dependencies
 
 **Runtime**: `jinja2>=3.1` + `pyyaml>=6.0` (workflow parsing), `rich>=13.0` (terminal UI)
 **Dev**: `pytest>=8.0`, `ruff>=0.4`
-**Optional SDK extras** (opt-in in-process backends, not needed for the subprocess defaults): `claude-sdk` (`claude-agent-sdk>=0.2`), `codex-sdk` (`openai-codex>=0.144`), `sdk` (both). See `docs/backends/`.
+**SDK extras** (preferred automatically when installed; subprocess fallback remains available): `claude-sdk` (`claude-agent-sdk>=0.2`), `codex-sdk` (`openai-codex>=0.144`), `sdk` (both). See `docs/backends/`.
 **External CLIs** (not pip-managed): `claude` (Anthropic CLI), `npx @openai/codex@latest` (OpenAI Codex)
 
 ## Project Layout
@@ -111,7 +126,7 @@ When bumping the version, update it in both `pyproject.toml` and `.claude-plugin
 ```
 juvenal/
 ├── __init__.py          # __version__ derived from installed package metadata
-├── backends.py          # Backend factory + subprocess (Claude/Codex) and opt-in SDK backends
+├── backends.py          # SDK-first backend factory + subprocess fallbacks
 ├── checkers.py          # Verdict parsing helpers
 ├── cli.py               # CLI argument parsing and dispatch
 ├── display.py           # Rich TUI rendering
@@ -134,8 +149,8 @@ docs/
 ├── AGENTS.md            # Native subagent (Claude + Codex) resolution and dual-emit
 ├── analysis-workflow.md # Analysis-phase author guide
 └── backends/            # SDK backend integration status
-    ├── claude-sdk-integration.md   # ClaudeSDKBackend — implemented, opt-in (subprocess stays default)
-    └── codex-sdk-exploration.md    # CodexSDKBackend — implemented, opt-in; green turn needs Codex auth
+    ├── claude-sdk-integration.md   # ClaudeSDKBackend implementation and fallback behavior
+    └── codex-sdk-exploration.md    # CodexSDKBackend implementation and auth requirements
 tests/
 ├── conftest.py          # Shared fixtures (MockBackend, etc.)
 ├── test_cli.py          # CLI argument parsing tests
@@ -147,5 +162,7 @@ tests/
 ├── test_round2.py       # Includes, cost tracking, backoff, notifications tests
 ├── test_skill.py        # Claude Code skill tests
 └── test_validation.py   # Workflow validation tests
-skills/juvenal/SKILL.md  # Claude Code skill definition
+skills/juvenal/SKILL.md  # Canonical Claude/Codex skill definition
+.claude/skills/juvenal   # Symlink for Claude repository skill discovery
+.agents/skills/juvenal   # Symlink for Codex repository skill discovery
 ```

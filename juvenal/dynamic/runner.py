@@ -2350,9 +2350,8 @@ class DynamicAnalysisRunner:
         else:
             system_prompt = ""
             # Captain turns 2+ use resume_agent, which inherits the system prompt
-            # set on turn 1. If the analyst finished after turn 1, re-inject the
-            # ready brief into the user prompt so the captain sees it. Anthropic
-            # prompt caching keeps the prefix cached across turns.
+            # set on turn 1. Re-inject the ready brief into the user prompt so the
+            # initialization evidence remains explicit on every turn.
             user_prompt_prefix = ""
             if brief_block:
                 user_prompt_prefix = f"{brief_block}\n\n"
@@ -4926,9 +4925,7 @@ class DynamicAnalysisRunner:
             pass
 
     def _load_subagent_scope_for_verifier(self, backend: str | None = None) -> str | None:
-        """Return the body of `.claude/agents/attack-surface.md` wrapped in a
-        verifier-mode framing for the ``trust-model`` verifier, or None if
-        unavailable.
+        """Return the shared runtime attack-surface body wrapped in verifier mode.
 
         Strips the Claude Code agent frontmatter (the leading ``---\\n…\\n---``
         block) so what's left is the system-prompt body the subagent itself
@@ -4939,10 +4936,9 @@ class DynamicAnalysisRunner:
         already embeds the project brief, so the caller skips the standard
         brief-block injection for this verifier.
 
-        The subagent body is identical across vendors (the runtime-written
-        `.claude/agents/attack-surface.md` is the source; the codex-side
-        `.codex/agents/attack-surface.toml` carries the same body), so the only
-        backend-dependent bit is which definition path the framing cites.
+        The Claude and Codex definitions are emitted from the same in-memory body;
+        the Claude Markdown file is used here as the readable materialization. The
+        only backend-dependent bit is which definition path the framing cites.
 
         Falls back to None when the subagent file is missing (analyst failed
         / hasn't run); the caller then uses the YAML scope.
@@ -5012,8 +5008,8 @@ class DynamicAnalysisRunner:
         return (
             "You are the project's attack-surface analyst for this Juvenal bug-finding run. "
             "The project brief below is your source of truth — quote and cite it when answering. "
-            "If the question goes beyond the brief, you may use Read / Grep / Glob over "
-            f"`{self.working_dir}` and WebFetch / WebSearch to do additional research before "
+            "If the question goes beyond the brief, use the repository and web-research tools "
+            f"available in your backend over `{self.working_dir}` before "
             "answering. Keep answers focused and cite specific files, docs, or URLs whenever "
             "possible. Reply with a concise direct answer; do not dump the entire brief back.\n\n"
             "If the calling agent's question does not have a confident answer, say so plainly — "

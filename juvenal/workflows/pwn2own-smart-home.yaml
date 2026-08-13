@@ -1,59 +1,62 @@
 name: pwn2own-smart-home
+# Bare backend names use Juvenal's SDK-first resolution when the matching SDK is
+# installed, with the subprocess backend as the portability fallback.
 backend: claude
 
-# Pwn2Own Ireland 2026 — Smart Home category.
+# Pwn2Own Ireland 2026 - Smart Home category.
 #
-# Derived from bug-bounty.yaml. The differences that matter:
-#   * The win condition is a CONTEST ENTRY, not a bounty submission: a
-#     pre-authentication (or auth-bypassing) chain reaching arbitrary code
-#     execution or sensitive-information retrieval on the physical device,
-#     launched from the contestant laptop over the contest network.
-#   * A dedicated `device-recon` phase runs FIRST and writes
-#     `output/device-recap.md` — the device-specific ground truth (hardware,
-#     radios, default-config listening services, auth model, prior ZDI/P2O
-#     history). Everything downstream reads it.
-#   * The verifier chain is five stages: a contest-rules gate now runs before
-#     the bug-class gate, and the old `trust-model` gate is replaced by a
-#     pre-auth / winning-impact gate.
-#   * The memory-safety-first bias of bug-bounty.yaml is now conditional on
-#     the target's implementation language, which the recap establishes.
-#     Home Assistant Green's exposed surface is overwhelmingly Python.
-#   * The non-gating `exploit_sim` stage is retuned for contest conditions: the
-#     environment is built in the device's DEFAULT, already-onboarded state with
-#     no credential handed to the attacker, so `exploit_confirmed` versus
-#     `exploit_confirmed_nondefault` lands directly on the rules'
-#     default-configuration requirement.
+# This workflow is intentionally target-neutral across the three listed Smart
+# Home devices. `initialize-run` turns the operator's inputs into a pinned run
+# profile; `device-recon` then derives device-specific facts. No later role may
+# substitute assumptions from another smart-home product for those artifacts.
 #
-# Run against a single device at a time. Override vars per device:
+# Run against one authorized lab device at a time. At minimum, set the target:
 #   juvenal run pwn2own-smart-home.yaml \
-#     --var TARGET_DEVICE="Sonos Era 300" --var REPO=... --var TARGET_PRIZE=...
+#     -D TARGET_DEVICE="Philips Hue Bridge Pro" \
+#     -D SOURCE_ROOTS="src,firmware-extracted" \
+#     -D DEVICE_ACCESS="isolated lab unit at 192.0.2.10; serial capture available"
+#
+# `SOURCE_ROOTS`, `FIRMWARE_ARTIFACTS`, and `DEVICE_ACCESS` may truthfully say
+# that no such input is available. Initialization records the resulting evidence
+# limits instead of allowing downstream agents to invent access.
 
 vars:
-  # ---- Device under test (defaults: Home Assistant Green) ----
-  TARGET_DEVICE: "Home Assistant Green"
-  TARGET_VENDOR: "Open Home Foundation / Nabu Casa"
+  # Required operator selection. The initialization gate rejects this sentinel.
+  # Valid targets are re-checked against the official rules at run time because
+  # the Sponsor reserves the right to change the device list.
+  TARGET_DEVICE: "__REQUIRED_SMART_HOME_TARGET__"
   TARGET_CATEGORY: "Smart Home"
   TARGET_VECTOR: "Remote Code Execution"
-  TARGET_PRIZE: "30,000 USD / 3 Master of Pwn points"
 
-  # Primary repository cloned into the working directory and actually analyzed.
-  REPO: "home-assistant/core"
+  # Comma-separated source, extracted-firmware, SDK, companion-app, or symbol
+  # roots available in the Juvenal working directory. `.` is safe as a generic
+  # default: initialization inventories what is really present and pins hashes.
+  SOURCE_ROOTS: "."
 
-  # Other first-party components that ship on the device but are NOT cloned
-  # here. The recon phase must enumerate their attack surface anyway so the
-  # captain knows when a chain needs an out-of-tree link, and so claims that
-  # depend on them are flagged rather than silently assumed.
-  EXTRA_COMPONENTS: >-
-    home-assistant/supervisor, home-assistant/operating-system (HAOS/buildroot),
-    home-assistant/plugin-dns, home-assistant/plugin-multicast,
-    home-assistant/plugin-audio, home-assistant/plugin-cli,
-    home-assistant/plugin-observer, home-assistant/frontend, home-assistant/os-agent
+  # Optional raw firmware/update packages, filesystem images, SBOMs, PCAPs, and
+  # vendor SDKs. Use workspace-relative paths or an honest `none supplied`.
+  FIRMWARE_ARTIFACTS: "none supplied"
+
+  # Known first-party components not present under SOURCE_ROOTS. Initialization
+  # and recon must expand this list; it is a hint, never ground truth.
+  EXTRA_COMPONENTS: "none declared; discover during initialization"
+
+  # Describe authorized access without embedding secrets: hardware availability,
+  # isolated network endpoints, controllable RF equipment, debug/log capture, and
+  # whether destructive testing is permitted. Never target public or third-party
+  # systems from this workflow.
+  DEVICE_ACCESS: "no live device supplied; static analysis only"
+  LAB_CONSTRAINTS: >-
+    Authorized Pwn2Own research in an isolated lab. Do not scan public address
+    space, vendor cloud tenants, or third-party devices. Do not perform destructive
+    actions unless the operator explicitly states that the lab unit is disposable.
 
   CONTEST_RULES_URL: "https://www.zerodayinitiative.com/Pwn2OwnIreland2026Rules.html"
 
-  # Canonical rules digest, injected into every phase and every verifier so no
-  # role reasons about contest scope from memory. Quotes are verbatim from the
-  # official rules page. Keep this free of curly braces — it is rendered
+  # Working rules digest, injected into every phase and verifier so no role
+  # reasons about contest scope from memory. `initialize-run` MUST re-fetch the
+  # official page and record any differences because the rules can change. Keep
+  # this free of curly braces - it is rendered
   # through Jinja2 and, in some contexts, str.format.
   P2O_RULES: |
     ### Pwn2Own Ireland 2026 — rules that bind this run
@@ -73,12 +76,20 @@ vars:
       arbitrary instructions."
     - "All entries must compromise the target(s) and demonstrate arbitrary code
       execution or retrieve sensitive information."
+    - The Sponsor defines the exact sensitive information for an attempt during
+      registration. Until that definition is present in `output/run-profile.md`,
+      treat disclosure as a useful primitive but do not call it a complete win;
+      prioritize the listed Remote Code Execution vector.
     - Entries must defeat "the target's techniques designed to ensure the safe
       execution of code, such as, but not limited to, Data Execution Prevention
       (DEP), Address Space Layout Randomization (ASLR) and/or application
       sandboxing."
     - "If a sandbox is present, a full sandbox escape is required unless
       otherwise stated."
+    - "The initial vulnerability utilized in the entry must be in the registered
+      target." All vulnerabilities must be present in the Sponsor-installed
+      software or firmware. A companion app, cloud, router, or neighboring-device
+      bug cannot substitute for the target's initial vulnerability.
 
     **Allowed attack surface for the Smart Home category**
     - "An attempt in this category must be launched against the target's exposed
@@ -159,37 +170,163 @@ vars:
       router-pivot chain; the attempt is launched directly from the contestant
       laptop on the contest network.
 
-# Caps how many times `recap-review` can bounce back to `device-recon`.
-#
-# NOTE: this value is currently inert. `juvenal run` / `do` / `validate` all
-# declare `--max-bounces` with `default=999` and then apply it unconditionally
-# (`if args.max_bounces: workflow.max_bounces = args.max_bounces` in cli.py),
-# so the truthy default always clobbers the YAML setting. Until that is fixed,
-# pass `--max-bounces 3` on the command line to get the intended cap.
-max_bounces: 3
+# Shared cap for the initialization and recon review loops.
+max_bounces: 6
 
 phases:
   # ==========================================================================
-  # Phase 1 — device recon. Runs once, before any bug hunting, and produces the
+  # Phase 1 - run initialization. Pins the selected device, current rules,
+  # supplied artifacts, and authorized lab capabilities before agents specialize.
+  # ==========================================================================
+  - id: initialize-run
+    prompt: |
+      You are initializing an authorized Pwn2Own Ireland 2026 Smart Home
+      research run. This phase must tailor a generic workflow to exactly one
+      contest device without importing facts from any other device.
+
+      Operator inputs:
+      - Target selection: {{ TARGET_DEVICE }}
+      - Category / vector: {{ TARGET_CATEGORY }} / {{ TARGET_VECTOR }}
+      - Candidate source and extracted-firmware roots: {{ SOURCE_ROOTS }}
+      - Raw firmware and supporting artifacts: {{ FIRMWARE_ARTIFACTS }}
+      - Declared but unavailable components: {{ EXTRA_COMPONENTS }}
+      - Authorized device and lab access: {{ DEVICE_ACCESS }}
+      - Lab constraints: {{ LAB_CONSTRAINTS }}
+      - Official rules: {{ CONTEST_RULES_URL }}
+
+      {{ P2O_RULES }}
+
+      ## Mission
+
+      Write `output/run-profile.md`. Do not modify source, firmware, repository
+      metadata, or lab devices. This file is the immutable identity and evidence
+      manifest for the run. Every later phase reads it before acting.
+
+      Use available repository and web-research tools. Re-fetch the official
+      rules page now. The embedded digest is a working snapshot, not authority.
+      Do not scan public address space or contact a vendor cloud service merely
+      because a hostname, token, or endpoint appears in an artifact.
+
+      If `TARGET_DEVICE` is still `__REQUIRED_SMART_HOME_TARGET__`, or if it is
+      not a Smart Home target on the current official page, record the failure
+      prominently. Never silently choose a device.
+
+      ## Required structure - use these headers verbatim
+
+      # Run Profile - {{ TARGET_DEVICE }}
+
+      ## Initialization status
+      Emit exactly one status: `READY`, `READY_WITH_LIMITATIONS`, or `BLOCKED`.
+      `BLOCKED` is mandatory for a missing/invalid target or an authorization
+      statement that permits testing systems outside an isolated owned lab.
+
+      ## Contest target identity
+      Record the exact model, vendor, category, vector, cash prize, and Master of
+      Pwn points from the official page. Include the rules URL and UTC retrieval
+      timestamp. State whether the selected target list or relevant rules differ
+      from the embedded digest.
+
+      ## Rules snapshot
+      Extract the current Smart Home scope plus the general successful-entry,
+      authentication, patch level, default/operational state, automation,
+      attempt-time, novelty, sandbox, reduced-prize, and whitepaper requirements.
+      Cite stable section or line descriptions and the URL. Distinguish exact
+      rule text from your interpretation.
+
+      ## Source and artifact manifest
+      Inventory every path named by `SOURCE_ROOTS` and `FIRMWARE_ARTIFACTS`.
+      Classify each as source repository, extracted filesystem, raw firmware or
+      update package, binary/symbol bundle, SBOM, PCAP, companion application,
+      documentation, or missing. For Git repositories record remote, HEAD SHA,
+      branch/tag, dirty state, and relevant release tag. For non-repository files
+      record size and SHA-256. For directories record a reproducible tree hash or
+      explicitly explain why one cannot be produced. Never claim a path belongs
+      to the device until evidence establishes that link.
+
+      ## Shipped-version baseline
+      Record the latest fully patched device firmware/software version supported
+      by vendor evidence, its release date, and whether the local inputs match it.
+      Preserve disagreements: contest registration details supplied by the
+      Sponsor outrank public marketing pages, and the official rules outrank all
+      secondary summaries. Mark unknown versions as unknown rather than current.
+
+      ## Available analysis capabilities
+      Turn `DEVICE_ACCESS` into a capability matrix: source review, firmware
+      extraction, architecture-aware disassembly, emulation, network traffic,
+      RF transmit/receive by protocol, reset/reimage, log capture, crash capture,
+      and destructive testing. Each row must be `AVAILABLE`, `UNAVAILABLE`, or
+      `UNVERIFIED`, with evidence. Never infer live hardware access from a source
+      checkout.
+
+      ## Authorized test boundary
+      Restate the exact devices, isolated network, radios, and accounts the run is
+      allowed to touch. Explicitly prohibit public scanning, unrelated nearby RF
+      devices, real customer accounts, and vendor cloud testing unless the
+      operator supplied separate written authorization in `DEVICE_ACCESS`.
+
+      ## Evidence gaps and initialization actions
+      List missing firmware, version ambiguity, unavailable components, absent
+      hardware, or missing tools. For every gap, give the concrete acquisition or
+      validation action that would close it. These are limitations, not license
+      to fill facts by analogy.
+
+      End after that section. Do not append process commentary.
+
+  - id: initialization-review
+    type: check
+    bounce_target: initialize-run
+    prompt: |
+      Review `output/run-profile.md` as the preflight gate for a Pwn2Own Ireland
+      2026 Smart Home run against `{{ TARGET_DEVICE }}`.
+
+      Do not modify files. Emit `VERDICT: FAIL: <specific correction>` if any of
+      these conditions holds:
+
+      1. The target is missing, is a placeholder, or is not confirmed on the
+         current official Smart Home target list at {{ CONTEST_RULES_URL }}.
+      2. The target identity, prize, vector, or rules are copied from another
+         device or lack an official citation and UTC retrieval timestamp.
+      3. Named source/artifact paths were not inventoried, Git inputs lack HEAD
+         SHAs, or firmware files lack SHA-256 hashes.
+      4. The shipped-version baseline claims `latest` without vendor or Sponsor
+         evidence, or hides a mismatch between local inputs and the target build.
+      5. Device/RF/emulation capabilities are assumed rather than marked
+         AVAILABLE, UNAVAILABLE, or UNVERIFIED with evidence.
+      6. The authorized boundary permits public scanning, nearby third-party RF
+         targets, customer accounts, or vendor cloud testing without explicit
+         authorization.
+      7. Status is `BLOCKED`, or a material limitation is omitted instead of
+         recorded under evidence gaps.
+
+      `READY_WITH_LIMITATIONS` may pass. Missing hardware or closed source should
+      constrain later work, not prevent a useful static-analysis run. If all
+      requirements hold, emit `VERDICT: PASS`.
+
+  # ==========================================================================
+  # Phase 2 - device recon. Runs once, before any bug hunting, and produces the
   # device-specific ground truth every later role depends on.
   # ==========================================================================
   - id: device-recon
     prompt: |
       You are the device analyst for a Pwn2Own Ireland 2026 entry against the
-      {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}** ({{ TARGET_VENDOR }}).
+      {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}**.
 
-      Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
-
-      Primary repository cloned in the working directory: {{ REPO }}
-      Other first-party components that ship on the device but are NOT cloned
-      here: {{ EXTRA_COMPONENTS }}
+      Attack vector: {{ TARGET_VECTOR }}.
+      Candidate analysis roots: {{ SOURCE_ROOTS }}
+      Candidate firmware artifacts: {{ FIRMWARE_ARTIFACTS }}
+      Declared unavailable components: {{ EXTRA_COMPONENTS }}
 
       {{ P2O_RULES }}
 
       ## Your job
 
-      Write `output/device-recap.md`. This file is the ground truth for the
-      entire run: the attack-surface analyst folds it into the brief injected
+      Read `output/run-profile.md` before any other investigation. It pins the
+      selected device, current rules, input hashes, shipped-version baseline,
+      authorized test boundary, and capabilities available in this run. Do not
+      contradict or silently broaden it.
+
+      Write `output/device-recap.md`. Together with the run profile, this is the
+      evidence base for the entire run: the attack-surface analyst folds it into the brief injected
       into every captain, worker, and verifier prompt, and the contest-scope
       verifier consults it to decide whether a claimed entry point is even
       reachable under contest conditions. A vague recap produces a run full of
@@ -201,16 +338,22 @@ phases:
 
       ## Method
 
-      Use everything available: Read / Grep / Glob over the cloned tree, plus
-      WebFetch and WebSearch for vendor documentation, teardowns, firmware
-      analyses, release notes, security advisories, and prior Pwn2Own results.
-      When the device's software is not in the cloned tree, say so explicitly
-      rather than guessing at its behavior.
+      Use available repository and web-research tools over every source and
+      artifact root that initialization confirmed. Research vendor documentation,
+      teardowns, firmware analyses, release notes, security advisories, and prior
+      Pwn2Own results. Only interact with a live device or RF interface when the
+      run profile marks that capability AVAILABLE and the action stays inside its
+      authorized boundary. When software is unavailable, say so explicitly
+      rather than guessing at behavior.
 
       **Label every factual claim with its evidence tier.** Downstream verifiers
       demand citations, and an unlabeled guess will be treated as one:
 
-      - `[CODE]` — read directly in the cloned repository. Give `path:line`.
+      - `[CODE]` — read directly in a pinned source root. Give `path:line`.
+      - `[FIRMWARE]` — observed in a pinned firmware image, filesystem, binary,
+        config, or SBOM. Give artifact hash plus path, address, or symbol.
+      - `[LIVE]` — observed on the authorized lab device. Give firmware version,
+        method, UTC timestamp, and a saved evidence artifact when possible.
       - `[VENDOR]` — vendor documentation, official spec sheet, or release notes.
         Give the URL.
       - `[THIRD-PARTY]` — teardown, blog post, advisory, or write-up. Give the URL
@@ -241,16 +384,33 @@ phases:
       clause gives you anything at all.** If the device has no radios, say so
       unambiguously — that collapses the surface to network services only.
 
+      ## Input coverage and confidence
+      Summarize the pinned inputs from `output/run-profile.md`: which shipped
+      components are backed by current source, which are firmware-only, which
+      can be observed live, and which are unavailable. State the consequence of
+      each gap. Do not treat a public upstream HEAD as the shipped device build
+      unless version evidence connects them.
+
       ## Software stack and component map
       Every significant software component running on the device: operating
       system, init and supervisor layers, container runtime, application
       runtime, language(s), and the privilege each runs at. For each component,
       state one of:
-      - `IN-TREE` — source is in the cloned repository; workers can analyze it.
+      - `IN-TREE` — source is in a pinned source root; workers can analyze it.
+      - `FIRMWARE-ONLY` — present only as an extracted file or binary; record the
+        artifact hash, architecture, path/address, and available symbols.
       - `OUT-OF-TREE` — first-party but not cloned; note the upstream repo.
       - `THIRD-PARTY` — vendored or packaged dependency; note name and version.
       A chain that needs an OUT-OF-TREE link is still worth pursuing, but the
       captain has to know which links it cannot verify locally.
+
+      ## Boot, service activation, and update chain
+      Map boot stages, init/service definitions, startup ordering, recovery and
+      factory-reset paths, update download/verification/install logic, rollback,
+      and trust roots. Identify which services are actually activated in the
+      default fully operational state. Record signed-versus-encrypted update
+      properties separately. This section is especially important when the input
+      is extracted firmware rather than a source repository.
 
       ## Default-configuration state
       The rules place the device in "default configurations and fully operational
@@ -282,9 +442,19 @@ phases:
       the XML device descriptions it fetches and parses, DHCP sniffing, NetBIOS/
       LLMNR, ARP, IPv6 RA/ND, broadcast and multicast listeners, BLE
       advertisement parsing, Zigbee/Thread/Matter frame handling. These are
-      pre-authentication by construction and are where this category's entries
-      historically come from. For each: the trigger, the parsing entry point
-      (`path:line` when IN-TREE), and where parsed attacker data flows next.
+      high-value pre-authentication candidates, but unsolicited receipt alone does
+      not prove a handler is active, reachable, or unauthenticated. For each:
+      prove activation in the default state, the trigger, parsing entry point
+      (`path:line` or firmware address/symbol), guards, and where parsed attacker
+      data flows next.
+
+      ## Companion, cloud, and cross-device boundaries
+      Identify mobile/desktop companion apps, cloud APIs, media/control endpoints,
+      and peer devices that influence input consumed by the target. Mark each as
+      `DIRECT ENTRY`, `DEPENDENCY`, or `OUT OF CONTEST PATH`. The initial
+      vulnerability must be in the registered target, so never turn a companion,
+      cloud, or neighboring-device bug into a target claim without a rules-valid
+      path that begins in this device.
 
       ## Authentication and authorization model
       How the device authenticates clients, what token or session formats exist,
@@ -305,10 +475,11 @@ phases:
       candidate escape paths.
 
       ## Sensitive information on the device
-      The rules accept "retrieve sensitive information" as an alternative win
-      condition. Enumerate what would qualify on this device and where it lives
-      on disk or in memory: credentials, long-lived tokens, integration secrets,
-      cloud-link credentials, user databases, recorded history. Give paths.
+      The rules accept retrieval of sensitive information that the Sponsor defines
+      for the attempt. Quote that registration definition from the run profile when
+      available. Otherwise enumerate only *candidate* high-value secrets on the
+      device and state that contest sufficiency is unconfirmed. Give paths or
+      binary locations without exposing real secret values in the recap.
 
       ## Prior Pwn2Own and public vulnerability history
       Research this hard — it is the difference between a paid entry and a
@@ -320,7 +491,7 @@ phases:
       - CVEs and vendor security advisories, including GitHub Security Advisories
         for the in-tree repositories.
       - Recent security-relevant commits, hardening changes, and fixed bug
-        classes in the cloned tree.
+        classes in the pinned source and firmware inputs.
       Then state, in a short paragraph, which bug classes are now well-trodden on
       this device and which surfaces appear comparatively unexamined.
 
@@ -354,15 +525,19 @@ phases:
       Review `output/device-recap.md` for the Pwn2Own Ireland 2026
       {{ TARGET_CATEGORY }} entry against {{ TARGET_DEVICE }}.
 
-      This recap is injected into every downstream agent prompt and is the basis
+      Read `output/run-profile.md` too. The recap must remain consistent with its
+      pinned identity, version, artifact hashes, capabilities, and authorization
+      boundary. This recap is injected into every downstream agent prompt and is the basis
       for contest-scope rejections. It has to be right. Check:
 
       1. The file exists and uses every required section header.
       2. The "Network-reachable surface in default configuration" table has real
          ports, real processes, and an explicit auth column — not placeholders,
          and not a list of services that only exist during initial setup.
-      3. The "Hardware and radios" section answers definitively whether an RF
-         attack surface exists on the stock device. "Possibly" is a fail.
+      3. The "Hardware and radios" section classifies each RF surface as PRESENT,
+         ABSENT, or UNKNOWN with evidence. UNKNOWN is allowed when initialization
+         recorded the evidence gap, but downstream scope decisions must treat it
+         as unavailable until confirmed.
       4. The "Authentication and authorization model" section actually
          enumerates pre-authentication reachable handlers. A chain cannot be
          scoped without this.
@@ -371,7 +546,13 @@ phases:
       6. "Prior Pwn2Own and public vulnerability history" shows evidence of real
          research — named advisories, CVE identifiers, or commits — not a generic
          statement that the project has had vulnerabilities.
-      7. "Contest-rule mapping for this device" is specific enough to reject a
+      7. "Input coverage and confidence" and "Boot, service activation, and
+         update chain" distinguish source-backed, firmware-only, live-observed,
+         and unavailable components, and do not equate upstream HEAD with shipped
+         firmware without version evidence.
+      8. "Companion, cloud, and cross-device boundaries" prevents bugs outside
+         the registered target from being mistaken for valid initial links.
+      9. "Contest-rule mapping for this device" is specific enough to reject a
          claim by citation.
 
       Do not modify any files. If the recap is missing sections, hand-waves the
@@ -380,19 +561,19 @@ phases:
       `VERDICT: PASS`.
 
   # ==========================================================================
-  # Phase 2 — the hunt.
+  # Phase 3 - the hunt.
   # ==========================================================================
   - id: hunt-bugs
     type: analysis
     prompt: |
       You are hunting a Pwn2Own Ireland 2026 entry against the
-      {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}** ({{ TARGET_VENDOR }}).
+      {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}**.
 
-      Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
-      Primary repository under analysis: {{ REPO }}
+      Attack vector: {{ TARGET_VECTOR }}.
+      Analysis roots: {{ SOURCE_ROOTS }}
 
-      Read `output/device-recap.md` before doing anything else. It is the
-      device-specific ground truth for this run — hardware, radios, default-
+      Read `output/run-profile.md` and then `output/device-recap.md` before doing
+      anything else. Together they are the device-specific evidence base for this run - hardware, radios, default-
       configuration listening services, pre-authentication surface, sandbox
       boundaries, and prior public findings. The attack-surface analyst has also
       folded it into the project brief injected above.
@@ -425,8 +606,10 @@ phases:
         deserialization, template injection, path traversal into a written file,
         SSRF into a privileged internal API, or an authentication bypass that
         promotes the attacker into a credentialed role.
-      - **Link C — code execution.** The primitive converted into running
-        attacker instructions on the device.
+      - **Link C — winning impact.** The primitive converted into arbitrary code
+        execution on the device or retrieval of the exact sensitive information
+        the Sponsor defines for this entry. Do not guess that definition; use the
+        run profile and registration details, and otherwise prioritize RCE.
       - **Link D — escape, if required.** If the network-facing code is
         sandboxed or containerized, the rules require a full escape before the
         device is considered compromised. The recap states whether this link is
@@ -443,11 +626,10 @@ phases:
       This deserves its own statement because it invalidates the majority of
       plausible-looking findings on smart-home targets.
 
-      Most of these devices grant an authenticated administrator broad power by
-      design — running scripts, invoking shell commands, installing extensions,
-      evaluating templates, uploading and restoring backups. Demonstrating code
-      execution from an authenticated administrator session is demonstrating the
-      product working as intended. It is worth nothing on its own.
+      Some smart-home devices grant an authenticated administrator broad power by
+      design; others expose only narrow control operations. The recap must establish
+      the actual role capabilities for this target. Demonstrating a documented
+      administrator capability is intended behavior, not a vulnerability.
 
       The rules say the exploit "must occur prior to authentication to the
       service or include an authentication bypass." So:
@@ -464,6 +646,37 @@ phases:
       bypass**, and spawn targets hunting that bypass. That is often the real
       shape of a winning chain on these devices.
 
+      ### Investigation lanes
+
+      Keep multiple evidence lanes active so the run does not overfit to whichever
+      input format is easiest to search. Only dispatch a lane when the run profile
+      says its required capability or artifact is available.
+
+      1. **Reachability and activation** - prove default-state listeners, radio
+         handlers, exposed features, authentication ordering, and the exact bytes
+         controlled by a contestant laptop.
+      2. **Source dataflow** - follow attacker-controlled fields through parsers,
+         state machines, trust checks, IPC, files, and dangerous sinks in pinned
+         source. Include build flags and deployment configuration.
+      3. **Firmware and binary analysis** - extract filesystems and update packages;
+         map services from init/config; identify architecture, mitigations, imports,
+         strings, protocol dispatchers, and vulnerable native parsing; correlate
+         every result to the pinned artifact hash and address/symbol.
+      4. **Protocol and live validation** - derive protocol grammars, capture a
+         clean baseline, mutate one dimension at a time, preserve PCAP/log/crash
+         evidence, and restore a fresh default operational state between trials.
+      5. **Privilege and update boundaries** - analyze internal management APIs,
+         IPC, sandbox/container escape paths, signed-update verification, rollback,
+         and persistence only where they complete a rules-valid chain.
+      6. **Chain integration and variants** - connect independently proven links,
+         measure automation/reliability, and sweep sibling code after a verified
+         defect or a historically fixed bug class.
+
+      A target packet must name its lane, exact component/artifact and version,
+      required capability, chain link, attacker-controlled input, success evidence,
+      and stop condition. Do not assign live/RF work to a static-only worker, or
+      source-line work to a firmware-only component.
+
       ### What counts
 
       Prioritize by what the recap says the device is actually built from. The
@@ -479,7 +692,7 @@ phases:
       harnesses under `fuzz/`, `tests/fuzz/`, `oss-fuzz/` first.
 
       **When the exposed surface is memory-safe (Python, Go, Java, Node, managed
-      runtimes) — which is the case for Home Assistant's exposed surface:**
+      runtimes):**
       memory-safety hunting is mostly wasted effort. The winning classes are:
 
       - **Command and argument injection** — `subprocess` with `shell=True`,
@@ -488,10 +701,9 @@ phases:
       - **Unsafe deserialization** — `pickle`, `marshal`, `yaml.load` /
         `yaml.unsafe_load` / `yaml.full_load`, `jsonpickle`, custom object
         reconstruction, over any attacker-reachable byte stream.
-      - **Template injection** — Jinja2 and similar engines rendering
-        attacker-controlled template *source* rather than attacker-controlled
-        *data*. On Home Assistant specifically the template engine is powerful
-        and widely reachable; find a pre-auth path into it.
+      - **Template injection** — template engines rendering attacker-controlled
+        template *source* rather than attacker-controlled *data*. Establish the
+        actual engine, sandbox policy, and pre-auth dataflow on this device.
       - **Path traversal into a write** — upload, backup, restore, extraction,
         media, and download handlers. An arbitrary file write on these devices is
         usually one restart or one config-reload away from code execution. Also
@@ -511,8 +723,8 @@ phases:
         and an application server disagree about framing.
       - **Discovery-data flow bugs** — attacker-controlled mDNS, SSDP, or DHCP
         fields flowing into config flows, file paths, URLs the device then
-        fetches, or commands. These begin unauthenticated, which makes them
-        disproportionately valuable here.
+        fetches, or commands. They are disproportionately valuable after default
+        activation and lack of an authentication guard are proven.
 
       **Always in scope regardless of language:** sandbox and container escapes
       that convert code execution in a confined process into control of the
@@ -552,26 +764,27 @@ phases:
       surface from the recap, then decompose it into bounded investigation
       targets workers can execute independently.
 
-      **Operate at scale.** This workflow is configured for an exhaustive,
-      multi-hour run. Expect to spawn many dozens to hundreds of targets. Run
-      time is not a concern — coverage and chain completeness are. The engine
-      enforces explicit floors on captain turns and terminal targets and will
-      reject premature `complete` declarations until those floors are met.
+      **Operate with evidence-driven breadth.** Run enough independent targets to
+      cover every confirmed entry point and every applicable investigation lane,
+      while avoiding quota-filling duplicates. Coverage and chain completeness
+      matter more than raw target count. The engine enforces modest floors only to
+      prevent a shallow first pass.
 
       **Per-turn fanout (hard expectation).** While `UNCOVERED SURFACE` in your
-      `mental_model_summary` is non-empty, every turn must enqueue at least 8 new
-      targets, spread across:
+      `mental_model_summary` is non-empty, every turn must enqueue 4-8 bounded new
+      targets, spread across different applicable investigation lanes and:
       - Unexplored entry points from the recap's ranked target list
       - Gaps in partially-complete chains (see `CHAINS` below) — a missing Link A
         for a verified Link B is the highest-value target you can spawn
       - Variant-analysis follow-ups for recently verified or rejected claims
       - Deeper drills into the highest-yield surfaces already in flight
 
-      **Front-load the unsolicited-input surface.** The recap has a dedicated
-      section for it. Discovery protocol parsers, broadcast/multicast listeners,
-      and radio frame handlers are pre-authentication by construction, which
-      means findings there clear the hardest contest gate automatically. Spend
-      your early turns there before touching authenticated surfaces.
+      **Front-load proven unsolicited-input surfaces.** The recap has a dedicated
+      section for them. Discovery protocol parsers, broadcast/multicast listeners,
+      and radio frame handlers are often pre-authentication, but only after the
+      activation path and guards are established for the default device state.
+      Give early priority to confirmed surfaces; assign separate reachability
+      targets to candidates whose activation is still unknown.
 
       **Variant-analysis policy (apply every turn that has new evidence):**
       - **Verified claim**: the bug is a leaf — do NOT respawn it. Treat it as
@@ -608,6 +821,8 @@ phases:
          against the recap's history section)
       8. Integration points that fetch and parse remote content the attacker can
          influence
+      9. Firmware boot/update/recovery code and binary-only services proven to
+         ship, especially where source coverage is absent
 
       Adapt aggressively: if a surface yields repeated no-findings or rejections,
       deprioritize it and pivot. If a verified claim opens a seam toward a
@@ -617,7 +832,13 @@ phases:
 
       Your `mental_model_summary` MUST use the `SUBSYSTEMS`, `ENTRY POINTS`,
       `UNCOVERED SURFACE`, and `NOTES` sections defined in the captain role
-      prompt, **plus one additional section appended after `NOTES`**:
+      prompt, plus `EVIDENCE LANES` and `CHAINS` appended after `NOTES`:
+
+          EVIDENCE LANES:
+            - reachability-and-activation: active - 6/8 confirmed entry points covered
+            - source-dataflow: active - pinned source at <sha>
+            - firmware-and-binary: blocked - no firmware artifact in run profile
+            - protocol-and-live: unavailable - static-analysis-only run
 
           CHAINS:
             - chain-1 [incomplete] — A: verified (claim-14, mDNS TXT parser reachable
@@ -627,7 +848,7 @@ phases:
             - chain-2 [stalled] — A: MISSING. B: verified (claim-31, template injection),
               authenticated-only. Spawned target-77/78/79 hunting auth bypass.
 
-      Every turn, update `CHAINS` alongside the other sections. Each chain names
+      Every turn, update `EVIDENCE LANES` and `CHAINS` alongside the other sections. Each chain names
       its links, the claim backing each verified link, and the specific missing
       link. This is how the run stays pointed at an entry rather than
       accumulating disconnected findings.
@@ -641,8 +862,10 @@ phases:
          variant-analysis policy.
       4. Pursued the missing link of every `incomplete` or `stalled` chain until
          it is either closed or demonstrably a dead end, with the reason recorded.
-      5. Explored at least 3 different vulnerability classes from "What counts".
-      6. `UNCOVERED SURFACE` is empty (`(none)`).
+      5. Every applicable evidence lane is covered or has an explicit run-profile
+         blocker; unavailable lanes do not count as silently covered.
+      6. Explored at least 3 different vulnerability classes from "What counts".
+      7. `UNCOVERED SURFACE` is empty (`(none)`).
 
       If you run out of high-priority targets, pivot to medium-priority
       exploration of unexplored surface and add it to your spawn batch — do NOT
@@ -665,8 +888,8 @@ phases:
 
       **Prefer PoCs that drive the real service over the network.** For a
       device target, the gold standard is a crafted packet, frame, or request
-      sent to a running instance of the actual service — in a container, VM, or
-      emulator — producing the alleged effect. Calling an internal Python
+      sent to a running instance of the actual service - in a container, VM, or
+      emulator - producing the alleged effect. Calling an internal implementation
       function directly proves the function is buggy; it does not prove an
       attacker can reach it. Reaching for the real listener also surfaces the
       guards that sit between the wire and the sink, which is exactly what the
@@ -682,31 +905,30 @@ phases:
       `blocked`, write nothing to disk; just return the structured JSON. The
       `output/` tree is owned by the reporter agent.
     analysis:
-      # Models default per role: claude → captain opus 4.7 1M, worker opus 4.7
-      # (200K), verifier opus 4.6 (200K), reporter sonnet 4.6, analyst opus 4.7
-      # 1M. Override with `captain_model`, `worker_model`, `verifier_model`, or a
-      # per-spec `model:` field if needed.
+      # Pin the strategic coordinator to Claude Opus 5 and investigation workers
+      # to GPT-5.6 Sol. Bare backend names select the installed SDK by default;
+      # these explicit model IDs pass through unchanged on SDK and CLI paths.
       captain_backend: claude
-      worker_backend: claude
+      captain_model: claude-opus-5
+      worker_backend: codex
+      worker_model: gpt-5.6-sol
       # Shared budget: all parallel agents draw from one pool, with verifier
       # dispatch preempting worker dispatch, so newly-proposed claims clear the
       # chain before more workers spin up.
       #
       # NOTE: this workflow runs a FIVE-stage verifier chain (bug-bounty.yaml
       # runs four), and the chain is sequential per claim. Verification is
-      # therefore the throughput bottleneck. At max_agents: 3 a claim that passes
-      # all five gates occupies most of the pool for a long stretch. Raise this
-      # to 6-12 if you want the fanout the captain prompt asks for to actually
-      # keep workers busy.
+      # therefore the throughput bottleneck. Eight shared slots leave room for a
+      # full verifier chain plus workers in distinct evidence lanes.
       shared_agent_budget: true
-      max_agents: 3
+      max_agents: 8
       # max_workers / max_verifiers are unused under shared_agent_budget: true.
       # Set shared_agent_budget: false (and uncomment below) to fall back to
       # legacy independent pools.
       # max_workers: 4
       # max_verifiers: 12
       interaction_timeout: 3.0
-      max_worker_retries: 10
+      max_worker_retries: 3
       max_captain_repairs: 4
       allow_repo_tools: true
       # Each worker fans out into its own subagents to work competing
@@ -715,26 +937,27 @@ phases:
       # worker prompt below leans on it. Set false for a legacy single-pass
       # worker.
       worker_dynamic_workflow: true
-      # Engine-enforced floors before the captain may declare `complete`.
-      min_captain_turns: 50
-      min_terminal_targets_before_complete: 200
+      # Engine-enforced floors prevent a shallow pass without rewarding duplicate
+      # quota-filling. The prompt's entry-point/lane/chain coverage is the real bar.
+      min_captain_turns: 12
+      min_terminal_targets_before_complete: 48
       # Soft escape: after this many consecutive overridden `complete`
       # declarations, the engine accepts completion to avoid an infinite nudge
       # loop on a dry target.
-      max_premature_completes: 5
+      max_premature_completes: 3
       continue_nudge: |
         ## Continue nudge — Pwn2Own coverage floors not yet met
 
         The engine has REJECTED your `complete` declaration (override #{consecutive} of
         {max_premature_completes}). Status: {turns} captain turn(s) elapsed; {terminal} target(s)
         in terminal state. Required floors: >= {min_captain_turns} captain turns AND
-        >= {min_terminal_targets} terminal targets. This is a deep, exhaustive contest-prep
-        run — run time is not a concern; chain completeness is.
+        >= {min_terminal_targets} terminal targets. This is a coverage-driven contest-prep
+        run; distinct evidence and chain completeness matter more than raw volume.
 
         Required actions for THIS turn:
 
         1. Update `mental_model_summary` with structured coverage accounting (SUBSYSTEMS,
-           ENTRY POINTS, UNCOVERED SURFACE, NOTES, CHAINS). UNCOVERED SURFACE must be empty
+           ENTRY POINTS, UNCOVERED SURFACE, NOTES, EVIDENCE LANES, CHAINS). UNCOVERED SURFACE must be empty
            before `complete` is allowed, and every CHAINS entry must be `complete` or carry a
            recorded dead-end reason.
         2. Re-read the ranked target list and the unsolicited-input section of
@@ -750,13 +973,13 @@ phases:
            - No-findings target: do NOT re-investigate; only spawn an adjacent fresh-angle
              target if you have a concrete new reason.
            - Blocked target: do NOT respawn until the blocker is addressed.
-        4. Enqueue at least 10 new targets. Bias toward unauthenticated reach: discovery
-           protocol parsers, broadcast/multicast listeners, RF frame handlers the recap
-           confirms exist, and the authentication machinery itself. An auth bypass unlocks
-           every authenticated sink already found.
+        4. Enqueue 4-8 non-duplicate targets across applicable evidence lanes. Bias toward
+           proven unauthenticated reach: active discovery parsers, broadcast/multicast
+           listeners, RF handlers the recap confirms exist, and authentication machinery.
+           Do not enqueue work whose required capability is unavailable in the run profile.
         5. Return `termination_state: "continue"`. Do not declare `complete` again until both
-           floors are met AND UNCOVERED SURFACE is empty AND no chain is left stalled without
-           a recorded reason.
+           floors are met AND UNCOVERED SURFACE is empty AND every evidence lane is covered
+           or explicitly blocked AND no chain is stalled without a recorded reason.
       worker_prompt: |
         ## Your role
 
@@ -786,7 +1009,8 @@ phases:
         one `outcome` and the same claim shape — never one block per subagent,
         and never a claim outside your assigned target.
 
-        Read `output/device-recap.md` for the device's ground truth: which
+        Read `output/run-profile.md` and `output/device-recap.md` for the device's
+        evidence base: which
         services listen by default, what is reachable before authentication,
         which radios exist, and where the sandbox boundaries are. The project
         brief injected above summarizes it.
@@ -807,10 +1031,9 @@ phases:
            exploit to "occur prior to authentication to the service or include an
            authentication bypass." If your path needs a valid session, token, API
            key, or paired client, it is not an entry unless you also demonstrate
-           obtaining that position without credentials. Smart-home hubs grant
-           authenticated administrators code execution *by design* — scripts,
-           shell commands, add-on installation, template evaluation, backup
-           restore. Demonstrating that is demonstrating the product.
+           obtaining that position without credentials. Reject effects that the
+           device recap establishes as intended capabilities of that authenticated
+           role; do not assume every smart-home target has the same admin powers.
         2. **Is the outcome code execution or sensitive data?** Crashes, hangs,
            resource exhaustion, config corruption, entity manipulation, and cache
            poisoning are not contest wins, however severe. A crash matters only
@@ -837,7 +1060,8 @@ phases:
         - **Link A** — unauthenticated reach into device code
         - **Link B** — primitive (corruption, injection, deserialization,
           traversal, SSRF, or authentication bypass)
-        - **Link C** — code execution
+        - **Link C** - winning impact: arbitrary code execution, or the exact
+          Sponsor-defined sensitive-information retrieval where applicable
         - **Link D** — sandbox or container escape, where the recap says one is
           required
 
@@ -911,8 +1135,7 @@ phases:
         management. Try `-fsanitize=address,undefined`, the project's existing
         ASan target, or a harness under `fuzz/`, `tests/fuzz/`, `oss-fuzz/`.
 
-        For memory-safe components — which on Home Assistant is nearly the whole
-        exposed surface — hunt instead for: command and argument injection;
+        For memory-safe components, hunt instead for: command and argument injection;
         unsafe deserialization (`pickle`, `marshal`, `yaml.load` /
         `yaml.unsafe_load` / `yaml.full_load`, `jsonpickle`); server-side
         template injection where attacker input becomes template *source*; path
@@ -987,15 +1210,12 @@ phases:
         Return only the structured JSON. A no-findings run that leaves files
         behind is treated as malformed.
       analyst:
-        # Runs ONCE at the start of this analysis phase, in parallel with the
-        # captain's first turn. Here its main job is to fold the device-recon
-        # phase's `output/device-recap.md` together with a code-level reading of
-        # the cloned repository into the brief that gets injected into every
-        # captain / worker / verifier system prompt as a cacheable prefix. It
-        # also writes `.claude/agents/attack-surface.md`, which the
-        # `preauth-impact` verifier materializes as its own role. Soft-fails: if
-        # the analyst fails, prompts include a `BRIEF_UNAVAILABLE` placeholder
-        # and the run continues with a visible error printed to stdout.
+        # Dynamic-analysis initialization barrier. Juvenal starts this role ONCE
+        # and waits for it to become ready or definitively fail before dispatching
+        # any captain, worker, or verifier. It folds the reviewed run profile and
+        # device recap together with source/firmware analysis into the cacheable
+        # brief injected into every later role. It also writes matching Claude and
+        # Codex `attack-surface` subagent definitions from that same brief.
         enabled: true
         backend: claude
         # 1M-context model — the analyst reads the recap plus a lot of code
@@ -1003,12 +1223,11 @@ phases:
         model: claude-opus-4-7[1m]
         max_duration_seconds: 1800
         prompt: |
-          You are the attack-surface analyst for a Pwn2Own Ireland 2026
-          {{ TARGET_CATEGORY }} entry against **{{ TARGET_DEVICE }}**
-          ({{ TARGET_VENDOR }}).
+          You are the initialization analyst for a Pwn2Own Ireland 2026
+          {{ TARGET_CATEGORY }} entry against **{{ TARGET_DEVICE }}**.
 
-          Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
-          Repository under analysis: {{ REPO }}
+          Attack vector: {{ TARGET_VECTOR }}.
+          Source and artifact roots under analysis: {{ SOURCE_ROOTS }}
           Repository root: {working_dir}
 
           {{ P2O_RULES }}
@@ -1017,21 +1236,24 @@ phases:
 
           {mission}
 
-          ## Start here: the device recap
+          ## Start here: the run profile and device recap
 
-          **Read `output/device-recap.md` first.** A prior phase produced it and
-          it passed a review gate. It is the device-specific ground truth:
+          **Read `output/run-profile.md`, then `output/device-recap.md`, first.**
+          Prior phases produced them and both passed review gates. They are the
+          device-specific evidence base:
           hardware and radios, software component map, default-configuration
           state, the table of network-reachable services, the unsolicited-input
           surface, the authentication model, sandbox boundaries, prior Pwn2Own
           and CVE history, and a device-specific mapping of the contest rules.
 
-          Your brief does not replace it — your brief **grounds it in the code**.
-          The recap says which services listen; you find where in
-          `{working_dir}` they are implemented, where their parsing begins, and
-          where the authentication check actually sits relative to the parsing.
-          That grounding is what lets verifiers reject claims with a `path:line`
-          instead of an opinion.
+          Your brief does not replace them - it initializes the dynamic run by
+          grounding their claims in the best available evidence. For source-backed
+          components, find implementation and `path:line`. For firmware-only
+          components, give artifact SHA-256 plus filesystem path, binary,
+          address/symbol, architecture, and analysis method. For live-only facts,
+          cite the authorized observation artifact and firmware version. Locate
+          parsing and authentication ordering rather than assuming a nominally
+          protected service parses nothing before its auth check.
 
           If `output/device-recap.md` is missing or truncated, say so loudly at
           the top of your brief and reconstruct what you can from the repository
@@ -1040,23 +1262,29 @@ phases:
 
           ## Your job
 
-          You run exactly once at the start of the analysis. The captain,
+          You run exactly once before the captain or any worker/verifier. The captain,
           workers, and verifiers all read your output as the source of truth for
           this device's trust model and attack surface. Be thorough but concise —
           cap the brief at roughly 8,000 words.
 
-          Investigate with Read / Grep / Glob across `{working_dir}`, plus
-          WebFetch and WebSearch for vendor documentation, security policy,
-          advisories, prior CVEs, and the contest rules. Do NOT modify any files
-          in the repo.
+          Investigate with the available repository and web-research tools across
+          `{working_dir}` for vendor documentation, security policy, advisories,
+          prior CVEs, and contest rules. Do NOT modify source or firmware inputs.
 
           ## Required brief structure — use these headers verbatim
 
           # Project Brief
 
+          ## Initialization verdict
+          State `READY` or `DEGRADED`, name the pinned target build and artifacts,
+          list which investigation lanes are available, and give explicit blockers
+          for unavailable lanes. If the run profile and recap disagree, use
+          `DEGRADED` and preserve the disagreement; do not choose whichever fact is
+          more convenient.
+
           ## Project identity
           What this component is, what role it plays on {{ TARGET_DEVICE }}, who
-          maintains it, the language(s), and the version or commit under
+          maintains it, the language(s), and the version, commit, or firmware hash under
           analysis. Note which parts of the device's software stack are NOT in
           this repository, per the recap's component map.
 
@@ -1074,21 +1302,22 @@ phases:
           network segment, RF-range devices, arbitrary remote content). Quote the
           project's own docs, SECURITY.md, or threat-model documentation where
           they exist. **State explicitly which capabilities an authenticated
-          administrator holds by design** — on smart-home hubs this list is long
-          and is the single most common source of invalid claims.
+          administrator holds by design**. Derive the list for this target; never
+          reuse another smart-home product's administrative capabilities.
 
           ## Attack surface — entry points
           Concrete enumeration of externally reachable interfaces, grounded in
-          code. For each: protocol, port, default exposure, the handler's
-          `path:line`, whether authentication gates it, and — critically —
+          code/firmware and, when available, live evidence. For each: protocol,
+          port/radio, default activation, handler `path:line` or binary address,
+          evidence tier, whether authentication gates it, and - critically -
           whether the authentication check runs BEFORE or AFTER the input is
           parsed. Parsing that precedes the auth check is pre-authentication
           attack surface regardless of what the route nominally requires.
 
           Separate the unsolicited-input handlers (discovery protocols,
           broadcast/multicast listeners, radio frame parsers) into their own
-          subsection. They are pre-authentication by construction and carry the
-          most contest value.
+          subsection. Treat them as pre-authentication only when activation and
+          guard analysis proves that property in the default operational state.
 
           ## Authentication & authorization boundaries
           How credentials and tokens are minted, validated, and revoked, with
@@ -1117,6 +1346,14 @@ phases:
           representative CVE or GHSA identifiers, plus anything from the recap's
           prior-Pwn2Own section. Note recent security-relevant commits and
           hardening changes. This drives variant analysis and the novelty gate.
+
+          ## Investigation lane seed
+          Seed bounded, non-overlapping targets for each AVAILABLE lane from the
+          mission: reachability/activation, source dataflow, firmware/binary,
+          protocol/live validation, privilege/update boundaries, and chain
+          integration/variants. Each seed names the exact artifact/version,
+          entry point or subsystem, chain link, expected evidence, and stop
+          condition. Mark unavailable lanes with their run-profile blocker.
 
           ## Sensitive information inventory
           What would satisfy the rules' "retrieve sensitive information" win
@@ -1160,7 +1397,7 @@ phases:
             boundaries.
 
             **Do not run the PoC.** Read the claim, read the cited code, and
-            consult `output/device-recap.md` — specifically its
+            consult `output/run-profile.md` and `output/device-recap.md` - specifically the recap's
             "Network-reachable surface in default configuration",
             "Unsolicited-input surface", "Default-configuration state", and
             "Contest-rule mapping for this device" sections. Those sections are
@@ -1209,12 +1446,20 @@ phases:
                stages fails here. A chain that is merely unpolished does not.
             6. **Check the patch-level assumption.** The device runs "the latest,
                fully patched version". If the claim depends on a version older
-               than current HEAD or the latest release, reject.
+               than the run profile's supported contest baseline, reject. Do not
+               equate an arbitrary upstream HEAD with the shipped firmware.
             7. **Flag prize-reducing techniques.** MITM, ARP spoofing, and
                software downgrade reduce the prize at Sponsor discretion but do
                NOT disqualify. If the claim uses one, PASS and record it
                prominently in `follow_up_action` so the entry is filed with eyes
                open.
+            8. **Confirm target ownership of the initial vulnerability.** A
+               companion app, vendor cloud, router, or neighboring device may
+               deliver bytes, but the first vulnerability must be in
+               {{ TARGET_DEVICE }} and every claimed vulnerability must exist in
+               the Sponsor-installed target software/firmware. Use the run
+               profile's version and artifact hashes. Reject a defect that belongs
+               to another product or an artifact not tied to the contest build.
 
             ### What you accept
 
@@ -1248,6 +1493,9 @@ phases:
               one command inside ten minutes.
             - **`stale-version`** — Depends on code already patched at HEAD or in
               the latest release.
+            - **`wrong-target-component`** - The initial vulnerability is in a
+              companion, cloud, router, neighboring device, or artifact not proven
+              to ship on the registered target.
 
             ### What is out of scope for THIS verifier
 
@@ -1285,9 +1533,10 @@ phases:
             private-API calls); this gate is not. Verifier 4 handles
             reproduction; verifier 3 handles the attacker's position.
 
-            **Do not run the PoC.** Read the cited code at HEAD, walk
-            attacker → sink, and judge the bug on its own terms. Referencing the
-            PoC's setup here reintroduces the gameable signal.
+            **Do not run the PoC.** Read the cited code at the run profile's pinned
+            revision, or the cited binary at its pinned artifact hash, then walk
+            attacker → sink and judge the defect on its own terms. Referencing
+            the PoC's setup here reintroduces the gameable signal.
 
             Apply the `bug-report-reviewer` and `design-critique-detector` skills
             if available.
@@ -1299,11 +1548,12 @@ phases:
                authentication bypass / authorization bypass / SSRF / information
                disclosure / privilege boundary / cryptographic misuse. State
                which.
-            2. **Verify the cited code matches the report's claim.** Read the
-               cited `file:line` at HEAD. Common failures: the line was
-               refactored, the validation lives in the caller, the guard polarity
-               was misread, the "missing" check sits a few lines below, or the
-               framework applies a decorator the report did not notice.
+            2. **Verify the cited artifact matches the report's claim.** Read the
+               cited `file:line` at the pinned revision, or confirm the firmware
+               SHA-256, binary, address/symbol, architecture, and disassembly.
+               Common failures: source and firmware versions differ, validation
+               lives in the caller, guard polarity was misread, a check sits nearby,
+               or framework/build configuration applies a guard the report missed.
             3. **Walk attacker → sink mechanically.** Where does input enter?
                What gates lie between input and sink — build flags, runtime
                config, feature negotiation, framework middleware, type coercion?
@@ -1359,7 +1609,7 @@ phases:
 
             ### Pass criteria (ALL must hold)
 
-            1. The cited code at HEAD does what the report claims.
+            1. The cited pinned source or firmware artifact does what the report claims.
             2. The bug class is a real implementation defect, not a hardening
                idea or a pure-correctness issue.
             3. Attacker input reaches the sink in a configuration that ships,
@@ -1384,13 +1634,13 @@ phases:
 
         - name: preauth-impact
           backend: claude
-          # When true, the runner replaces this verifier's `prompt` with the body
-          # of `.claude/agents/attack-surface.md` (written by the analyst from
-          # the device recap plus its code reading), so the verifier session
-          # materializes the attack-surface subagent role with the device brief
-          # embedded. The `prompt` below is the fallback used when that file is
-          # missing (analyst failed or has not run).
-          use_attack_surface_subagent: true
+          # Keep this contest-specific verifier prompt. The analyst brief is
+          # injected normally and matching Claude/Codex `attack-surface` subagents
+          # remain available for focused follow-up. Setting
+          # `use_attack_surface_subagent: true` would REPLACE this prompt with
+          # Juvenal's generic bug-bounty trust-model verifier and discard the
+          # Pwn2Own authentication/impact procedure.
+          use_attack_surface_subagent: false
           prompt: |
             ## Your specialized scope: pre-authentication reach and winning impact
 
@@ -1416,12 +1666,11 @@ phases:
 
             ### Why this gate is strict about authentication
 
-            Smart-home hubs grant authenticated administrators enormous power by
-            design. On Home Assistant that includes executing Python scripts,
-            invoking shell commands, installing add-ons and custom integrations,
-            evaluating arbitrary templates, and uploading and restoring backups.
-            The brief's "Documented out-of-scope / by-design behaviors" section
-            enumerates these for this device.
+            Smart-home products often grant authenticated administrators broad
+            powers by design, but those powers differ sharply by target. The
+            brief's "Documented out-of-scope / by-design behaviors" section
+            enumerates the actual capabilities for this device; do not import an
+            administrative feature set from another product.
 
             A report demonstrating code execution from an authenticated
             administrator session is demonstrating the product working as
@@ -1472,9 +1721,13 @@ phases:
                information". Classify the effect:
                - **Code execution** — attacker instructions run on the device.
                  PASS the impact test.
-               - **Sensitive information retrieval** — the attacker obtains
-                 something from the brief's sensitive-information inventory:
-                 credentials, tokens, integration secrets, user records. PASS.
+               - **Sponsor-defined sensitive information retrieval** - the
+                 attacker obtains the exact information recorded from registration
+                 in the run profile. PASS as Link C.
+               - **Other security-sensitive disclosure** - credentials, tokens,
+                 keys, or private records not yet confirmed by the Sponsor. PASS
+                 as a Link B disclosure primitive, but state that it is not a
+                 complete winning impact and prioritize an RCE conversion path.
                - **Corruption primitive** — memory corruption or a write
                  primitive that a chain could plausibly develop into code
                  execution. PASS, and note in `follow_up_action` that the chain
@@ -1528,8 +1781,9 @@ phases:
             1. The attacker starts unauthenticated, or the chain supplies the
                authentication bypass (verified sibling claim named).
             2. The effect is not a documented capability of the attacker's role.
-            3. The impact is code execution, sensitive-information retrieval, a
-               corruption primitive, or an authentication bypass.
+            3. The impact is code execution, Sponsor-defined sensitive-information
+               retrieval, another concrete security-sensitive disclosure primitive,
+               a corruption primitive, or an authentication bypass.
             4. Any missing chain link — code execution, sandbox escape — is
                explicitly acknowledged rather than glossed over.
 
@@ -1731,8 +1985,8 @@ phases:
             partial overlap rather than an exact duplicate, PASS and flag it
             loudly rather than rejecting.
 
-            Target device: {{ TARGET_DEVICE }} ({{ TARGET_VENDOR }})
-            Repository: {{ REPO }}
+            Target device: {{ TARGET_DEVICE }}
+            Source and artifact roots: {{ SOURCE_ROOTS }}
 
             ### Primary scope: external novelty (bias your effort here)
 
@@ -1765,7 +2019,8 @@ phases:
             6. **Known limitation.** Code comments, TODO / FIXME annotations, and
                known-bug lists at or near the cited locations.
 
-            WebFetch and WebSearch are fair game and you should use them.
+            Use available web-research tools; prefer primary vendor, ZDI, CVE,
+            and repository sources, and record direct URLs.
 
             Reject criteria — `rejection_class: duplicate-claim`:
             - Already fixed at HEAD or in a recent commit: cite the fixing commit
@@ -1851,7 +2106,7 @@ phases:
           - **Severity** — critical / high / medium / low, with a one-sentence
             justification grounded in the impact.
           - **Chain role** — which link this finding fills: Link A
-            (unauthenticated reach), Link B (primitive), Link C (code execution),
+            (unauthenticated reach), Link B (primitive), Link C (winning impact),
             or Link D (sandbox escape). State explicitly which links of a
             complete entry this finding does NOT supply, and what would be needed
             to close them. Pull this from the claim's reasoning and the verifier
@@ -1944,7 +2199,8 @@ phases:
       # NON-GATING post-verification exploit simulation. Runs AFTER the full
       # five-stage verifier chain passes and BEFORE the reporter, on its own
       # single-slot executor (it does not draw from `max_agents`). It stands the
-      # target up for real and tries to reproduce each verified claim live, then
+      # highest-fidelity runnable target representation available and tries to
+      # reproduce each verified claim live, then
       # categorizes it. It NEVER rejects a verified claim; an env-build or
       # simulator failure yields sim_error / sim_inconclusive while the claim
       # stays verified and the reporter still runs.
@@ -1952,7 +2208,8 @@ phases:
       # Why this matters more here than in a generic bounty run: the contest
       # installs the device "in their default configurations and fully
       # operational state", and requires the exploit to work pre-authentication.
-      # The env-builder below reproduces exactly that state — onboarded, but with
+      # The env-builder below must reproduce exactly that state - fully set up,
+      # but with
       # no credential handed to the attacker — so the judge's
       # exploit_confirmed vs exploit_confirmed_nondefault split lands directly on
       # a contest rule instead of being a generic nicety.
@@ -1965,20 +2222,30 @@ phases:
           model: claude-opus-4-7[1m]
           prompt: |
             You are the exploit-simulation environment builder for a Pwn2Own
-            Ireland 2026 Smart Home entry against {{ TARGET_DEVICE }}
-            ({{ TARGET_VENDOR }}). Target repository: {{ REPO }}
+            Ireland 2026 Smart Home entry against {{ TARGET_DEVICE }}.
+            Target source and artifact roots: {{ SOURCE_ROOTS }}
 
-            Read `output/device-recap.md` first if it exists. Its
+            Read `output/run-profile.md` and `output/device-recap.md` first. Their
             "Default-configuration state", "Network-reachable surface in default
             configuration", and "Software stack and component map" sections tell
-            you what a correct instance looks like and which components are not
-            in this repository.
+            you what a correct instance looks like, which exact build/artifact is
+            in scope, and which emulation/build capabilities are actually available.
 
-            Stand up a REAL, RUNNABLE instance of the target INSIDE THIS
-            SANDBOX. Actually fetch, build, install, and configure it so a live
-            process can be started and reached over the network — do NOT mock
-            it, stub it, or merely describe how it would run. A container is
-            usually the right shape here.
+            Stand up the highest-fidelity REAL, RUNNABLE representation of the
+            pinned target build INSIDE THIS SANDBOX. In priority order, use: an
+            official simulator or source build proven equivalent to the shipped
+            component; full-system emulation of the pinned firmware; then the exact
+            shipped service binary with its real libraries/configuration. A generic
+            reimplementation, a different device model, arbitrary upstream HEAD,
+            or a mock/stub is not a target instance. Containers are useful only
+            when they faithfully preserve the relevant device component and guards.
+
+            Do not fetch from untrusted or unofficial locations just to make an
+            environment possible. Keep the instance isolated from public networks,
+            vendor cloud services, unrelated LAN devices, and host credentials. If
+            no faithful runnable representation can be created from the capabilities
+            and artifacts in the run profile, fail clearly so the non-gating stage
+            records `sim_error`/`sim_inconclusive`; never manufacture fidelity.
 
             ## Reproduce the contest's starting state, not a fresh install
 
@@ -1987,25 +2254,25 @@ phases:
             operational state", and explicitly exclude entries that need it to
             be in an "initial-setup, pairing, or otherwise uninitialized state".
 
-            So: complete onboarding. Create the operator account, finish the
-            setup wizard, let the default integrations settle — bring the
-            instance to the state a real owner's device sits in. An instance
-            parked on the onboarding screen is the WRONG environment and will
-            make genuinely valid pre-auth findings look unreproducible.
+            Reproduce the exact normal operating state in the recap. Complete the
+            device-specific setup flow, including an owner account or paired
+            first-party controller only when that target normally requires one;
+            allow stock services to settle. Do not import another product's
+            account, integration, or setup model. An instance parked in a setup or
+            pairing-only state is the wrong environment.
 
-            Change nothing else. Do not enable extra integrations, add-ons,
-            debug modes, or configuration options beyond what a stock device
-            ships with. If the recap identifies something as enabled by default,
-            it belongs; anything else does not.
+            Change nothing else. Do not enable optional services, integrations,
+            plugins, debug modes, or configuration beyond the recap's proven
+            default operational baseline.
 
             ## Hard rule — hand the attacker nothing
 
             Do NOT pre-install, pre-seed, or expose ANY credential, token,
             session cookie, API key, paired-client identity, or privileged
             socket that an attacker would have to cross a trust boundary to
-            obtain. The operator account you create during onboarding is the
-            device owner's — its password and tokens stay inside the instance
-            and are never written anywhere the attacker role can read.
+            obtain. Any owner or controller credentials created during normal
+            setup stay inside the instance and are never written where the
+            attacker role can read them.
 
             The entry being simulated must work pre-authentication. Provisioning
             a credential would invalidate the entire exercise and would turn a
@@ -2165,30 +2432,32 @@ phases:
             EXPLOIT_JUDGE_JSON_END
 
   # ==========================================================================
-  # Phase 3 — assemble the contest picture.
+  # Phase 4 - assemble the contest picture.
   # ==========================================================================
   - id: summarize-findings
     prompt: |
       Write `pwn2own-report.md`, the run's contest-readiness index for the
-      Pwn2Own Ireland 2026 {{ TARGET_CATEGORY }} target **{{ TARGET_DEVICE }}**
-      ({{ TARGET_VENDOR }}).
+      Pwn2Own Ireland 2026 {{ TARGET_CATEGORY }} target **{{ TARGET_DEVICE }}**.
 
-      Attack vector: {{ TARGET_VECTOR }}. Prize: {{ TARGET_PRIZE }}.
+      Attack vector: {{ TARGET_VECTOR }}. Read prize and points from
+      `output/run-profile.md`; do not infer them from a different target.
 
       This is not a bug list. It is an assessment of how close the run got to a
       registrable entry, and what remains.
 
       ## Inputs
 
-      1. **`output/device-recap.md`** — the device ground truth from the recon
-         phase. Use it to frame coverage: which of the surfaces it ranked were
-         actually investigated.
-      2. **Per-bug reports under `output/<bug-id>/report.md`** — the
+      1. **`output/run-profile.md`** - the pinned target identity, rules snapshot,
+         input hashes, shipped-version baseline, capabilities, and authorization
+         boundary. Use it to prevent cross-device or stale-version conclusions.
+      2. **`output/device-recap.md`** - the device evidence base from recon. Use it
+         to frame coverage: which ranked surfaces were actually investigated.
+      3. **Per-bug reports under `output/<bug-id>/report.md`** - the
          authoritative source for verified findings. List them
          (`find output -maxdepth 2 -name report.md`), read each, and use its
          content directly. Do NOT rewrite the per-bug bodies — link to them and
          quote the title, CWE, severity, chain role, and location into the index.
-      3. **`.juvenal-state-hunt-bugs-analysis.json`** — for what the reports do
+      4. **`.juvenal-state-hunt-bugs-analysis.json`** - for what the reports do
          not capture: rejected claims with verifier reasons, blocked targets,
          no-findings targets, and the captain's final `mental_model_summary`
          including its `CHAINS` section.
@@ -2209,7 +2478,7 @@ phases:
       - Chain ID and status: complete / incomplete / stalled
       - Link A (unauthenticated reach) — claim ID and title, or MISSING
       - Link B (primitive) — claim ID and title, or MISSING
-      - Link C (code execution) — claim ID and title, or MISSING
+      - Link C (winning impact) - claim ID and title, or MISSING
       - Link D (sandbox escape) — claim ID and title, MISSING, or n/a
       - The specific work that would close the gap
 

@@ -319,7 +319,7 @@ class TestPwn2OwnSmartHomeWorkflow:
         phase = next(p for p in workflow.phases if p.type == "analysis")
         return workflow, phase.analysis
 
-    def test_verifier_chain_order_and_preauth_subagent(self):
+    def test_verifier_chain_order_and_custom_preauth_prompt(self):
         _, config = self._analysis()
 
         assert [spec.name for spec in config.verifiers] == [
@@ -330,7 +330,29 @@ class TestPwn2OwnSmartHomeWorkflow:
             "novelty",
         ]
         by_name = {spec.name: spec for spec in config.verifiers}
-        assert by_name["preauth-impact"].use_attack_surface_subagent
+        # Generic attack-surface mode replaces this contest-specific prompt.
+        assert not by_name["preauth-impact"].use_attack_surface_subagent
+
+    def test_sdk_default_role_models_are_pinned(self):
+        workflow, config = self._analysis()
+
+        assert workflow.backend == "claude"
+        assert config.captain_backend == "claude"
+        assert config.captain_model == "claude-opus-5"
+        assert config.worker_backend == "codex"
+        assert config.worker_model == "gpt-5.6-sol"
+
+    def test_analyst_is_initialization_barrier_after_device_preflight(self):
+        workflow, config = self._analysis()
+
+        ids = [phase.id for phase in workflow.phases]
+        assert ids.index("initialize-run") < ids.index("initialization-review")
+        assert ids.index("initialization-review") < ids.index("device-recon")
+        assert ids.index("device-recon") < ids.index("recap-review")
+        assert ids.index("recap-review") < ids.index("hunt-bugs")
+        assert workflow.max_bounces == 6
+        assert config.analyst is not None
+        assert config.analyst.enabled
 
     def test_recon_precedes_analysis_and_check_bounces_back(self):
         workflow, _ = self._analysis()

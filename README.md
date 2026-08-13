@@ -45,12 +45,12 @@ Each phase runs on a backend selected per workflow (`backend:` in YAML) or per r
 
 | Backend | Mechanism | Status |
 |---------|-----------|--------|
-| `claude` | Subprocess `claude` CLI | Default, always available |
-| `codex` | Subprocess `npx @openai/codex@latest` | Default, always available |
-| `claude-sdk` | In-process [`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) | Implemented, opt-in; live-smoke verified. Falls back to subprocess `claude` if the SDK is not installed |
-| `codex-sdk` | In-process official [`openai-codex`](https://pypi.org/project/openai-codex/) SDK | Implemented, opt-in; app-server/thread plumbing verified locally, but a **green success turn requires valid Codex auth** (`~/.codex/auth.json` from `codex login`, or `OPENAI_API_KEY`). Falls back to subprocess `codex` if the SDK is not installed |
+| `claude` | SDK-first logical Claude backend | Uses `claude-agent-sdk` when installed; falls back to the `claude` CLI |
+| `codex` | SDK-first logical Codex backend | Uses official `openai-codex` when installed; falls back to the Codex CLI |
+| `claude-sdk` | Explicit [`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) preference | Falls back to subprocess `claude` unless fail-loud mode is enabled |
+| `codex-sdk` | Explicit official [`openai-codex`](https://pypi.org/project/openai-codex/) preference | Falls back to subprocess `codex` unless fail-loud mode is enabled |
 
-The subprocess backends are the working defaults; the SDK backends are opt-in. Install with the `claude-sdk`, `codex-sdk`, or combined `sdk` extra (`pip install -e ".[sdk]"`). Set `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1` to make backend selection fail loud instead of falling back when the SDK is missing. Details and the E2E parity + default-flip steps are in [`docs/backends/`](docs/backends/).
+Bare `claude` and `codex` are the recommended selectors: `create_backend()` prefers the installed SDK and otherwise keeps workflows portable through the subprocess fallback. Install SDKs with the `claude-sdk`, `codex-sdk`, or combined `sdk` extra (`pip install -e ".[sdk]"`). Set `JUVENAL_BACKEND_NO_SDK=1` to force subprocess execution. The explicit `*-sdk` selectors can be made fail-loud with `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1`. See [`docs/backends/`](docs/backends/).
 
 ## Other Such Frameworks
 
@@ -62,9 +62,12 @@ Juvenal is conceptually similar to [ralph](https://github.com/snarktank/ralph), 
 pip install -e ".[dev]"
 ```
 
-## Claude Code Skill
+## Claude Code And Codex Skill
 
-Juvenal ships as a Claude Code plugin, so you can use it directly from Claude Code with `/juvenal`.
+Juvenal ships one portable `skills/juvenal/SKILL.md`. In this repository it is
+discovered through `.claude/skills/juvenal` by Claude Code and
+`.agents/skills/juvenal` by Codex. The same skill is also packaged as a Claude
+Code plugin.
 
 ### Install the plugin
 
@@ -86,7 +89,14 @@ Once installed, invoke the skill in Claude Code:
 /juvenal add authentication to the Flask app
 ```
 
-Claude will create a Juvenal workflow for your goal and run it. You can also ask for help with workflow formats or run existing workflows.
+In Codex, mention `$juvenal` or choose it with `/skills`:
+
+```
+$juvenal add authentication to the Flask app
+```
+
+Either agent can create a Juvenal workflow for your goal and run it. You can also
+ask for help with workflow formats or run existing workflows.
 
 ## Quick Start
 
@@ -276,7 +286,7 @@ can inspect the verified findings or audit trail if they need to summarize resul
 | `reporter` | `null` | `ReporterSpec` for the write-up agent that owns `output/<bug-id>/` |
 | `exploit_sim` | `null` | Optional non-gating post-verification stage (`ExploitSimSpec`); see below |
 
-Backend fields accept `claude`, `codex`, and the opt-in in-process `claude-sdk` / `codex-sdk` SDK backends.
+Backend fields accept `claude`, `codex`, `claude-sdk`, and `codex-sdk`. Bare `claude`/`codex` use SDK-first resolution and are normally the right workflow values.
 
 In v1, `analysis` phases may not appear inside `parallel_groups`.
 
