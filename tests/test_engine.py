@@ -3296,6 +3296,7 @@ class TestAnalysisEngineIntegration:
             runner.run.return_value = PhaseResult(success=True)
             runner.total_input_tokens = 3
             runner.total_output_tokens = 5
+            runner.total_cached_input_tokens = 2
 
             with patch.object(engine, "_get_git_head", return_value=None):
                 result = engine._run_analysis(phase)

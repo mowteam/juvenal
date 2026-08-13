@@ -27,6 +27,12 @@ class AgentResult:
     duration: float  # seconds
     input_tokens: int = 0
     output_tokens: int = 0
+    # The cached SUBSET of input_tokens, not an addition to it. Cached input is
+    # billed at a fraction of fresh input, so a run's token total says little
+    # about its cost without this: an agentic turn re-sends its whole
+    # conversation on every tool round-trip, and whether that costs full price
+    # or cache price is the difference between expensive and routine.
+    cached_input_tokens: int = 0
     session_id: str | None = None
     # Set when the Claude CLI surfaces a 429 in the final `result` event
     # (api_error_status). The runner uses this to distinguish a real upstream
@@ -425,6 +431,7 @@ class ClaudeBackend(Backend):
         assistant_messages: list[str] = []
         total_input_tokens = 0
         total_output_tokens = 0
+        total_cached_input_tokens = 0
         rate_limit_status: int | None = None
 
         try:
@@ -439,6 +446,7 @@ class ClaudeBackend(Backend):
                         duration=time.time() - start,
                         input_tokens=total_input_tokens,
                         output_tokens=total_output_tokens,
+                        cached_input_tokens=total_cached_input_tokens,
                     )
                 line = raw_line.rstrip("\n")
                 if not line:
@@ -446,9 +454,10 @@ class ClaudeBackend(Backend):
                 event = _parse_json_event(line)
                 if event:
                     display_text, assistant_text = _process_claude_event(event)
-                    inp, out = _extract_claude_tokens(event)
+                    inp, out, cached = _extract_claude_tokens(event)
                     total_input_tokens += inp
                     total_output_tokens += out
+                    total_cached_input_tokens += cached
                     if (
                         event.get("type") == "result"
                         and event.get("is_error")
@@ -489,6 +498,7 @@ class ClaudeBackend(Backend):
             duration=duration,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            cached_input_tokens=total_cached_input_tokens,
             rate_limit_status=rate_limit_status,
         )
 
@@ -760,6 +770,7 @@ class ClaudeSDKBackend(Backend):
         assistant_messages: list[str] = []
         total_input_tokens = 0
         total_output_tokens = 0
+        total_cached_input_tokens = 0
         rate_limit_status: int | None = None
         result_is_error = False
         result_text: str | None = None
@@ -767,6 +778,7 @@ class ClaudeSDKBackend(Backend):
 
         async def _consume() -> None:
             nonlocal total_input_tokens, total_output_tokens, rate_limit_status
+            nonlocal total_cached_input_tokens
             nonlocal result_is_error, result_text, resolved_session_id
             async for message in sdk.query(prompt=prompt, options=options):
                 for display_text, assistant_text in _render_claude_sdk_message(sdk, message):
@@ -797,6 +809,7 @@ class ClaudeSDKBackend(Backend):
                     usage = message.usage or {}
                     total_input_tokens += _claude_input_tokens(usage)
                     total_output_tokens += int(usage.get("output_tokens", 0) or 0)
+                    total_cached_input_tokens += _claude_cached_input_tokens(usage)
                     if message.result:
                         result_text = message.result
 
@@ -822,6 +835,7 @@ class ClaudeSDKBackend(Backend):
             duration=time.time() - start,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            cached_input_tokens=total_cached_input_tokens,
             session_id=resolved_session_id,
             rate_limit_status=rate_limit_status,
         )
@@ -955,6 +969,7 @@ class CodexBackend(Backend):
         assistant_messages: list[str] = []
         total_input_tokens = 0
         total_output_tokens = 0
+        total_cached_input_tokens = 0
         thread_id: str | None = None
 
         try:
@@ -969,6 +984,7 @@ class CodexBackend(Backend):
                         duration=time.time() - start,
                         input_tokens=total_input_tokens,
                         output_tokens=total_output_tokens,
+                        cached_input_tokens=total_cached_input_tokens,
                     )
                 line = raw_line.rstrip("\n")
                 if not line:
@@ -981,9 +997,10 @@ class CodexBackend(Backend):
                         if on_session_id:
                             on_session_id(thread_id)
                     display_text, assistant_text = _process_codex_event(event)
-                    inp, out = _extract_codex_tokens(event)
+                    inp, out, cached = _extract_codex_tokens(event)
                     total_input_tokens += inp
                     total_output_tokens += out
+                    total_cached_input_tokens += cached
                     if display_text:
                         transcript_lines.append(display_text)
                         if display_callback:
@@ -1014,6 +1031,7 @@ class CodexBackend(Backend):
             duration=duration,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            cached_input_tokens=total_cached_input_tokens,
             session_id=thread_id,
         )
 
@@ -1262,11 +1280,18 @@ class CodexSDKBackend(Backend):
             display_callback(output)
         input_tokens = 0
         output_tokens = 0
+        cached_input_tokens = 0
         usage = getattr(turn, "usage", None)
-        total = getattr(usage, "total", None)
-        if total is not None:
-            input_tokens = int(getattr(total, "input_tokens", 0) or 0)
-            output_tokens = int(getattr(total, "output_tokens", 0) or 0)
+        # `usage.total` is the THREAD's cumulative usage, not this turn's. The
+        # runner adds whatever we report on every turn, so reporting `total`
+        # bills a resumed thread triangularly — turn 5 re-counts turns 1-4.
+        # `usage.last` is the per-turn breakdown, which is what a per-call
+        # AgentResult means.
+        breakdown = getattr(usage, "last", None) or getattr(usage, "total", None)
+        if breakdown is not None:
+            input_tokens = int(getattr(breakdown, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(breakdown, "output_tokens", 0) or 0)
+            cached_input_tokens = int(getattr(breakdown, "cached_input_tokens", 0) or 0)
         # TurnStatus.completed is success; interrupted/failed are non-zero.
         status = getattr(turn, "status", None)
         status_value = getattr(status, "value", status)
@@ -1285,6 +1310,7 @@ class CodexSDKBackend(Backend):
             duration=time.time() - start,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
             session_id=thread_id,
         )
 
@@ -1510,19 +1536,32 @@ def _claude_input_tokens(usage: dict) -> int:
     )
 
 
-def _extract_claude_tokens(event: dict) -> tuple[int, int]:
-    """Extract token usage from a Claude event. Returns (input_tokens, output_tokens)."""
+def _claude_cached_input_tokens(usage: dict) -> int:
+    """The cached subset of `_claude_input_tokens`, for cost attribution."""
+    return int(usage.get("cache_read_input_tokens", 0) or 0)
+
+
+def _extract_claude_tokens(event: dict) -> tuple[int, int, int]:
+    """Extract usage from a Claude event. Returns (input, output, cached_input)."""
     if event.get("type") == "result":
         usage = event.get("usage", {})
         if usage:
-            return _claude_input_tokens(usage), int(usage.get("output_tokens", 0) or 0)
-    return 0, 0
+            return (
+                _claude_input_tokens(usage),
+                int(usage.get("output_tokens", 0) or 0),
+                _claude_cached_input_tokens(usage),
+            )
+    return 0, 0, 0
 
 
-def _extract_codex_tokens(event: dict) -> tuple[int, int]:
-    """Extract token usage from a Codex event. Returns (input_tokens, output_tokens)."""
+def _extract_codex_tokens(event: dict) -> tuple[int, int, int]:
+    """Extract usage from a Codex event. Returns (input, output, cached_input)."""
     if event.get("type") == "turn.completed":
         usage = event.get("usage", {})
         if usage:
-            return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
-    return 0, 0
+            return (
+                int(usage.get("input_tokens", 0) or 0),
+                int(usage.get("output_tokens", 0) or 0),
+                int(usage.get("cached_input_tokens", 0) or 0),
+            )
+    return 0, 0, 0

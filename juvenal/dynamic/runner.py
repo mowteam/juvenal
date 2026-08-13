@@ -544,6 +544,7 @@ def _load_agent_body(name: str, working_dir: Path | None = None) -> str | None:
 # `multi_agent stable true` on codex-cli 0.128.0; defs live in `.codex/agents/<name>.toml`
 # with name/description/developer_instructions — the exact keys the installed binary parses).
 _SHIPPED_AGENT_NAMES = (
+    "code-survey",
     "attack-surface-verifier",
     "trust-model-verifier",
     "poc-verifier",
@@ -757,6 +758,7 @@ class DynamicAnalysisRunner:
         self._shutdown_event = Event()
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.total_cached_input_tokens = 0
         self._interaction_channel = interaction_channel if interactive else None
         self._injected_interaction_channel = interaction_channel is not None and interactive
         if self._interaction_channel is None and interactive:
@@ -5400,6 +5402,7 @@ class DynamicAnalysisRunner:
     def _add_tokens(self, result: AgentResult) -> None:
         self.total_input_tokens += result.input_tokens
         self.total_output_tokens += result.output_tokens
+        self.total_cached_input_tokens += result.cached_input_tokens
 
     def _role_env(self, role: str, *, verifier_name: str = "") -> dict[str, str] | None:
         env = dict(self.phase.env)

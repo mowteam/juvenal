@@ -197,6 +197,7 @@ def test_agent_result_contract_fields_are_backend_independent():
         "duration",
         "input_tokens",
         "output_tokens",
+        "cached_input_tokens",
         "session_id",
         "rate_limit_status",
     }

@@ -457,3 +457,35 @@ def test_codex_sdk_reports_thread_id_before_running_the_turn():
     assert reported == ["019ff9a6-62db-7070-bd6e-b2ea628adfa5"]
     assert order == ["report", "run"], "thread id must be reported before thread.run()"
     assert result.exit_code == 1
+
+
+def test_codex_sdk_reports_per_turn_usage_not_thread_cumulative():
+    """`turn.usage.total` is the THREAD's running total, not this turn's.
+
+    Regression for: the runner adds whatever an AgentResult reports on every
+    turn, so reporting `total` billed a resumed thread triangularly — turn 5
+    re-counted turns 1-4. That inflated the exact number a token-reduction
+    effort is trying to read.
+    """
+    from juvenal.backends import CodexSDKBackend
+
+    class _Breakdown:
+        def __init__(self, i, o, c):
+            self.input_tokens, self.output_tokens, self.cached_input_tokens = i, o, c
+
+    class _Usage:
+        last = _Breakdown(1_000, 100, 800)
+        total = _Breakdown(50_000, 5_000, 40_000)  # whole thread so far
+
+    class _Turn:
+        final_response = "done"
+        status = "completed"
+        error = None
+        usage = _Usage()
+
+    backend = CodexSDKBackend.__new__(CodexSDKBackend)
+    result = backend._map_codex_turn(None, _Turn(), "thread-1", None, 0.0)
+
+    assert result.input_tokens == 1_000, "must bill this turn, not the thread total"
+    assert result.output_tokens == 100
+    assert result.cached_input_tokens == 800

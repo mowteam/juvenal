@@ -146,20 +146,20 @@ class TestCostTracking:
     def test_extract_claude_tokens(self):
         """Claude result event extracts token usage."""
         event = {"type": "result", "usage": {"input_tokens": 500, "output_tokens": 200}}
-        assert _extract_claude_tokens(event) == (500, 200)
+        assert _extract_claude_tokens(event) == (500, 200, 0)
 
     def test_extract_claude_tokens_no_usage(self):
         """Non-result events return zero tokens."""
-        assert _extract_claude_tokens({"type": "assistant"}) == (0, 0)
+        assert _extract_claude_tokens({"type": "assistant"}) == (0, 0, 0)
 
     def test_extract_codex_tokens(self):
         """Codex turn.completed event extracts token usage."""
         event = {"type": "turn.completed", "usage": {"input_tokens": 300, "output_tokens": 100}}
-        assert _extract_codex_tokens(event) == (300, 100)
+        assert _extract_codex_tokens(event) == (300, 100, 0)
 
     def test_extract_codex_tokens_no_usage(self):
         """Non turn.completed events return zero tokens."""
-        assert _extract_codex_tokens({"type": "item.completed"}) == (0, 0)
+        assert _extract_codex_tokens({"type": "item.completed"}) == (0, 0, 0)
 
     def test_state_tracks_tokens(self, tmp_path):
         """PipelineState accumulates token counts per phase."""

@@ -601,7 +601,12 @@ class Engine:
         finally:
             self._active_dynamic_runner = None
 
-        self.state.add_tokens(phase.id, runner.total_input_tokens, runner.total_output_tokens)
+        self.state.add_tokens(
+            phase.id,
+            runner.total_input_tokens,
+            runner.total_output_tokens,
+            runner.total_cached_input_tokens,
+        )
 
         if result.success:
             self.display.step_pass(f"analysis: {phase.id}")

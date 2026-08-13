@@ -541,13 +541,13 @@ class TestProcessCodexEvent:
 class TestExtractClaudeTokens:
     def test_result_with_usage(self):
         event = {"type": "result", "usage": {"input_tokens": 500, "output_tokens": 200}}
-        assert _extract_claude_tokens(event) == (500, 200)
+        assert _extract_claude_tokens(event) == (500, 200, 0)
 
     def test_result_no_usage(self):
-        assert _extract_claude_tokens({"type": "result"}) == (0, 0)
+        assert _extract_claude_tokens({"type": "result"}) == (0, 0, 0)
 
     def test_non_result_event(self):
-        assert _extract_claude_tokens({"type": "assistant", "usage": {"input_tokens": 100}}) == (0, 0)
+        assert _extract_claude_tokens({"type": "assistant", "usage": {"input_tokens": 100}}) == (0, 0, 0)
 
     def test_input_counts_cache_read_and_creation(self):
         # Anthropic reports cached input separately; all three are billed input.
@@ -560,7 +560,8 @@ class TestExtractClaudeTokens:
                 "output_tokens": 50,
             },
         }
-        assert _extract_claude_tokens(event) == (1206, 50)
+        # Cached input is reported as a SUBSET of the billed input total.
+        assert _extract_claude_tokens(event) == (1206, 50, 1000)
 
     def test_claude_input_tokens_helper_tolerates_missing_cache_fields(self):
         assert _claude_input_tokens({"input_tokens": 10}) == 10
@@ -571,13 +572,20 @@ class TestExtractClaudeTokens:
 class TestExtractCodexTokens:
     def test_turn_completed_with_usage(self):
         event = {"type": "turn.completed", "usage": {"input_tokens": 300, "output_tokens": 100}}
-        assert _extract_codex_tokens(event) == (300, 100)
+        assert _extract_codex_tokens(event) == (300, 100, 0)
 
     def test_turn_completed_no_usage(self):
-        assert _extract_codex_tokens({"type": "turn.completed"}) == (0, 0)
+        assert _extract_codex_tokens({"type": "turn.completed"}) == (0, 0, 0)
 
     def test_non_turn_event(self):
-        assert _extract_codex_tokens({"type": "item.completed"}) == (0, 0)
+        assert _extract_codex_tokens({"type": "item.completed"}) == (0, 0, 0)
+
+    def test_cached_input_is_reported(self):
+        event = {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 300, "output_tokens": 100, "cached_input_tokens": 250},
+        }
+        assert _extract_codex_tokens(event) == (300, 100, 250)
 
 
 class TestInteractiveResult:

@@ -133,6 +133,7 @@ class PhaseState:
     completed_at: float | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
     baseline_sha: str | None = None  # git HEAD before first implement run
     phase_type: str | None = None  # "implement", "check", "workflow", "analysis"
     analysis_state_file: str | None = None  # child state file for analysis phases
@@ -244,12 +245,13 @@ class PipelineState:
             ps.logs.append(entry)
             self.save()
 
-    def add_tokens(self, phase_id: str, input_tokens: int, output_tokens: int) -> None:
+    def add_tokens(self, phase_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> None:
         """Accumulate token usage for a phase."""
         with self._lock:
             ps = self._ensure_phase(phase_id)
             ps.input_tokens += input_tokens
             ps.output_tokens += output_tokens
+            ps.cached_input_tokens += cached_input_tokens
             self.save()
 
     def total_tokens(self) -> tuple[int, int]:
@@ -341,6 +343,7 @@ class PipelineState:
                     completed_at=pdata.get("completed_at"),
                     input_tokens=pdata.get("input_tokens", 0),
                     output_tokens=pdata.get("output_tokens", 0),
+                    cached_input_tokens=pdata.get("cached_input_tokens", 0),
                     baseline_sha=pdata.get("baseline_sha"),
                     phase_type=pdata.get("phase_type"),
                     analysis_state_file=pdata.get("analysis_state_file"),
@@ -620,6 +623,7 @@ class PipelineState:
                     "completed_at": ps.completed_at,
                     "input_tokens": ps.input_tokens,
                     "output_tokens": ps.output_tokens,
+                    "cached_input_tokens": ps.cached_input_tokens,
                     "baseline_sha": ps.baseline_sha,
                     "phase_type": ps.phase_type,
                     "analysis_state_file": ps.analysis_state_file,
