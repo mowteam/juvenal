@@ -7,6 +7,11 @@ description: Create, validate, run, and troubleshoot verified AI-agent workflows
 
 You are helping the user create and manage Juvenal workflows. Juvenal orchestrates AI coding agents through alternating implementation and verification phases, preventing agents from cheating on success criteria.
 
+For local use across repositories, `juvenal install-skills` installs this
+canonical skill at both user discovery locations: `~/.claude/skills/juvenal`
+for Claude Code and `~/.agents/skills/juvenal` for Codex. The command is
+idempotent and refuses to replace an unrelated existing skill.
+
 ## What is Juvenal?
 
 Juvenal is a framework where a deterministic Python runtime orchestrates AI coding agents (Claude or Codex) through verified phases. Each phase has:

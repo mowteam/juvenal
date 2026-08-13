@@ -108,8 +108,10 @@ When bumping the version, update it in both `pyproject.toml` and `.claude-plugin
 - `skills/juvenal/SKILL.md` is the canonical cross-agent skill and follows the
   portable Agent Skills format. `.claude/skills/juvenal` and
   `.agents/skills/juvenal` symlink to that directory for native Claude and Codex
-  repository discovery. Keep `plugin/skills/juvenal/SKILL.md` byte-identical for
-  standalone plugin packaging.
+  repository discovery. `juvenal install-skills` creates the corresponding
+  user-scoped links under `~/.claude/skills` and `~/.agents/skills`, making the
+  skill available outside this checkout. Keep `plugin/skills/juvenal/SKILL.md`
+  byte-identical for standalone plugin packaging.
 - Skill frontmatter must keep portable `name` and `description` fields. Put
   backend-specific invocation wording in the body only when both equivalents are
   stated (`/juvenal` for Claude, `$juvenal` or `/skills` for Codex).

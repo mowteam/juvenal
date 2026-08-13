@@ -10,6 +10,7 @@ from juvenal.cli import (
     _parse_defines,
     _parse_phased_implementer,
     build_parser,
+    cmd_install_skills,
     cmd_plan,
     cmd_run,
     cmd_status,
@@ -119,6 +120,11 @@ class TestArgumentParsing:
         assert args.directory == "myproject"
         assert args.template == "basic"
 
+    def test_install_skills(self):
+        parser = build_parser()
+        args = parser.parse_args(["install-skills"])
+        assert args.command == "install-skills"
+
     def test_validate(self):
         parser = build_parser()
         args = parser.parse_args(["validate", "workflow.yaml"])
@@ -142,6 +148,33 @@ phases:
 
         assert cmd_validate(args) == 0
         assert "Max bounces: 6" in capsys.readouterr().out
+
+    def test_install_skills_creates_global_claude_and_codex_links(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        args = build_parser().parse_args(["install-skills"])
+
+        assert cmd_install_skills(args) == 0
+        codex_skill = tmp_path / ".agents" / "skills" / "juvenal"
+        claude_skill = tmp_path / ".claude" / "skills" / "juvenal"
+        assert codex_skill.is_symlink()
+        assert claude_skill.is_symlink()
+        assert (codex_skill / "SKILL.md").is_file()
+        assert codex_skill.resolve() == claude_skill.resolve()
+
+        # Re-running setup is safe and leaves the same links in place.
+        assert cmd_install_skills(args) == 0
+        assert codex_skill.resolve() == claude_skill.resolve()
+
+    def test_install_skills_refuses_to_replace_existing_path(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        conflict = tmp_path / ".agents" / "skills" / "juvenal"
+        conflict.mkdir(parents=True)
+        args = build_parser().parse_args(["install-skills"])
+
+        assert cmd_install_skills(args) == 1
+        assert "refusing to replace" in capsys.readouterr().out
+        assert conflict.is_dir() and not conflict.is_symlink()
+        assert not (tmp_path / ".claude" / "skills" / "juvenal").exists()
 
     def test_run_checker_single(self):
         parser = build_parser()

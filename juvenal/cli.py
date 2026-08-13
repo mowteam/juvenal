@@ -1,6 +1,7 @@
 """Juvenal CLI — orchestrate AI coding agents through verified phases."""
 
 import argparse
+import site
 import sys
 from pathlib import Path
 
@@ -142,6 +143,12 @@ def build_parser() -> argparse.ArgumentParser:
     init_p = sub.add_parser("init", help="Scaffold a workflow directory")
     init_p.add_argument("directory", nargs="?", default=".", help="Directory to scaffold (default: .)")
     init_p.add_argument("--template", default="default", help="Template to use (default: default)")
+
+    # install-skills
+    sub.add_parser(
+        "install-skills",
+        help="Install the Juvenal skill for Claude Code and Codex in every local project",
+    )
 
     # validate (same flags as run, but always dry-run)
     validate_p = sub.add_parser(
@@ -514,6 +521,64 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _find_juvenal_skill_source() -> Path:
+    """Locate the canonical skill in an editable checkout or installed wheel."""
+    candidates = [
+        Path(__file__).resolve().parents[1] / "skills" / "juvenal",
+        Path(sys.prefix) / "share" / "juvenal" / "skills" / "juvenal",
+        Path(site.getuserbase()) / "share" / "juvenal" / "skills" / "juvenal",
+    ]
+    for candidate in candidates:
+        if (candidate / "SKILL.md").is_file():
+            return candidate.resolve()
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Juvenal skill asset is missing; searched: {searched}")
+
+
+def cmd_install_skills(args: argparse.Namespace) -> int:
+    """Install user-scoped Claude and Codex links to the canonical skill."""
+    del args
+    try:
+        source = _find_juvenal_skill_source()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    targets = [
+        Path.home() / ".agents" / "skills" / "juvenal",
+        Path.home() / ".claude" / "skills" / "juvenal",
+    ]
+
+    conflicts: list[Path] = []
+    already_installed: set[Path] = set()
+    for target in targets:
+        if target.is_symlink():
+            try:
+                if target.resolve(strict=True) == source:
+                    already_installed.add(target)
+                    continue
+            except FileNotFoundError:
+                pass
+            conflicts.append(target)
+        elif target.exists():
+            conflicts.append(target)
+
+    if conflicts:
+        for target in conflicts:
+            print(f"Error: refusing to replace existing skill path: {target}")
+        return 1
+
+    for target in targets:
+        if target in already_installed:
+            print(f"Already installed: {target} -> {source}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
+        print(f"Installed: {target} -> {source}")
+
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from juvenal.engine import Engine
     from juvenal.workflow import inject_implementer
@@ -558,6 +623,7 @@ def main(argv: list[str] | None = None) -> None:
         "do": cmd_do,
         "status": cmd_status,
         "init": cmd_init,
+        "install-skills": cmd_install_skills,
         "validate": cmd_validate,
     }
     sys.exit(handlers[args.command](args))

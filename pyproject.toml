@@ -36,6 +36,9 @@ include = ["juvenal*"]
 [tool.setuptools.package-data]
 juvenal = ["prompts/*.md", "prompts/agents/*.md", "templates/**/*", "workflows/**/*"]
 
+[tool.setuptools.data-files]
+"share/juvenal/skills/juvenal" = ["skills/juvenal/SKILL.md"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

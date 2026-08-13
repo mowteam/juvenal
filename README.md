@@ -60,14 +60,18 @@ Juvenal is conceptually similar to [ralph](https://github.com/snarktank/ralph), 
 
 ```bash
 pip install -e ".[dev]"
+juvenal install-skills
 ```
 
 ## Claude Code And Codex Skill
 
-Juvenal ships one portable `skills/juvenal/SKILL.md`. In this repository it is
-discovered through `.claude/skills/juvenal` by Claude Code and
-`.agents/skills/juvenal` by Codex. The same skill is also packaged as a Claude
-Code plugin.
+Juvenal ships one portable `skills/juvenal/SKILL.md`. Run `juvenal
+install-skills` once to create user-scoped links at
+`~/.claude/skills/juvenal` and `~/.agents/skills/juvenal`; Claude Code and Codex
+then discover the skill from any local working directory. The repository-scoped
+`.claude/skills/juvenal` and `.agents/skills/juvenal` links support contributors
+working inside this checkout. The same skill is also packaged as a Claude Code
+plugin.
 
 ### Install the plugin
 
@@ -537,6 +541,7 @@ juvenal do "goal" [--backend claude|codex] [--max-bounces N] [-D VAR=VAL]
                   [-i|--interactive] [--serialize]
 juvenal status [--state-file path]
 juvenal init [directory] [--template name]
+juvenal install-skills
 juvenal validate <workflow>
 ```
 
@@ -557,6 +562,10 @@ juvenal validate <workflow>
 | `--backoff SECONDS` | Exponential backoff base delay between bounces |
 | `--notify URL` | Webhook URL for completion/failure notifications. Repeatable. |
 | `--serialize` | Disable all parallelization (run everything sequentially) |
+
+`juvenal install-skills` is idempotent. It refuses to overwrite an existing
+Claude or Codex skill with the same name, and installs user-level symlinks so the
+skill remains available when Juvenal is invoked from another repository.
 
 ### Resume & Rewind
 
