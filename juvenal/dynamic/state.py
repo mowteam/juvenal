@@ -132,6 +132,24 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return deduped
 
 
+# Bound one note so a runaway worker summary can't dominate the captain prompt.
+_OUTCOME_NOTE_MAX_CHARS = 2000
+_OUTCOME_NOTE_KEYS = {"target.no_findings": "summary", "target.blocked": "blocker"}
+
+
+def _outcome_notes(events: list[DynamicEvent]) -> dict[str, str]:
+    """Map target_id -> the worker's stated reason a target ended."""
+    notes: dict[str, str] = {}
+    for event in events:
+        key = _OUTCOME_NOTE_KEYS.get(event.event_type)
+        if key is None or not event.target_id:
+            continue
+        note = str((event.payload or {}).get(key) or "").strip()
+        if note:
+            notes[event.target_id] = note[:_OUTCOME_NOTE_MAX_CHARS]
+    return notes
+
+
 @dataclass
 class DynamicSessionState:
     """Complete dynamic analysis phase state with atomic persistence."""
@@ -252,6 +270,11 @@ class DynamicSessionState:
             for claim in self.claims.values():
                 target = self.targets.get(claim.target_id)
                 if target is None or target.active_generation != claim.generation:
+                    continue
+                if target.status in _PRESERVED_TARGET_STATUSES:
+                    # The target is terminal and stays that way (the loop below
+                    # preserves it), so promoting its claim back to "verifying"
+                    # would only produce a claim the scheduler must then refuse.
                     continue
 
                 relevant = self._claim_verifications(claim, target.active_generation)
@@ -430,6 +453,7 @@ class DynamicSessionState:
                     for event in unread_events
                     if event.event_type == "captain.proposal_dropped"
                 ],
+                target_outcome_notes=_outcome_notes(unread_events),
             )
 
     def record_captain_turn(self, turn: CaptainTurn, delivered_event_seq: int) -> None:

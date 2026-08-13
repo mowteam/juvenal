@@ -359,6 +359,11 @@ class CaptainDelta:
     # a blocked target needs a different approach, a stranded one needs only
     # to be re-enqueued without its dependency gate.
     dependency_stranded_target_ids: list[str] = field(default_factory=list)
+    # target_id -> why it ended: the worker's `summary` for no_findings, its
+    # `blocker` for blocked. Without this the captain sees only that a target
+    # ended and cannot tell a rigorous negative that closes a line from a
+    # worker that got nowhere — so it re-spawns work already answered.
+    target_outcome_notes: dict[str, str] = field(default_factory=dict)
 
 
 __all__ = [

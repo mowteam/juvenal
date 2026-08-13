@@ -1449,7 +1449,7 @@ class DynamicAnalysisRunner:
                 claim = self.state.claims.get(claim_id)
                 if target is None or claim is None or claim.status != "rejected":
                     continue
-                if self._is_target_ignored(target):
+                if self._is_target_ignored(target) or self._is_terminal_target(target):
                     continue
                 if available <= 0 or target.active_attempt_id is not None or target_id in consumed:
                     kept.append((target_id, claim_id))
@@ -1485,6 +1485,13 @@ class DynamicAnalysisRunner:
             if claim.status not in {"proposed", "verifying"}:
                 continue
             if target.active_generation != claim.generation:
+                continue
+            if self._is_terminal_target(target):
+                # A target that has reached a terminal state does not get to
+                # pull more work. Without this, a claim left mid-chain on a
+                # target that later blocked would be re-scheduled here — and
+                # this loop also flips the target back to "verifying", quietly
+                # resurrecting a target the run had already finished with.
                 continue
 
             claim_verifications = [
@@ -2373,6 +2380,11 @@ class DynamicAnalysisRunner:
             # aren't in frontier.json, so you can't see them — generate
             # fresher ids, e.g. include a turn-number or hash suffix).
             "dropped_proposals": delta.dropped_proposals,
+            # Why each target above ended, in the worker's own words. Read these
+            # before enqueuing: a no_findings that closes a hypothesis with
+            # evidence means the line is settled, not that it needs another
+            # worker pointed at it.
+            "target_outcome_notes": delta.target_outcome_notes,
         }
         mission = self.phase.render_prompt(failure_context=self.failure_context, vars=self.workflow.vars)
         mode_note = (
@@ -3638,7 +3650,16 @@ class DynamicAnalysisRunner:
 
         if report.outcome == "no_findings":
             target.status = "no_findings"
-            self.state.append_event("target.no_findings", target_id=target.target_id, generation=attempt.generation)
+            # Carry the worker's rationale, exactly as `target.blocked` carries
+            # its blocker. A rigorous negative is a result the captain must be
+            # able to act on; dropping it here made every no_findings look
+            # alike and invited re-spawning work that was already settled.
+            self.state.append_event(
+                "target.no_findings",
+                target_id=target.target_id,
+                generation=attempt.generation,
+                summary=report.summary,
+            )
             self.state.save()
             return
 
