@@ -77,14 +77,14 @@ def test_get_backend_routes_each_role_to_its_own_backend(tmp_path):
     worker = runner._get_backend(config.worker_backend)
     verifier = runner._get_backend(config.verifier_backend)
 
-    assert isinstance(captain, ClaudeBackend)
-    assert isinstance(worker, CodexBackend)
-    assert isinstance(verifier, ClaudeBackend)
+    assert isinstance(captain, (ClaudeSDKBackend, ClaudeBackend))
+    assert isinstance(worker, (CodexSDKBackend, CodexBackend))
+    assert isinstance(verifier, (ClaudeSDKBackend, ClaudeBackend))
 
     # The runner never conflates two different vendors into one instance.
     assert captain is not worker
-    assert captain.name() == "claude"
-    assert worker.name() == "codex"
+    assert captain.name() in ("claude", "claude-sdk")
+    assert worker.name() in ("codex", "codex-sdk")
 
     # Same name resolves to the same cached instance (routing is stable, not
     # a fresh backend per call), and the captain/verifier share a backend since
@@ -289,6 +289,6 @@ def test_verifier_chain_can_mix_backends_per_verifier(tmp_path):
     static_backend = runner._get_backend(config.verifiers[0].backend)
     poc_backend = runner._get_backend(config.verifiers[1].backend)
 
-    assert isinstance(static_backend, ClaudeBackend)
-    assert isinstance(poc_backend, CodexBackend)
+    assert isinstance(static_backend, (ClaudeSDKBackend, ClaudeBackend))
+    assert isinstance(poc_backend, (CodexSDKBackend, CodexBackend))
     assert static_backend is not poc_backend

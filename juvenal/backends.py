@@ -488,9 +488,10 @@ def _load_claude_agent_sdk() -> Any | None:
 class ClaudeSDKBackend(Backend):
     """Claude backend driving the Claude Agent SDK in-process instead of a CLI subprocess.
 
-    Opt-in via `backend: claude-sdk` (or `JUVENAL_BACKEND_SDK=1`); the subprocess
-    `ClaudeBackend` remains the default. Targets the session-expiration cold-restart
-    gap: the SDK keeps session state in-process, so a resume either works or raises
+    Used by default for `backend: claude` when the Claude Agent SDK is installed
+    (force the subprocess CLI with `JUVENAL_BACKEND_NO_SDK=1`). Targets the
+    session-expiration cold-restart gap: the SDK keeps session state in-process, so a
+    resume either works or raises
     rather than silently starting a fresh CLI session without the original system
     prompt. Accepts the same `model=` strings as `ClaudeBackend`, including the
     `[1m]` 1M-context suffix, and returns the identical `AgentResult` contract.
@@ -506,6 +507,26 @@ class ClaudeSDKBackend(Backend):
 
     def name(self) -> str:
         return "claude-sdk"
+
+    def run_interactive(
+        self,
+        prompt: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+    ) -> InteractiveResult:
+        # Terminal passthrough is a CLI-only feature; delegate so an SDK-default run
+        # still supports `--interactive` implement phases.
+        return ClaudeBackend().run_interactive(prompt, working_dir, env=env, model=model)
+
+    def resume_interactive(
+        self,
+        session_id: str,
+        working_dir: str,
+        env: dict[str, str] | None = None,
+        model: str | None = None,
+    ) -> InteractiveResult:
+        return ClaudeBackend().resume_interactive(session_id, working_dir, env=env, model=model)
 
     def run_agent(
         self,
@@ -979,8 +1000,9 @@ def _load_codex_sdk() -> Any | None:
 class CodexSDKBackend(Backend):
     """Codex backend driving the OpenAI Codex Python SDK in-process instead of `npx`.
 
-    Opt-in via `backend: codex-sdk` (or `JUVENAL_BACKEND_CODEX_SDK=1`); the subprocess
-    `CodexBackend` remains the default. Targets the `npx @openai/codex@latest` startup
+    Used by default for `backend: codex` when the official OpenAI Codex Python SDK is
+    installed (force the subprocess CLI with `JUVENAL_BACKEND_NO_SDK=1`). Targets the
+    `npx @openai/codex@latest` startup
     races (ENOTEMPTY/ETXTBSY on parallel spawns) and transient auth.json 401s: the SDK
     launches the pinned Codex binary as a persistent `codex app-server` over JSON-RPC
     (bundled by `openai-codex-cli-bin`) and reuses existing Codex auth, so there's no
@@ -1254,14 +1276,26 @@ def _extend_with_settings(cmd: list[str], hooks_config: dict[str, Any] | None) -
 def create_backend(name: str) -> Backend:
     """Factory to create a backend by name.
 
-    `claude-sdk` and `codex-sdk` are opt-in and fall back to their subprocess backends
-    (`ClaudeBackend` / `CodexBackend`) when the corresponding SDK isn't installed, so
-    existing workflows never break. Set `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1`
-    to fail loud instead of falling back — for the human verifying the SDK path.
+    Bare `claude` / `codex` resolve to their in-process SDK backends
+    (`ClaudeSDKBackend` / `CodexSDKBackend`) when the SDK is installed — the SDK is the
+    default because it removes the Codex `npx` unpack race and the Claude
+    session-expiration gap. Set `JUVENAL_BACKEND_NO_SDK=1` to force the subprocess CLI
+    backends. When the SDK isn't installed, every name falls back to the subprocess
+    backend so runs never break; the explicit `claude-sdk` / `codex-sdk` names
+    additionally fail loud under `JUVENAL_BACKEND_SDK=1` / `JUVENAL_BACKEND_CODEX_SDK=1`.
     """
+    force_cli = os.environ.get("JUVENAL_BACKEND_NO_SDK", "0") == "1"
     if name == "claude":
+        if not force_cli:
+            claude_sdk_default = ClaudeSDKBackend()
+            if claude_sdk_default.sdk_available:
+                return claude_sdk_default
         return ClaudeBackend()
     elif name == "codex":
+        if not force_cli:
+            codex_sdk_default = CodexSDKBackend()
+            if codex_sdk_default.sdk_available:
+                return codex_sdk_default
         return CodexBackend()
     elif name == "claude-sdk":
         backend = ClaudeSDKBackend()

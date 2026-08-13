@@ -55,14 +55,32 @@ class FakeProc:
 
 class TestCreateBackend:
     def test_claude(self):
+        # SDK is the default when installed; either way it's a Claude backend.
         backend = create_backend("claude")
-        assert isinstance(backend, ClaudeBackend)
-        assert backend.name() == "claude"
+        assert isinstance(backend, (ClaudeSDKBackend, ClaudeBackend))
+        assert backend.name() in ("claude", "claude-sdk")
 
     def test_codex(self):
         backend = create_backend("codex")
-        assert isinstance(backend, CodexBackend)
-        assert backend.name() == "codex"
+        assert isinstance(backend, (CodexSDKBackend, CodexBackend))
+        assert backend.name() in ("codex", "codex-sdk")
+
+    def test_sdk_is_default_when_installed(self):
+        # The whole point of the flip: bare `claude`/`codex` prefer the SDK backend.
+        if ClaudeSDKBackend().sdk_available:
+            assert isinstance(create_backend("claude"), ClaudeSDKBackend)
+        if CodexSDKBackend().sdk_available:
+            assert isinstance(create_backend("codex"), CodexSDKBackend)
+        if not ClaudeSDKBackend().sdk_available and not CodexSDKBackend().sdk_available:
+            pytest.skip("no SDK installed; default-flip exercised only when an SDK is present")
+
+    def test_no_sdk_env_forces_cli_backends(self, monkeypatch):
+        # Escape hatch: JUVENAL_BACKEND_NO_SDK=1 forces the subprocess CLI backends.
+        monkeypatch.setenv("JUVENAL_BACKEND_NO_SDK", "1")
+        assert type(create_backend("claude")) is ClaudeBackend
+        assert type(create_backend("codex")) is CodexBackend
+        assert create_backend("claude").name() == "claude"
+        assert create_backend("codex").name() == "codex"
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown backend"):
