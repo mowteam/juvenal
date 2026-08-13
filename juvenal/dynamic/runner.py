@@ -309,6 +309,36 @@ _RATE_LIMIT_ERROR_SIGNATURES = (
     "your limit · resets",
     "429",
 )
+
+# Substrings that indicate the account's agent quota is *spent*, not that a
+# short-window throttle is in effect. Codex says "You've hit your usage limit …
+# try again at <date>" where the date can be days out, so no backoff schedule
+# can wait it out — the run stops and the user resumes after the reset. These
+# must stay narrow enough not to swallow Anthropic's 5-hour-window messages,
+# which the probe backoff in `_rate_limit_backoff` does recover from.
+_QUOTA_EXHAUSTED_ERROR_SIGNATURES = (
+    "hit your usage limit",
+    "purchase more credits",
+    "codex/settings/usage",
+    "exceeded your current quota",
+    "insufficient_quota",
+)
+
+
+def _error_text(error: str | AgentResult | None) -> str:
+    """Raw text to match signatures against, from an error string or a result."""
+    if error is None:
+        return ""
+    if isinstance(error, AgentResult):
+        return f"{error.output or ''}\n{error.transcript or ''}"
+    return error
+
+
+def _is_quota_exhaustion(error: str | AgentResult | None) -> bool:
+    text = _error_text(error).lower()
+    return any(signature in text for signature in _QUOTA_EXHAUSTED_ERROR_SIGNATURES)
+
+
 _DEFAULT_ANALYST_PROMPT = """You are the project's attack-surface analyst for a Juvenal bug-finding run.
 
 Your job is to produce ONE structured project brief that the captain, workers, and verifiers \
@@ -756,6 +786,7 @@ class DynamicAnalysisRunner:
         # When set, _rate_limit_backoff switches from exponential backoff to a
         # fixed probe cadence keyed off the typical 5h reset window.
         self._last_observed_rate_limit_at: float | None = None
+        self._quota_exhausted = False
         # Set on shutdown (Ctrl-C, kill_active). Background threads in
         # _rate_limit_backoff use this to interrupt their sleep loop so the
         # process can exit promptly instead of waiting up to an hour for a
@@ -1232,6 +1263,7 @@ class DynamicAnalysisRunner:
             # Captain crash. Classify: only sleep on actual rate-limit signatures —
             # other captain crashes (e.g., parse errors mid-stream) won't recover
             # by waiting and shouldn't waste backoff time.
+            self._note_quota_exhaustion(result)
             self._record_infrastructure_error(result)
             return
 
@@ -1307,6 +1339,7 @@ class DynamicAnalysisRunner:
             if result.exit_code != 0:
                 # Captain repair crash. Same classification as the main captain
                 # path: only sleep on actual rate-limit signatures.
+                self._note_quota_exhaustion(result)
                 self._record_infrastructure_error(result)
                 return None
             try:
@@ -3020,6 +3053,16 @@ class DynamicAnalysisRunner:
         )
 
     def _record_env_builder_failure(self, error: str, *, agent_result: AgentResult | None = None) -> None:
+        if self._note_quota_exhaustion(error) or self._note_quota_exhaustion(agent_result):
+            # Sticky `failed` state, same as the analyst: don't spend it on a
+            # refusal that never ran the builder.
+            self.state.simulation_env = SimulationEnvState(
+                status="pending",
+                backend=self.state.simulation_env.backend,
+                model=self.state.simulation_env.model,
+            )
+            self.state.save()
+            return
         now = time.time()
         started = self.state.simulation_env.started_at or now
         self.state.simulation_env = SimulationEnvState(
@@ -3458,8 +3501,11 @@ class DynamicAnalysisRunner:
         if result.error:
             # Leave reported_at unset; _schedule_reporters will retry up to _MAX_REPORTER_ATTEMPTS.
             attempts = self._reporter_attempts.get(claim.claim_id, 0)
-            if self._note_dead_session(claim.reporter_session_id, result.error) and attempts > 0:
-                # Refund the attempt the refused resume consumed; the next pass
+            refused_before_running = self._note_quota_exhaustion(result.error) or self._note_dead_session(
+                claim.reporter_session_id, result.error
+            )
+            if refused_before_running and attempts > 0:
+                # Refund the attempt the refusal consumed; the next pass
                 # cold-starts on a fresh session id.
                 attempts -= 1
                 self._reporter_attempts[claim.claim_id] = attempts
@@ -3498,10 +3544,13 @@ class DynamicAnalysisRunner:
             attempt.error = result.error
             if target.active_attempt_id == attempt.attempt_id:
                 target.active_attempt_id = None
-                if self._note_dead_session(attempt.parent_session_id, result.error):
-                    # The resume was refused before the worker ran, so this
-                    # failure says nothing about the target. Re-queue for a cold
-                    # start without spending budget the worker never got to use.
+                if self._note_quota_exhaustion(result.error) or self._note_dead_session(
+                    attempt.parent_session_id, result.error
+                ):
+                    # The backend refused before the worker ran — spent quota or
+                    # a dead session — so this failure says nothing about the
+                    # target. Re-queue for a cold start without spending budget
+                    # the worker never got to use.
                     target.status = "queued"
                 else:
                     target.error_retry_count += 1
@@ -4286,12 +4335,13 @@ class DynamicAnalysisRunner:
         self, verification: VerificationRecord, claim: ClaimRecord, target: TargetRecord
     ) -> None:
         """Handle a verifier crash: retry verification or treat as inconclusive rejection."""
+        quota_exhausted = self._note_quota_exhaustion(verification.error)
         dead_session = self._note_dead_session(verification.parent_session_id, verification.error)
-        if not dead_session:
+        if not dead_session and not quota_exhausted:
             target.error_retry_count += 1
         if verification.verification_id in target.pending_verification_ids:
             target.pending_verification_ids.remove(verification.verification_id)
-        if dead_session or target.error_retry_count <= self.config.max_worker_retries:
+        if dead_session or quota_exhausted or target.error_retry_count <= self.config.max_worker_retries:
             # Resume the prior verifier session if it had time to register one
             # (i.e., the subprocess started). The verifier's `session_id` is
             # pre-allocated at VerificationRecord construction so even a
@@ -4494,20 +4544,41 @@ class DynamicAnalysisRunner:
     def _error_looks_like_rate_limit(self, error: str | AgentResult | None) -> bool:
         if error is None:
             return False
-        if isinstance(error, AgentResult):
-            if error.rate_limit_status == 429:
-                return True
-            text = (error.output or "") + "\n" + (getattr(error, "transcript", "") or "")
-        else:
-            text = error
-        text = text.lower()
+        # Spent quota is checked first and never treated as a throttle: it can
+        # carry a 429 or the word "limit" while being unrecoverable by waiting.
+        if _is_quota_exhaustion(error):
+            return False
+        if isinstance(error, AgentResult) and error.rate_limit_status == 429:
+            return True
+        text = _error_text(error).lower()
         return any(sig in text for sig in _RATE_LIMIT_ERROR_SIGNATURES)
+
+    def _note_quota_exhaustion(self, error: str | AgentResult | None) -> bool:
+        """Record a backend refusal caused by spent account quota.
+
+        Returns True for *every* quota error, not just the first, because each
+        caller uses it to skip charging its retry budget: the agent never ran,
+        so the failure says nothing about the work. The run stops instead of
+        backing off — the reset can be days out — and `--resume` re-dispatches
+        the untouched targets once the quota is back.
+        """
+        if not _is_quota_exhaustion(error):
+            return False
+        if not self._quota_exhausted:
+            self._quota_exhausted = True
+            detail = " ".join(_error_text(error).split())[-400:]
+            self._terminal_failure = (
+                f"backend quota exhausted, so no agent work can proceed: {detail} "
+                "No retry budget was spent; state saved, --resume once the quota resets."
+            )
+            print(f"\n[juvenal] {self._terminal_failure}", flush=True)
+        return True
 
     def _note_agent_result(self, agent_result: AgentResult | None) -> None:
         """Record observable signals from a finished agent result for downstream backoff decisions."""
         if agent_result is None:
             return
-        if agent_result.rate_limit_status == 429:
+        if agent_result.rate_limit_status == 429 and not _is_quota_exhaustion(agent_result):
             self._last_observed_rate_limit_at = time.time()
 
     def _rate_limit_backoff(self) -> None:
@@ -4971,6 +5042,17 @@ class DynamicAnalysisRunner:
             self._dashboard.render_event(kind="analyst.ready", text=str(brief_path))
 
     def _record_analyst_failure(self, error: str, *, agent_result: AgentResult | None = None) -> None:
+        if self._note_quota_exhaustion(error) or self._note_quota_exhaustion(agent_result):
+            # A `failed` analyst is sticky across resumes, so a quota refusal
+            # must not spend it: the brief was never attempted. Park the state
+            # back at `pending` and let the run stop — resume re-dispatches.
+            self.state.attack_surface = AttackSurfaceState(
+                status="pending",
+                backend=self.state.attack_surface.backend,
+                model=self.state.attack_surface.model,
+            )
+            self.state.save()
+            return
         now = time.time()
         started = self.state.attack_surface.started_at or now
         input_tokens = agent_result.input_tokens if agent_result is not None else 0
