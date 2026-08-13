@@ -41,7 +41,7 @@ The implementing agent and the checking agent are separate processes, so the imp
 
 ## Backends
 
-Each phase runs on a backend selected per workflow (`backend:` in YAML) or per role (`captain_backend`, `worker_backend`, etc. in an `analysis` block):
+Each phase runs on the workflow backend by default. `implement` and `check` phases may override it with `backend:` and `model:`, while analysis roles use selectors such as `captain_backend` and `captain_model`:
 
 | Backend | Mechanism | Status |
 |---------|-----------|--------|
@@ -170,6 +170,8 @@ notify:
 
 phases:
   - id: implement
+    backend: codex       # optional per-phase override
+    model: gpt-5.6-sol   # passed unchanged to the selected backend
     prompt: "Implement the feature."
     timeout: 300
     env:
@@ -396,7 +398,9 @@ Checks are defined inline on implement phases. Each entry can be:
 - **`prompt: TEXT`** — agent checker with inline prompt
 - **`prompt_file: PATH`** — agent checker with prompt from file
 
-Checkers can also carry `timeout` and `env`.
+Checks can also carry `backend`, `model`, `timeout`, and `env`. Phase-level
+`backend` and `model` overrides are supported on `implement` and `check` phases;
+other phase types use their own nested backend/model configuration.
 
 ```yaml
 - id: implement

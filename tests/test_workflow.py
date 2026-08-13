@@ -36,6 +36,31 @@ class TestYAMLLoading:
         assert wf.phases[0].type == "implement"
         assert wf.phases[0].prompt == "Set up the project scaffolding."
 
+    def test_phase_backend_and_model_overrides(self, tmp_path):
+        path = tmp_path / "workflow.yaml"
+        path.write_text(
+            """\
+name: routed
+backend: claude
+phases:
+  - id: recon
+    backend: codex
+    model: gpt-5.6-sol
+    prompt: Inspect the target.
+  - id: review
+    type: check
+    backend: claude
+    model: claude-opus-5
+    prompt: Verify the plan and emit a verdict.
+"""
+        )
+
+        workflow = load_workflow(path)
+        assert workflow.phases[0].backend == "codex"
+        assert workflow.phases[0].model == "gpt-5.6-sol"
+        assert workflow.phases[1].backend == "claude"
+        assert workflow.phases[1].model == "claude-opus-5"
+
     def test_yaml_phase_types(self, sample_yaml):
         wf = load_workflow(sample_yaml)
         assert wf.phases[0].type == "implement"

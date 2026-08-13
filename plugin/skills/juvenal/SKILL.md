@@ -42,6 +42,8 @@ include:
 
 phases:
   - id: setup
+    backend: codex  # optional implement/check phase override
+    model: gpt-5.6-sol
     prompt: "Set up the {{PROJECT}} project scaffolding in {{ENV}}."
     timeout: 300  # seconds
     env:
@@ -167,7 +169,9 @@ Checks are defined inline on implement phases. Each entry can be:
 - **`prompt: TEXT`** — agent checker with inline prompt
 - **`prompt_file: PATH`** — agent checker with prompt from file
 
-Checks can also carry `timeout` and `env`.
+Checks can also carry `backend`, `model`, `timeout`, and `env`. Top-level
+`implement` and `check` phases likewise accept optional `backend` and `model`
+overrides. Model IDs pass through unchanged to the selected SDK or CLI backend.
 
 ## Bounce Targets
 

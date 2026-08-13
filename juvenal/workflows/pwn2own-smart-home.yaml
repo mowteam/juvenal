@@ -179,6 +179,8 @@ phases:
   # supplied artifacts, and authorized lab capabilities before agents specialize.
   # ==========================================================================
   - id: initialize-run
+    backend: claude
+    model: claude-opus-5
     prompt: |
       You are initializing an authorized Pwn2Own Ireland 2026 Smart Home
       research run. This phase must tailor a generic workflow to exactly one
@@ -274,6 +276,8 @@ phases:
 
   - id: initialization-review
     type: check
+    backend: claude
+    model: claude-opus-5
     bounce_target: initialize-run
     prompt: |
       Review `output/run-profile.md` as the preflight gate for a Pwn2Own Ireland
@@ -307,6 +311,8 @@ phases:
   # device-specific ground truth every later role depends on.
   # ==========================================================================
   - id: device-recon
+    backend: codex
+    model: gpt-5.6-sol
     prompt: |
       You are the device analyst for a Pwn2Own Ireland 2026 entry against the
       {{ TARGET_CATEGORY }} target: **{{ TARGET_DEVICE }}**.
@@ -520,6 +526,8 @@ phases:
 
   - id: recap-review
     type: check
+    backend: codex
+    model: gpt-5.6-sol
     bounce_target: device-recon
     prompt: |
       Review `output/device-recap.md` for the Pwn2Own Ireland 2026
@@ -905,9 +913,10 @@ phases:
       `blocked`, write nothing to disk; just return the structured JSON. The
       `output/` tree is owned by the reporter agent.
     analysis:
-      # Pin the strategic coordinator to Claude Opus 5 and investigation workers
-      # to GPT-5.6 Sol. Bare backend names select the installed SDK by default;
-      # these explicit model IDs pass through unchanged on SDK and CLI paths.
+      # Opus 5 has a fixed 1M context window, so no context suffix is needed.
+      # GPT-5.6 Sol provides a 1.05M context window for technical investigation.
+      # Bare backend names select the installed SDK by default; these explicit
+      # model IDs pass through unchanged on SDK and CLI paths.
       captain_backend: claude
       captain_model: claude-opus-5
       worker_backend: codex
@@ -1217,10 +1226,10 @@ phases:
         # brief injected into every later role. It also writes matching Claude and
         # Codex `attack-surface` subagent definitions from that same brief.
         enabled: true
-        backend: claude
-        # 1M-context model — the analyst reads the recap plus a lot of code
-        # before producing the brief, so context wins over speed.
-        model: claude-opus-4-7[1m]
+        backend: codex
+        # Technical initialization uses Sol's 1.05M context window because the
+        # analyst reads the recap plus substantial source and firmware evidence.
+        model: gpt-5.6-sol
         max_duration_seconds: 1800
         prompt: |
           You are the initialization analyst for a Pwn2Own Ireland 2026
@@ -1377,11 +1386,11 @@ phases:
           meta-commentary about your own process.
       verifiers:
         # Five sequential gates. Verifier i+1 runs only after verifier i PASSes.
-        # Order is deliberate: the cheapest and most decisive rejections
-        # (contest scope, then bug class, then pre-auth reach) run before the
-        # expensive reproduction work.
+        # Order is deliberate: decisive scope and validity rejections run before
+        # the expensive reproduction work.
         - name: p2o-scope
           backend: claude
+          model: claude-opus-5
           prompt: |
             ## Your specialized scope: Pwn2Own contest rules (scope gate)
 
@@ -1517,7 +1526,8 @@ phases:
             claim is silent on something material, say what it must state.
 
         - name: bug-class
-          backend: claude
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             ## Your specialized scope: bug class and code-claim fidelity
 
@@ -1633,7 +1643,8 @@ phases:
             tell the worker what would convert the report into a real defect.
 
         - name: preauth-impact
-          backend: claude
+          backend: codex
+          model: gpt-5.6-sol
           # Keep this contest-specific verifier prompt. The analyst brief is
           # injected normally and matching Claude/Codex `attack-surface` subagents
           # remain available for focused follow-up. Setting
@@ -1646,9 +1657,9 @@ phases:
 
             **You are a strict verifier and the most consequential gate in this
             chain.** Your default is to reject. You operate in the SAME ROLE as
-            the `attack-surface` Claude Code subagent
-            (`.claude/agents/attack-surface.md`); your ground truth is the
-            project brief injected above and `output/device-recap.md`.
+            the generated `attack-surface` Claude/Codex subagent; your ground
+            truth is the project brief injected above and
+            `output/device-recap.md`.
 
             You are verifier 3 of 5. `p2o-scope` confirmed the entry point is
             legal under contest rules. `bug-class` confirmed the defect is real
@@ -1812,7 +1823,8 @@ phases:
             bypass that would complete the chain.
 
         - name: poc
-          backend: claude
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             ## Your specialized scope: PoC reproduction (mechanical gate)
 
@@ -1968,7 +1980,8 @@ phases:
             documented entry point that *would* need to be used.
 
         - name: novelty
-          backend: claude
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             ## Your specialized scope: novelty (already-known check)
 
@@ -2076,6 +2089,7 @@ phases:
             - PoC reproduction (`poc`).
       reporter:
         backend: claude
+        model: claude-sonnet-4-6
         prompt: |
           ## Specialized scope: per-bug report writer (whitepaper-ready)
 
@@ -2218,8 +2232,8 @@ phases:
         max_exchange_rounds: 5
         max_attempts: 1
         env_builder:
-          backend: claude
-          model: claude-opus-4-7[1m]
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             You are the exploit-simulation environment builder for a Pwn2Own
             Ireland 2026 Smart Home entry against {{ TARGET_DEVICE }}.
@@ -2293,8 +2307,8 @@ phases:
             {"artifact_path": "<path under env_dir>", "instantiate_script": "<path to instantiate.sh>"}
             ENV_JSON_END
         simulator:
-          backend: claude
-          model: claude-opus-4-7
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             You are the exploit-simulation SIMULATOR (round {round} of
             {max_rounds}) for a Pwn2Own Ireland 2026 Smart Home entry against
@@ -2328,8 +2342,8 @@ phases:
 
             Attacker's last message: {attacker_last}
         attacker:
-          backend: claude
-          model: claude-opus-4-7
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             You are the exploit-simulation ATTACKER (round {round} of
             {max_rounds}) for a Pwn2Own Ireland 2026 Smart Home entry against
@@ -2374,8 +2388,8 @@ phases:
 
             Simulator's last message: {simulator_last}
         judge:
-          backend: claude
-          model: claude-opus-4-6
+          backend: codex
+          model: gpt-5.6-sol
           prompt: |
             You are the exploit-simulation JUDGE for a Pwn2Own Ireland 2026
             Smart Home entry against {{ TARGET_DEVICE }}. Read the
@@ -2435,6 +2449,8 @@ phases:
   # Phase 4 - assemble the contest picture.
   # ==========================================================================
   - id: summarize-findings
+    backend: claude
+    model: claude-sonnet-4-6
     prompt: |
       Write `pwn2own-report.md`, the run's contest-readiness index for the
       Pwn2Own Ireland 2026 {{ TARGET_CATEGORY }} target **{{ TARGET_DEVICE }}**.

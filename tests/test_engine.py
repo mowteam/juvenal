@@ -23,6 +23,37 @@ from juvenal.workflow import (
 from tests.conftest import MockBackend
 
 
+def test_phase_backend_and_model_routing(tmp_path):
+    claude = MockBackend()
+    codex = MockBackend()
+    claude.add_response(exit_code=0, output="initialized")
+    claude.add_response(exit_code=0, output="summarized")
+    codex.add_response(exit_code=0, output="analyzed")
+    workflow = Workflow(
+        name="routed",
+        backend="claude",
+        working_dir=str(tmp_path),
+        phases=[
+            Phase(id="initialize", prompt="Initialize.", backend="claude", model="claude-opus-5"),
+            Phase(id="analyze", prompt="Analyze.", backend="codex", model="gpt-5.6-sol"),
+            Phase(id="summarize", prompt="Summarize.", backend="claude", model="claude-sonnet-4-6"),
+        ],
+    )
+    created: list[str] = []
+
+    def factory(name: str):
+        created.append(name)
+        return {"claude": claude, "codex": codex}[name]
+
+    with patch("juvenal.engine.create_backend", side_effect=factory):
+        engine = Engine(workflow, state_file=str(tmp_path / "state.json"), plain=True)
+        assert engine.run() == 0
+
+    assert created == ["claude", "codex"]
+    assert [model for _, model in claude.model_calls] == ["claude-opus-5", "claude-sonnet-4-6"]
+    assert [model for _, model in codex.model_calls] == ["gpt-5.6-sol"]
+
+
 class TestVerdictParsing:
     def test_pass(self):
         passed, reason, target = parse_verdict("some output\nVERDICT: PASS")
@@ -2573,6 +2604,33 @@ class TestBackendInjection:
             assert engine.run() == 0
 
         assert backend.calls == ["Build."]
+
+    def test_explicit_phase_backend_routes_away_from_injected_default(self, tmp_path):
+        claude = MockBackend()
+        codex = MockBackend()
+        claude.add_response(exit_code=0, output="planned")
+        codex.add_response(exit_code=0, output="analyzed")
+        workflow = Workflow(
+            name="test",
+            backend="claude",
+            phases=[
+                Phase(id="plan", prompt="Plan.", model="claude-opus-5"),
+                Phase(id="analyze", prompt="Analyze.", backend="codex", model="gpt-5.6-sol"),
+            ],
+        )
+
+        with patch("juvenal.engine.create_backend", return_value=codex) as factory:
+            engine = Engine(
+                workflow,
+                state_file=str(tmp_path / "state.json"),
+                plain=True,
+                backend_instance=claude,
+            )
+            assert engine.run() == 0
+
+        factory.assert_called_once_with("codex")
+        assert [model for _, model in claude.model_calls] == ["claude-opus-5"]
+        assert [model for _, model in codex.model_calls] == ["gpt-5.6-sol"]
 
     def test_engine_preserves_existing_positional_resume_argument(self, tmp_path):
         from juvenal.state import PipelineState

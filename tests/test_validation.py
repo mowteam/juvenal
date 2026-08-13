@@ -33,6 +33,29 @@ class TestValidateWorkflow:
         )
         assert validate_workflow(wf) == []
 
+    def test_phase_backend_and_model_validation(self):
+        wf = Workflow(
+            name="test",
+            phases=[
+                Phase(id="bad-backend", prompt="x", backend="unknown"),
+                Phase(id="non-string-backend", prompt="x", backend=["codex"]),
+                Phase(id="bad-model", prompt="x", model=""),
+                Phase(
+                    id="analysis",
+                    type="analysis",
+                    prompt="x",
+                    backend="codex",
+                    model="gpt-5.6-sol",
+                ),
+            ],
+        )
+
+        errors = validate_workflow(wf)
+        assert any("bad-backend" in error and "backend must be one of" in error for error in errors)
+        assert any("non-string-backend" in error and "backend must be one of" in error for error in errors)
+        assert any("bad-model" in error and "model must be a non-empty string" in error for error in errors)
+        assert any("analysis" in error and "only supported on implement and check" in error for error in errors)
+
     def test_duplicate_phase_ids(self):
         wf = Workflow(
             name="test",
@@ -333,14 +356,50 @@ class TestPwn2OwnSmartHomeWorkflow:
         # Generic attack-surface mode replaces this contest-specific prompt.
         assert not by_name["preauth-impact"].use_attack_surface_subagent
 
-    def test_sdk_default_role_models_are_pinned(self):
+    def test_pwn2own_model_policy_is_pinned(self):
         workflow, config = self._analysis()
 
         assert workflow.backend == "claude"
+        phases = {phase.id: phase for phase in workflow.phases}
+        assert (phases["initialize-run"].backend, phases["initialize-run"].model) == (
+            "claude",
+            "claude-opus-5",
+        )
+        assert (phases["initialization-review"].backend, phases["initialization-review"].model) == (
+            "claude",
+            "claude-opus-5",
+        )
+        assert (phases["device-recon"].backend, phases["device-recon"].model) == ("codex", "gpt-5.6-sol")
+        assert (phases["recap-review"].backend, phases["recap-review"].model) == ("codex", "gpt-5.6-sol")
+        assert (phases["summarize-findings"].backend, phases["summarize-findings"].model) == (
+            "claude",
+            "claude-sonnet-4-6",
+        )
+
         assert config.captain_backend == "claude"
         assert config.captain_model == "claude-opus-5"
         assert config.worker_backend == "codex"
         assert config.worker_model == "gpt-5.6-sol"
+        assert config.analyst is not None
+        assert (config.analyst.backend, config.analyst.model) == ("codex", "gpt-5.6-sol")
+
+        verifiers = {spec.name: (spec.backend, spec.model) for spec in config.verifiers}
+        assert verifiers == {
+            "p2o-scope": ("claude", "claude-opus-5"),
+            "bug-class": ("codex", "gpt-5.6-sol"),
+            "preauth-impact": ("codex", "gpt-5.6-sol"),
+            "poc": ("codex", "gpt-5.6-sol"),
+            "novelty": ("codex", "gpt-5.6-sol"),
+        }
+
+        assert config.reporter is not None
+        assert (config.reporter.backend, config.reporter.model) == ("claude", "claude-sonnet-4-6")
+        assert config.exploit_sim is not None
+        sim = config.exploit_sim
+        assert (sim.env_builder.backend, sim.env_builder.model) == ("codex", "gpt-5.6-sol")
+        assert (sim.simulator.backend, sim.simulator.model) == ("codex", "gpt-5.6-sol")
+        assert (sim.attacker.backend, sim.attacker.model) == ("codex", "gpt-5.6-sol")
+        assert (sim.judge.backend, sim.judge.model) == ("codex", "gpt-5.6-sol")
 
     def test_analyst_is_initialization_barrier_after_device_preflight(self):
         workflow, config = self._analysis()

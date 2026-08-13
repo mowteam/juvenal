@@ -1063,6 +1063,8 @@ class Phase:
     workflow_dir: str | None = None  # path to static sub-workflow directory (resolved at load time)
     analysis: AnalysisConfig | None = None  # nested analysis runner config
     template_vars: dict[str, str] = field(default_factory=dict)  # per-phase Jinja2 variables from expansion
+    backend: str | None = None  # per-phase override for implement/check phases
+    model: str | None = None  # opaque backend model ID for implement/check phases
 
     def _render_text(self, text: str, vars: dict[str, str] | None = None) -> str:
         context = dict(vars or {})
@@ -1213,6 +1215,8 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
     _VALID_PHASE_KEYS = {
         "id",
         "type",
+        "backend",
+        "model",
         "prompt",
         "prompt_file",
         "analysis",
@@ -1275,6 +1279,8 @@ def _load_yaml_with_includes(path: Path, seen: set[str]) -> Workflow:
         phase = Phase(
             id=phase_data["id"],
             type=phase_type,
+            backend=phase_data.get("backend"),
+            model=phase_data.get("model"),
             prompt=prompt,
             role=phase_data.get("role"),
             bounce_target=bounce_target,
@@ -1529,7 +1535,7 @@ def _expand_checkers(
     - bare string -> role shorthand (must be in VALID_ROLES)
     - dict with "role" -> check phase with built-in role
     - dict with "prompt" or "prompt_file" -> check phase with inline/file prompt
-    Dicts may also carry "timeout" and "env".
+    Dicts may also carry "backend", "model", "timeout", and "env".
 
     check_offset lets counters continue from existing inline checkers.
     """
@@ -1554,6 +1560,8 @@ def _expand_checkers(
                 )
             )
         elif isinstance(entry, dict):
+            backend = entry.get("backend")
+            model = entry.get("model")
             timeout = entry.get("timeout")
             env = entry.get("env", {})
 
@@ -1576,6 +1584,8 @@ def _expand_checkers(
                     Phase(
                         id=f"{parent_id}~check-{check_n}",
                         type="check",
+                        backend=backend,
+                        model=model,
                         role=role,
                         prompt=prompt,
                         bounce_target=parent_id,
@@ -1593,6 +1603,8 @@ def _expand_checkers(
                     Phase(
                         id=f"{parent_id}~check-{check_n}",
                         type="check",
+                        backend=backend,
+                        model=model,
                         prompt=prompt,
                         bounce_target=parent_id,
                         timeout=timeout,
@@ -1780,6 +1792,8 @@ def inject_implementer(workflow: Workflow, role: str) -> Workflow:
             phase = Phase(
                 id=phase.id,
                 type=phase.type,
+                backend=phase.backend,
+                model=phase.model,
                 prompt=preamble + phase.prompt,
                 role=phase.role,
                 bounce_target=phase.bounce_target,
@@ -1918,6 +1932,8 @@ def expand_multi_vars(workflow: Workflow, multi_vars: dict[str, list[str]]) -> W
                 new_phase = Phase(
                     id=new_id,
                     type=phase.type,
+                    backend=phase.backend,
+                    model=phase.model,
                     prompt=phase.prompt,
                     role=phase.role,
                     bounce_target=new_bounce,
@@ -1979,6 +1995,19 @@ def validate_workflow(workflow: Workflow) -> list[str]:
         # Valid type
         if phase.type not in VALID_PHASE_TYPES:
             errors.append(f"Phase {phase.id!r}: invalid type {phase.type!r} (must be one of {VALID_PHASE_TYPES})")
+
+        if phase.backend is not None and (
+            not isinstance(phase.backend, str) or phase.backend not in _ANALYSIS_BACKENDS
+        ):
+            errors.append(
+                f"Phase {phase.id!r}: backend must be one of {sorted(_ANALYSIS_BACKENDS)}, got {phase.backend!r}"
+            )
+        if phase.model is not None and (not isinstance(phase.model, str) or not phase.model.strip()):
+            errors.append(f"Phase {phase.id!r}: model must be a non-empty string")
+        if phase.type not in {"implement", "check"} and (phase.backend is not None or phase.model is not None):
+            errors.append(
+                f"Phase {phase.id!r}: backend/model overrides are only supported on implement and check phases"
+            )
 
         # bounce_target references existing phase
         if phase.bounce_target and phase.bounce_target not in all_ids:

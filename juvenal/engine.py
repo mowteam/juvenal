@@ -82,6 +82,7 @@ class Engine:
     ):
         self.workflow = workflow
         self.backend = backend_instance if backend_instance is not None else create_backend(workflow.backend)
+        self._phase_backends: dict[str, Backend] = {}
         self.display = Display(plain=plain)
         self._depth = _depth
         self._max_depth = _max_depth
@@ -124,6 +125,29 @@ class Engine:
 
         # If start lands inside a parallel group, snap to group's first phase
         self._start_idx = self._snap_to_group_start(self._start_idx)
+
+    def _backend_for_phase(self, phase: Phase) -> Backend:
+        """Resolve an implement/check phase backend, caching non-default instances."""
+        backend_name = phase.backend or self.workflow.backend
+        if backend_name == self.workflow.backend:
+            return self.backend
+        with self._engine_lock:
+            backend = self._phase_backends.get(backend_name)
+            if backend is None:
+                backend = create_backend(backend_name)
+                self._phase_backends[backend_name] = backend
+            return backend
+
+    def _kill_active_backends(self) -> None:
+        """Stop work on the default and every instantiated phase backend."""
+        with self._engine_lock:
+            backends = [self.backend, *self._phase_backends.values()]
+        seen: set[int] = set()
+        for backend in backends:
+            if id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            backend.kill_active()
 
     def run(self) -> int:
         """Execute the pipeline. Returns 0 on success, 1 on failure."""
@@ -229,7 +253,7 @@ class Engine:
                     self._active_dynamic_runner.kill_active()
                 except Exception:
                     pass
-            self.backend.kill_active()
+            self._kill_active_backends()
             self.state.save()
             print("\nInterrupted. State saved. Resume with --resume.")
             return 130
@@ -260,31 +284,34 @@ class Engine:
         self._bounce_targets.discard(phase.id)
 
         self.display.step_start("implement")
+        backend = self._backend_for_phase(phase)
         if should_resume:
             resume_prompt = (
                 "A previous attempt failed verification.\n"
                 f"Failure details:\n\n{failure_context}\n\n"
                 "Fix these issues in your implementation.\n"
             )
-            result = self.backend.resume_agent(
+            result = backend.resume_agent(
                 self._session_ids[phase.id],
                 resume_prompt,
                 working_dir=self.workflow.working_dir,
                 display_callback=self.display.live_update,
                 timeout=phase.timeout,
                 env=phase.env or None,
+                model=phase.model,
             )
         else:
             try:
                 prompt = phase.render_prompt(failure_context=failure_context, vars=self.workflow.vars)
             except Exception as exc:
                 return self._template_render_failure(phase.id, "prompt", "implement", exc)
-            result = self.backend.run_agent(
+            result = backend.run_agent(
                 prompt,
                 working_dir=self.workflow.working_dir,
                 display_callback=self.display.live_update,
                 timeout=phase.timeout,
                 env=phase.env or None,
+                model=phase.model,
             )
         logged_input = resume_prompt if should_resume else prompt
         self.state.log_step(
@@ -329,12 +356,14 @@ class Engine:
         prompt = self._INTERACTIVE_PREAMBLE + prompt
 
         self.display.step_start("interactive")
-        result = self.backend.run_agent(
+        backend = self._backend_for_phase(phase)
+        result = backend.run_agent(
             prompt,
             working_dir=self.workflow.working_dir,
             display_callback=self.display.live_update,
             timeout=phase.timeout,
             env=phase.env or None,
+            model=phase.model,
         )
         self.state.log_step(phase.id, attempt, "interactive", result.output, input=prompt, transcript=result.transcript)
         self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
@@ -366,13 +395,14 @@ class Engine:
                 return PhaseResult(success=False)
 
             self.display.step_start("interactive")
-            result = self.backend.resume_agent(
+            result = backend.resume_agent(
                 session_id,
                 user_input,
                 working_dir=self.workflow.working_dir,
                 display_callback=self.display.live_update,
                 timeout=phase.timeout,
                 env=phase.env or None,
+                model=phase.model,
             )
             self.state.log_step(
                 phase.id, attempt, "interactive-resume", result.output, input=user_input, transcript=result.transcript
@@ -435,12 +465,14 @@ class Engine:
                 "not just the latest commit. This ensures you review the complete scope of work."
             )
 
-        result = self.backend.run_agent(
+        backend = self._backend_for_phase(phase)
+        result = backend.run_agent(
             prompt,
             working_dir=self.workflow.working_dir,
             display_callback=self.display.live_update,
             timeout=phase.timeout,
             env=phase.env or None,
+            model=phase.model,
         )
         self.state.log_step(phase.id, attempt, "check", result.output, input=prompt, transcript=result.transcript)
         self.state.add_tokens(phase.id, result.input_tokens, result.output_tokens)
@@ -458,13 +490,14 @@ class Engine:
         # If no verdict was emitted, try resuming the session to get one
         if not passed and reason == NO_VERDICT_REASON and result.session_id:
             for _ in range(self._MAX_NO_VERDICT_RESUMES):
-                resume_result = self.backend.resume_agent(
+                resume_result = backend.resume_agent(
                     result.session_id,
                     self._RESUME_PROMPT,
                     working_dir=self.workflow.working_dir,
                     display_callback=self.display.live_update,
                     timeout=phase.timeout,
                     env=phase.env or None,
+                    model=phase.model,
                 )
                 self.state.log_step(
                     phase.id,
@@ -1040,6 +1073,10 @@ class Engine:
         for i, phase in enumerate(self.workflow.phases):
             prefix = f"  {i + 1}."
             extras = []
+            if phase.backend:
+                extras.append(f"backend={phase.backend}")
+            if phase.model:
+                extras.append(f"model={phase.model}")
             if phase.timeout:
                 extras.append(f"timeout={phase.timeout}s")
             if phase.env:
