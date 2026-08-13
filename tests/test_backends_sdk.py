@@ -387,3 +387,73 @@ class TestCreateBackendClaudeSDK:
         monkeypatch.setenv("JUVENAL_BACKEND_SDK", "1")
         with pytest.raises(RuntimeError, match="claude-agent-sdk"):
             create_backend("claude-sdk")
+
+
+def test_codex_sdk_reports_thread_id_before_running_the_turn():
+    """The Codex thread id must reach the caller when the thread opens, not when
+    the turn returns.
+
+    Regression for: `thread.run()` is where a kill or timeout lands, so an id
+    only surfaced on return was exactly the id an interrupted attempt never got.
+    The runner then persisted its own pre-allocated UUID, and every resume
+    against that fabricated id failed with "no rollout found for thread id".
+    """
+    from juvenal.backends import CodexSDKBackend
+
+    reported: list[str] = []
+    order: list[str] = []
+
+    class _Thread:
+        id = "019ff9a6-62db-7070-bd6e-b2ea628adfa5"
+
+        def run(self, prompt):
+            order.append("run")
+            raise RuntimeError("interrupted mid-turn")
+
+    class _Codex:
+        def __init__(self, config):
+            pass
+
+        def thread_start(self, **kwargs):
+            return _Thread()
+
+        def close(self):
+            pass
+
+    class _Sandbox:
+        full_access = "full_access"
+
+    class _ApprovalMode:
+        auto_review = "auto_review"
+
+    class _FakeSDK:
+        Codex = _Codex
+        Sandbox = _Sandbox
+        ApprovalMode = _ApprovalMode
+
+        @staticmethod
+        def CodexConfig(**kwargs):
+            return kwargs
+
+    backend = CodexSDKBackend.__new__(CodexSDKBackend)
+    backend._sdk = _FakeSDK()
+
+    def _record(session_id: str) -> None:
+        order.append("report")
+        reported.append(session_id)
+
+    result = backend._drive_codex_sdk(
+        prompt="go",
+        working_dir=".",
+        display_callback=None,
+        timeout=30,
+        env=None,
+        model=None,
+        resume_thread_id=None,
+        on_session_id=_record,
+    )
+
+    # The turn blew up, but the id was already out.
+    assert reported == ["019ff9a6-62db-7070-bd6e-b2ea628adfa5"]
+    assert order == ["report", "run"], "thread id must be reported before thread.run()"
+    assert result.exit_code == 1

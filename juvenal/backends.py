@@ -95,6 +95,7 @@ class Backend(ABC):
         system_prompt: str | None = None,
         session_id: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """Run an agent with the given prompt. Returns AgentResult.
 
@@ -120,6 +121,14 @@ class Backend(ABC):
         tool-use guardrails at the CLI level. The Claude backend passes it to the
         CLI via ``--settings``; backends without a settings-injection mechanism
         ignore it.
+
+        ``on_session_id`` is invoked with the real session id the moment it is
+        known, before the turn produces any output. Backends that accept a
+        caller-chosen ``session_id`` fire it immediately; backends that assign
+        their own (Codex, which mints a thread id server-side) fire it as soon
+        as the thread opens. This is what makes an interrupted turn resumable:
+        the id reaches state before the turn can be killed, so the caller is
+        never left holding an id the backend never issued.
         """
         ...
 
@@ -133,6 +142,7 @@ class Backend(ABC):
         env: dict[str, str] | None = None,
         model: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """Resume an existing agent session. Default falls back to run_agent.
 
@@ -142,7 +152,14 @@ class Backend(ABC):
         ``--settings`` are per-invocation, not persisted with the session.
         """
         return self.run_agent(
-            prompt, working_dir, display_callback, timeout, env, model=model, hooks_config=hooks_config
+            prompt,
+            working_dir,
+            display_callback,
+            timeout,
+            env,
+            model=model,
+            hooks_config=hooks_config,
+            on_session_id=on_session_id,
         )
 
     def run_interactive(
@@ -256,9 +273,12 @@ class ClaudeBackend(Backend):
         system_prompt: str | None = None,
         session_id: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         if session_id is None:
             session_id = str(uuid.uuid4())
+        if on_session_id:
+            on_session_id(session_id)
         cmd = [
             "claude",
             "-p",
@@ -303,7 +323,10 @@ class ClaudeBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
+        if on_session_id:
+            on_session_id(session_id)
         cmd = [
             "claude",
             "-p",
@@ -539,9 +562,12 @@ class ClaudeSDKBackend(Backend):
         system_prompt: str | None = None,
         session_id: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         if session_id is None:
             session_id = str(uuid.uuid4())
+        if on_session_id:
+            on_session_id(session_id)
         result = self._run_sdk_query(
             prompt=prompt,
             working_dir=working_dir,
@@ -567,7 +593,10 @@ class ClaudeSDKBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
+        if on_session_id:
+            on_session_id(session_id)
         result = self._run_sdk_query(
             prompt=prompt,
             working_dir=working_dir,
@@ -828,9 +857,13 @@ class CodexBackend(Backend):
         system_prompt: str | None = None,
         session_id: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
-        # Codex assigns its own thread_id post-hoc; the externally chosen
+        # Codex mints its own thread_id server-side; the externally chosen
         # session_id parameter is accepted for interface parity and ignored.
+        # `on_session_id` is how the caller learns the real id — it fires on the
+        # `thread.started` event, so an interrupted turn still leaves a
+        # resumable id behind.
         # Codex has no Claude-settings equivalent, so hooks_config is a no-op.
         del session_id, hooks_config
         # Codex does not currently expose a separate system-prompt slot; if a
@@ -849,7 +882,9 @@ class CodexBackend(Backend):
         if model:
             cmd.extend(["--model", model])
         cmd.append("-")
-        return self._run_codex_process(cmd, working_dir, display_callback, timeout, env, stdin_input=prompt)
+        return self._run_codex_process(
+            cmd, working_dir, display_callback, timeout, env, stdin_input=prompt, on_session_id=on_session_id
+        )
 
     def resume_agent(
         self,
@@ -861,8 +896,11 @@ class CodexBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         del hooks_config  # Codex has no Claude-settings equivalent.
+        if on_session_id:
+            on_session_id(session_id)
         cmd = [
             "npx",
             "@openai/codex@latest",
@@ -888,6 +926,7 @@ class CodexBackend(Backend):
         timeout: int | None = None,
         env: dict[str, str] | None = None,
         stdin_input: str | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         proc_env = dict(os.environ)
         if env:
@@ -939,6 +978,8 @@ class CodexBackend(Backend):
                     # Capture thread_id from thread.started event
                     if event.get("type") == "thread.started" and "thread_id" in event:
                         thread_id = event["thread_id"]
+                        if on_session_id:
+                            on_session_id(thread_id)
                     display_text, assistant_text = _process_codex_event(event)
                     inp, out = _extract_codex_tokens(event)
                     total_input_tokens += inp
@@ -1033,11 +1074,13 @@ class CodexSDKBackend(Backend):
         system_prompt: str | None = None,
         session_id: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         # Codex has no separate system-prompt slot; fold it into the user message so
         # it is not silently dropped, matching subprocess CodexBackend behavior. Codex
         # assigns its own thread id, so the externally chosen session_id is ignored, as
-        # is hooks_config (no Claude-settings equivalent).
+        # is hooks_config (no Claude-settings equivalent). `on_session_id` carries the
+        # real thread id back as soon as the thread opens.
         del session_id, hooks_config
         if system_prompt is not None:
             prompt = f"{system_prompt}\n\n{prompt}"
@@ -1049,6 +1092,7 @@ class CodexSDKBackend(Backend):
             env=env,
             model=model,
             resume_thread_id=None,
+            on_session_id=on_session_id,
         )
 
     def resume_agent(
@@ -1061,6 +1105,7 @@ class CodexSDKBackend(Backend):
         env: dict[str, str] | None = None,
         model: str | None = None,
         hooks_config: dict[str, Any] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         del hooks_config  # Codex has no Claude-settings equivalent.
         result = self._run_codex_sdk_query(
@@ -1071,6 +1116,7 @@ class CodexSDKBackend(Backend):
             env=env,
             model=model,
             resume_thread_id=session_id,
+            on_session_id=on_session_id,
         )
         # Preserve the caller's thread id if the SDK didn't surface a fresh one.
         if result.session_id is None:
@@ -1097,6 +1143,7 @@ class CodexSDKBackend(Backend):
         env: dict[str, str] | None,
         model: str | None,
         resume_thread_id: str | None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         if self._sdk is None:
             raise RuntimeError(
@@ -1111,6 +1158,7 @@ class CodexSDKBackend(Backend):
             env=env,
             model=model,
             resume_thread_id=resume_thread_id,
+            on_session_id=on_session_id,
         )
 
     def _drive_codex_sdk(
@@ -1122,6 +1170,7 @@ class CodexSDKBackend(Backend):
         env: dict[str, str] | None,
         model: str | None,
         resume_thread_id: str | None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> AgentResult:
         sdk = self._sdk
         # The SDK launches the bundled `codex app-server` and reuses Codex auth from
@@ -1158,6 +1207,11 @@ class CodexSDKBackend(Backend):
                         model=model,
                     )
                 box["thread_id"] = thread.id
+                # Report before running the turn, not after: `thread.run` is
+                # where a kill or timeout lands, and an id that only surfaces on
+                # return is exactly the id an interrupted attempt never gets.
+                if on_session_id and thread.id:
+                    on_session_id(thread.id)
                 box["result"] = thread.run(prompt)
             except BaseException as exc:  # captured and re-raised on the caller thread
                 box["error"] = exc

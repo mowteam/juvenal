@@ -260,6 +260,7 @@ class MockBackend(Backend):
         system_prompt=None,
         session_id=None,
         hooks_config=None,
+        on_session_id=None,
     ):
         role = self._detect_role(prompt, env)
         self.calls.append(prompt)
@@ -272,6 +273,10 @@ class MockBackend(Backend):
         result = self._next_result(role)
         if session_id is not None and result.session_id is None:
             result.session_id = session_id
+        # Mirror the real backends: report the id before returning, so tests
+        # exercise the write-through that makes interrupted turns resumable.
+        if on_session_id and result.session_id:
+            on_session_id(result.session_id)
         return result
 
     def resume_agent(
@@ -284,6 +289,7 @@ class MockBackend(Backend):
         env=None,
         model=None,
         hooks_config=None,
+        on_session_id=None,
     ):
         role = self._detect_role(prompt, env)
         self.resume_calls.append((session_id, prompt))
@@ -292,6 +298,8 @@ class MockBackend(Backend):
         self.hooks_config_calls.append((role, hooks_config))
         self._consume_side_effect(role, prompt, env)
         self._emit_chunks(role, display_callback)
+        if on_session_id:
+            on_session_id(session_id)
         return self._next_result(role)
 
     def add_interactive_response(self, exit_code: int = 0, session_id: str = "mock-session"):

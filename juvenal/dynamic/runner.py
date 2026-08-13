@@ -279,6 +279,18 @@ _MAX_REPORTER_ATTEMPTS = 3
 # fresh sessions returning unstructured output) has actually been observed.
 _SESSION_STALENESS_THRESHOLD_SECONDS = 36 * 3600
 
+# Substrings that indicate a resume was refused because the session no longer
+# exists on the backend. Distinct from staleness, which is a time-based guess:
+# these are the backend stating outright that the id is unusable, so no amount
+# of waiting or retrying recovers it — only a cold restart does. Codex emits the
+# rollout form (a run killed before codex flushed its rollout leaves a thread id
+# that never materialized); the Claude CLI emits the conversation form.
+_DEAD_SESSION_ERROR_SIGNATURES = (
+    "no rollout found for thread id",
+    "no conversation found with session id",
+    "session not found",
+)
+
 # Substrings that indicate an Anthropic / Claude CLI rate-limit response. Used
 # to distinguish errors worth a long backoff sleep ("wait it out") from errors
 # where backoff would not help (parse failures, identity mismatches, etc.).
@@ -711,6 +723,11 @@ class DynamicAnalysisRunner:
         # Stale-session warnings are debounced per-session so a target with N
         # retries doesn't emit N copies of the same warning.
         self._logged_stale_sessions: set[str] = set()
+        # Sessions the backend has refused to resume. In-memory only: a process
+        # restart re-learns each one at the cost of a single failed resume, and
+        # persisting it would add a state field for a fact that only matters
+        # while the owning attempt chain is live.
+        self._dead_sessions: set[str] = set()
         self._worker_futures: dict[Future[_WorkerExecutionResult], str] = {}
         self._verifier_futures: dict[Future[_VerifierExecutionResult], str] = {}
         self._reporter_futures: dict[Future[_ReporterExecutionResult], str] = {}
@@ -2525,9 +2542,17 @@ class DynamicAnalysisRunner:
         backend = self._get_backend(self.config.worker_backend)
         worker_model = _resolve_model(self.config.worker_backend, "worker", self.config.worker_model)
         hooks_config = self._hooks_for_role("worker")
+
+        def _assign(session_id: str) -> None:
+            attempt.session_id = session_id
+
+        record_session = self._session_id_recorder(_assign)
         parent_session_id = attempt.parent_session_id
         cold_restart = False
-        if parent_session_id and self._session_is_stale(parent_session_id):
+        if parent_session_id and parent_session_id in self._dead_sessions:
+            parent_session_id = None
+            cold_restart = True
+        elif parent_session_id and self._session_is_stale(parent_session_id):
             # Parent session is too old to safely --resume (Claude session
             # expiration). Cold-restart with run_agent + system_prompt so the
             # worker has its full role + scope inherited from the start, and
@@ -2558,6 +2583,7 @@ class DynamicAnalysisRunner:
                 env=self._role_env("worker"),
                 model=worker_model,
                 hooks_config=hooks_config,
+                on_session_id=record_session,
             )
         else:
             # On cold-restart, drop the (stale) attempt.session_id and let the
@@ -2575,6 +2601,7 @@ class DynamicAnalysisRunner:
                 system_prompt=system_prompt,
                 session_id=effective_session_id,
                 hooks_config=hooks_config,
+                on_session_id=record_session,
             )
         if result.exit_code != 0:
             return _WorkerExecutionResult(
@@ -2614,9 +2641,17 @@ class DynamicAnalysisRunner:
         backend = self._get_backend(verification.backend)
         spec = self._verifier_chain[verification.verifier_index]
         hooks_config = self._hooks_for_role("verifier")
+
+        def _assign(session_id: str) -> None:
+            verification.session_id = session_id
+
+        record_session = self._session_id_recorder(_assign)
         parent_session_id = verification.parent_session_id
         cold_restart = False
-        if parent_session_id and self._session_is_stale(parent_session_id):
+        if parent_session_id and parent_session_id in self._dead_sessions:
+            parent_session_id = None
+            cold_restart = True
+        elif parent_session_id and self._session_is_stale(parent_session_id):
             if parent_session_id not in self._logged_stale_sessions:
                 self._emit_analyst_message(
                     f"[juvenal] parent session {parent_session_id[:8]} is stale; "
@@ -2634,6 +2669,7 @@ class DynamicAnalysisRunner:
                 env=self._role_env("verifier", verifier_name=verification.verifier_name),
                 model=_resolve_model(spec.backend, "verifier", spec.model),
                 hooks_config=hooks_config,
+                on_session_id=record_session,
             )
         else:
             # See _execute_worker_attempt for why cold_restart drops session_id.
@@ -2647,6 +2683,7 @@ class DynamicAnalysisRunner:
                 system_prompt=system_prompt,
                 session_id=effective_session_id,
                 hooks_config=hooks_config,
+                on_session_id=record_session,
             )
         if result.exit_code != 0:
             return _VerifierExecutionResult(
@@ -3343,6 +3380,16 @@ class DynamicAnalysisRunner:
         worker_attempt = self.state.worker_attempts.get(claim.attempt_id)
         scratch_dir = self._scratch_dir_for_attempt(worker_attempt) if worker_attempt is not None else None
         hooks_config = self._hooks_for_role("reporter", scratch_dir=scratch_dir)
+
+        def _assign(session_id: str) -> None:
+            claim.reporter_session_id = session_id
+
+        record_session = self._session_id_recorder(_assign)
+        if is_retry and claim.reporter_session_id in self._dead_sessions:
+            # Re-key onto a fresh id so the cold start below does not hand the
+            # backend a session id it has already rejected.
+            claim.reporter_session_id = str(uuid.uuid4())
+            is_retry = False
         if is_retry and claim.reporter_session_id:
             result = backend.resume_agent(
                 claim.reporter_session_id,
@@ -3352,6 +3399,7 @@ class DynamicAnalysisRunner:
                 env=self._role_env("reporter"),
                 model=_resolve_model(spec_backend, "reporter", spec_model),
                 hooks_config=hooks_config,
+                on_session_id=record_session,
             )
         else:
             result = backend.run_agent(
@@ -3363,6 +3411,7 @@ class DynamicAnalysisRunner:
                 system_prompt=system_prompt,
                 session_id=claim.reporter_session_id,
                 hooks_config=hooks_config,
+                on_session_id=record_session,
             )
         if result.exit_code != 0:
             return _ReporterExecutionResult(
@@ -3398,6 +3447,11 @@ class DynamicAnalysisRunner:
         if result.error:
             # Leave reported_at unset; _schedule_reporters will retry up to _MAX_REPORTER_ATTEMPTS.
             attempts = self._reporter_attempts.get(claim.claim_id, 0)
+            if self._note_dead_session(claim.reporter_session_id, result.error) and attempts > 0:
+                # Refund the attempt the refused resume consumed; the next pass
+                # cold-starts on a fresh session id.
+                attempts -= 1
+                self._reporter_attempts[claim.claim_id] = attempts
             if attempts < _MAX_REPORTER_ATTEMPTS:
                 if claim.claim_id not in self._pending_reporter_claim_ids:
                     self._pending_reporter_claim_ids.append(claim.claim_id)
@@ -3433,17 +3487,23 @@ class DynamicAnalysisRunner:
             attempt.error = result.error
             if target.active_attempt_id == attempt.attempt_id:
                 target.active_attempt_id = None
-                target.error_retry_count += 1
-                if target.error_retry_count > self.config.max_worker_retries:
-                    target.status = "blocked"
-                    self.state.append_event(
-                        "target.blocked",
-                        target_id=target.target_id,
-                        generation=attempt.generation,
-                        blocker=result.error,
-                    )
-                else:
+                if self._note_dead_session(attempt.parent_session_id, result.error):
+                    # The resume was refused before the worker ran, so this
+                    # failure says nothing about the target. Re-queue for a cold
+                    # start without spending budget the worker never got to use.
                     target.status = "queued"
+                else:
+                    target.error_retry_count += 1
+                    if target.error_retry_count > self.config.max_worker_retries:
+                        target.status = "blocked"
+                        self.state.append_event(
+                            "target.blocked",
+                            target_id=target.target_id,
+                            generation=attempt.generation,
+                            blocker=result.error,
+                        )
+                    else:
+                        target.status = "queued"
                 target.updated_at = time.time()
             self.state.save()
             self._record_infrastructure_error(result.agent_result)
@@ -3791,6 +3851,7 @@ class DynamicAnalysisRunner:
             and a.retry_claim_id is None
             and a.status == "failed"
             and a.session_id
+            and a.session_id not in self._dead_sessions
         ]
         if prior:
             most_recent = max(prior, key=lambda a: a.started_at or 0.0)
@@ -3833,12 +3894,13 @@ class DynamicAnalysisRunner:
         # Priority: latest direct retry of this claim → original attempt that
         # produced the claim → no resume (cold start).
         parent_session_id: str | None = None
-        if existing:
-            most_recent = max(existing, key=lambda a: a.started_at or 0.0)
+        resumable = [a for a in existing if a.session_id not in self._dead_sessions]
+        if resumable:
+            most_recent = max(resumable, key=lambda a: a.started_at or 0.0)
             parent_session_id = most_recent.session_id
         if parent_session_id is None:
             origin = self.state.worker_attempts.get(claim.attempt_id)
-            if origin is not None:
+            if origin is not None and origin.session_id not in self._dead_sessions:
                 parent_session_id = origin.session_id
         attempt = WorkerAttempt(
             attempt_id=f"{target.target_id}-g{generation}-retry-{claim.claim_id}-{len(existing) + 1}",
@@ -4213,15 +4275,19 @@ class DynamicAnalysisRunner:
         self, verification: VerificationRecord, claim: ClaimRecord, target: TargetRecord
     ) -> None:
         """Handle a verifier crash: retry verification or treat as inconclusive rejection."""
-        target.error_retry_count += 1
+        dead_session = self._note_dead_session(verification.parent_session_id, verification.error)
+        if not dead_session:
+            target.error_retry_count += 1
         if verification.verification_id in target.pending_verification_ids:
             target.pending_verification_ids.remove(verification.verification_id)
-        if target.error_retry_count <= self.config.max_worker_retries:
+        if dead_session or target.error_retry_count <= self.config.max_worker_retries:
             # Resume the prior verifier session if it had time to register one
             # (i.e., the subprocess started). The verifier's `session_id` is
             # pre-allocated at VerificationRecord construction so even a
             # Ctrl-C-mid-stream crash leaves a usable id behind.
             resume_from = verification.session_id
+            if resume_from in self._dead_sessions:
+                resume_from = None
             new_verification = VerificationRecord(
                 verification_id=self._next_verification_id(claim.claim_id),
                 claim_id=claim.claim_id,
@@ -5214,6 +5280,46 @@ class DynamicAnalysisRunner:
                 "it can use Read / Grep / WebFetch on the fly.\n"
             )
         return ""
+
+    def _session_id_recorder(self, assign: Callable[[str], None]) -> Callable[[str], None]:
+        """Persist a backend-issued session id the moment the backend reports it.
+
+        Codex mints its thread id server-side, so before this the id existed
+        only in the backend's return value — a run killed mid-turn left the
+        record holding a juvenal-generated UUID that Codex had never issued, and
+        every resume against it failed with "no rollout found for thread id".
+        Writing through on the open event is what makes an interrupted Codex
+        turn resumable the way a Claude one already was.
+        """
+
+        def _record(session_id: str) -> None:
+            if not session_id:
+                return
+            assign(session_id)
+            self.state.save()
+
+        return _record
+
+    def _note_dead_session(self, session_id: str | None, error: str | None) -> bool:
+        """Record a session the backend refused to resume.
+
+        Returns True only the first time a given session is found dead, which
+        is what makes it safe for callers to skip charging their retry budget:
+        the resume never reached the agent, and each id can produce at most one
+        such refund before it is filtered out of every future resume decision.
+        """
+        if not session_id or not error:
+            return False
+        lowered = error.lower()
+        if not any(signature in lowered for signature in _DEAD_SESSION_ERROR_SIGNATURES):
+            return False
+        if session_id in self._dead_sessions:
+            return False
+        self._dead_sessions.add(session_id)
+        self._emit_analyst_message(
+            f"[juvenal] session {session_id[:8]} no longer exists on the backend; cold-restarting instead of resuming"
+        )
+        return True
 
     def _session_is_stale(self, session_id: str) -> bool:
         """True if a Claude session has not been SUCCESSFULLY used inside the

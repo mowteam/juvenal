@@ -2936,3 +2936,63 @@ def test_worker_dispatch_passes_hooks_config_to_backend(tmp_path):
     _, cfg = worker_calls[-1]
     output_dir = runner.working_dir / "output"
     assert f"Write(//{output_dir}/**)" in cfg["permissions"]["deny"]
+
+
+def test_dead_session_error_cold_restarts_without_burning_budget(tmp_path):
+    """A resume the backend refuses because the session is gone must not count
+    against the target's retry budget, and must not be resumed again.
+
+    Regression for: an interrupted worker left `parent_session_id` pointing at a
+    codex thread whose rollout was never written. Every retry re-resumed that
+    same dead id, failed identically ("no rollout found for thread id ..."), and
+    burned `error_retry_count` until the target went `blocked` — five targets
+    died this way in one run without a single worker ever executing.
+    """
+    from juvenal.backends import AgentResult
+    from juvenal.dynamic.runner import _WorkerExecutionResult
+
+    config = AnalysisConfig(max_workers=1, max_verifiers=1, max_worker_retries=3)
+    runner = _make_unstarted_runner(tmp_path, config)
+
+    target = _system_split_target("target-dead-session")
+    target.status = "running"
+    runner.state.targets[target.target_id] = target
+
+    dead = "d77a8819-bc31-48e7-b25d-2de901d87764"
+    attempt = _system_split_attempt("attempt-dead-1", target.target_id)
+    attempt.status = "running"
+    attempt.session_id = dead
+    attempt.parent_session_id = dead
+    target.active_attempt_id = attempt.attempt_id
+    runner.state.worker_attempts[attempt.attempt_id] = attempt
+
+    def _failure(attempt_id: str) -> _WorkerExecutionResult:
+        return _WorkerExecutionResult(
+            attempt_id=attempt_id,
+            target_id=target.target_id,
+            generation=1,
+            report=None,
+            agent_result=AgentResult(exit_code=1, output="", transcript="", duration=0.0, session_id=dead),
+            error=(f"worker exited with code 1: JSON-RPC error -32600: no rollout found for thread id {dead}"),
+        )
+
+    runner._apply_worker_result(_failure(attempt.attempt_id))
+
+    # The resume never reached the worker, so the budget is untouched and the
+    # target is re-queued rather than pushed one step closer to blocked.
+    assert runner.state.targets[target.target_id].error_retry_count == 0
+    assert runner.state.targets[target.target_id].status == "queued"
+    assert dead in runner._dead_sessions
+
+    # The next attempt must cold-start: inheriting the dead id is what made the
+    # original failure repeat identically four times.
+    successor = runner._start_worker_attempt(runner.state.targets[target.target_id])
+    assert successor.parent_session_id is None
+    assert successor.session_id != dead
+
+    # A second dead-session failure on the SAME id is not refunded again, so a
+    # genuinely wedged target still converges on `blocked` instead of looping.
+    successor.parent_session_id = dead
+    target.active_attempt_id = successor.attempt_id
+    runner._apply_worker_result(_failure(successor.attempt_id))
+    assert runner.state.targets[target.target_id].error_retry_count == 1
