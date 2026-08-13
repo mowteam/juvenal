@@ -51,8 +51,13 @@ class BounceCounter:
 class PipelineExhausted(Exception):
     """Raised when the pipeline exhausts the global bounce limit."""
 
-    def __init__(self, phase_id: str):
+    def __init__(self, phase_id: str, failure_context: str = ""):
         self.phase_id = phase_id
+        # Why the phase failed, carried so the handler can persist it next to
+        # the `failed` status. Without it the run records that a phase died and
+        # not one word about why — and `_run_analysis` reads the stored context
+        # back on the next attempt, so losing it also silently de-fangs retries.
+        self.failure_context = failure_context
         super().__init__(f"Pipeline exhausted bounce limit at phase '{phase_id}'")
 
 
@@ -177,13 +182,13 @@ class Engine:
                         result, lane_bounces = self._run_lane_group(pg, bounces)
                         bounces += lane_bounces
                         if not result.success:
-                            raise PipelineExhausted(phase.id)
+                            raise PipelineExhausted(phase.id, result.failure_context)
                     else:
                         result = self._run_parallel_group(pg)
                         if result.bounce_target:
                             bounces += 1
                             if bounces >= self.workflow.max_bounces:
-                                raise PipelineExhausted(phase.id)
+                                raise PipelineExhausted(phase.id, result.failure_context)
                             self._apply_backoff(bounces)
                             self.state.invalidate_from(result.bounce_target)
                             if result.failure_context:
@@ -195,7 +200,7 @@ class Engine:
                             phase_idx = self._snap_to_group_start(self._find_phase_index(result.bounce_target))
                             continue
                         if not result.success:
-                            raise PipelineExhausted(phase.id)
+                            raise PipelineExhausted(phase.id, result.failure_context)
                     # Skip past all phases in the group
                     last_pg_phase = pg.last_phase_id()
                     phase_idx = self._find_phase_index(last_pg_phase) + 1
@@ -218,7 +223,7 @@ class Engine:
                 elif result.bounce_target:
                     bounces += 1
                     if bounces >= self.workflow.max_bounces:
-                        raise PipelineExhausted(phase.id)
+                        raise PipelineExhausted(phase.id, result.failure_context)
                     self._apply_backoff(bounces)
                     self.state.invalidate_from(result.bounce_target)
                     if result.failure_context:
@@ -229,7 +234,7 @@ class Engine:
                     self._bounce_targets.add(result.bounce_target)
                     phase_idx = self._snap_to_group_start(self._find_phase_index(result.bounce_target))
                 else:
-                    raise PipelineExhausted(phase.id)
+                    raise PipelineExhausted(phase.id, result.failure_context)
 
             self.state.completed_at = time.time()
             self.state.save()
@@ -239,6 +244,10 @@ class Engine:
             return 0
 
         except PipelineExhausted as e:
+            if e.failure_context:
+                self.state.set_failure_context(
+                    e.phase_id, e.failure_context, attempt=self.state._ensure_phase(e.phase_id).attempt
+                )
             self.state.mark_failed(e.phase_id)
             self.state.completed_at = time.time()
             self.state.save()
