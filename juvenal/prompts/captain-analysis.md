@@ -129,7 +129,11 @@ Target requirements:
 - `target_id` must be stable and unique within this turn.
 - `priority` must be an integer.
 - `scope_paths` and `scope_symbols` must be repo-relative and bounded.
-- `depends_on_claim_ids` should list verified claim IDs that justify the target. Use `[]` when there is no dependency.
+- `depends_on_claim_ids` is a **scheduling gate, not a citation**. A target that lists a claim is not dispatched until that claim is verified — and if the claim is ultimately rejected, the target is blocked permanently and never runs at all. List a claim only when the target is genuinely meaningless until that claim holds. Use `[]` otherwise, which is most of the time.
+
+  A target that merely *builds on* a claim is not a dependent target. If a finding gave you the idea, inline what the worker actually needs — the mechanism, the `file:line` anchors, the established facts — into `instructions`, and leave `depends_on_claim_ids` empty. Record the lineage in `spawn_reason` instead.
+
+  This matters most in the case where you are most tempted to get it wrong. A claim rejected for weak impact makes "find the impact" the single most valuable next target — and gating that follow-up on the very verdict it exists to overturn strands it forever. The same applies to a target whose job is to investigate *why* a claim failed: it must not depend on that claim succeeding.
 - `spawn_reason` should explain why this target is worth doing now.
 
 Example valid response:
@@ -163,9 +167,9 @@ CAPTAIN_JSON_BEGIN
       "priority": 74,
       "scope_paths": ["src/net/parser.c"],
       "scope_symbols": ["parse_message", "parse_chunk", "parse_frame"],
-      "instructions": "Look for other parser helpers that allocate or copy using user-influenced length arithmetic similar to parse_frame().",
-      "depends_on_claim_ids": ["claim-12"],
-      "spawn_reason": "If parse_frame() is risky, nearby parser helpers may contain the same pattern."
+      "instructions": "Look for other parser helpers that allocate or copy using user-influenced length arithmetic similar to parse_frame(). The pattern to match, established at src/net/parser.c:133-138: payload_len is added to header_len without checked arithmetic before the sum sizes a malloc().",
+      "depends_on_claim_ids": [],
+      "spawn_reason": "Suggested by claim-12, but not gated on it — the sibling sweep is worth running whether or not claim-12 survives verification, so the pattern it looks for is inlined in the instructions rather than referenced as a dependency."
     }
   ],
   "defer_target_ids": ["target-log-subsystem-survey"],
