@@ -85,7 +85,13 @@ vars:
       (DEP), Address Space Layout Randomization (ASLR) and/or application
       sandboxing."
     - "If a sandbox is present, a full sandbox escape is required unless
-      otherwise stated."
+      otherwise stated." Read this alongside the DEP/ASLR sentence above it: a
+      "sandbox" here is a confinement boundary designed to contain exploitation,
+      which the Sponsor designates. An appliance running its own primary
+      application in a container, a service account, or a systemd unit is not
+      thereby sandboxed. Do not infer this requirement from a `docker inspect`
+      output; infer it from the rules text or a Sponsor ruling recorded in
+      `output/run-profile.md`.
     - "The initial vulnerability utilized in the entry must be in the registered
       target." All vulnerabilities must be present in the Sponsor-installed
       software or firmware. A companion app, cloud, router, or neighboring-device
@@ -474,11 +480,19 @@ phases:
       ## Privilege, container, and sandbox boundaries
       What isolates the network-facing code from the device itself: containers,
       namespaces, seccomp, capability sets, read-only mounts, and any privileged
-      management API reachable from inside a container. The rules require "a full
-      sandbox escape ... if a sandbox is present", so state plainly whether code
-      execution in the network-facing process already constitutes owning the
-      device, or whether an additional escape link is required. Enumerate the
-      candidate escape paths.
+      management API reachable from inside a container. Report these as
+      deployment facts.
+
+      The rules require "a full sandbox escape ... if a sandbox is present", but
+      do not resolve that conditional yourself from the presence of a container.
+      The registered vector is RCE on the device, and code execution in the
+      device's own network-facing process is presumed to constitute owning it.
+      Say an escape link is required only if the rules text or a Sponsor ruling
+      in the run profile designates the component a contest sandbox; where that
+      is unsettled, record it as an open Sponsor question and leave it open. A
+      recap that resolves an open question toward "escape required" points the
+      whole run at a link the rules may not ask for. Enumerate candidate escape
+      paths regardless, labelled as entry-hardening.
 
       ## Sensitive information on the device
       The rules accept retrieval of sensitive information that the Sponsor defines
@@ -618,10 +632,26 @@ phases:
         execution on the device or retrieval of the exact sensitive information
         the Sponsor defines for this entry. Do not guess that definition; use the
         run profile and registration details, and otherwise prioritize RCE.
-      - **Link D — escape, if required.** If the network-facing code is
-        sandboxed or containerized, the rules require a full escape before the
-        device is considered compromised. The recap states whether this link is
-        mandatory for this device.
+      - **Link D — escape, only if the Sponsor requires it.** The registered
+        attack vector is Remote Code Execution on the device. Link C is the win;
+        Link D is not a fourth mandatory link and must not be treated as one by
+        default.
+
+        Containerized is not the same as sandboxed. Nearly every modern
+        appliance ships its main application in a container, systemd unit, or
+        service account; that is deployment, not an exploit-mitigation boundary.
+        The rules pair "sandbox" with DEP and ASLR — mitigations designed to
+        contain exploitation — so the escape requirement attaches to a
+        confinement boundary the Sponsor designates as one, not to the mere fact
+        that the process runs in a namespace. If the target's own primary
+        application is the thing you executed code in, you have compromised the
+        target.
+
+        Treat this link as **required only when the run profile records a
+        Sponsor ruling that says so.** Where the recap leaves the question open,
+        it is open: pursue Link C, note that an escape would harden the entry,
+        and put the question to the Sponsor rather than silently spending the
+        run on an extra link the rules may not ask for.
 
       A chain is complete when every required link is verified. A single verified
       Link B with no path to Link A is not an entry; a verified Link A that
@@ -1071,8 +1101,10 @@ phases:
           traversal, SSRF, or authentication bypass)
         - **Link C** - winning impact: arbitrary code execution, or the exact
           Sponsor-defined sensitive-information retrieval where applicable
-        - **Link D** — sandbox or container escape, where the recap says one is
-          required
+        - **Link D** — escape, and only where the run profile records a Sponsor
+          ruling that the compromised component is a contest sandbox. Absent
+          that ruling, Link C on the device is the win and a claim supplying
+          only an escape is not a chain link the run currently needs.
 
         Also state honestly what your claim does NOT supply. A verified Link B
         with an unknown Link A is useful and welcome; a Link B dressed up as a
@@ -1338,10 +1370,15 @@ phases:
           ## Privilege & sandbox boundaries
           Process and container boundaries, namespaces, capability sets, seccomp,
           read-only mounts, and any privileged management API reachable from
-          inside a confined process. State plainly whether code execution in the
-          network-facing process is sufficient to claim the device under the
-          rules' full-sandbox-escape requirement, or whether an additional escape
-          link is mandatory — and if so, list candidate escape paths.
+          inside a confined process. Record these as facts about the deployment;
+          do not convert them into a contest requirement. Code execution in the
+          device's own network-facing process is the registered RCE vector and
+          is presumed sufficient. Only state that an escape link is required if
+          the rules text or a recorded Sponsor ruling says the component is a
+          contest sandbox — and if the question is open, say it is open and name
+          it as a Sponsor question rather than resolving it toward "escape
+          required". List candidate escape paths either way, marked as
+          entry-hardening rather than as a missing mandatory link.
 
           ## Documented out-of-scope / by-design behaviors
           Anything the project documents as not-a-bug, won't-fix, or by-design,
@@ -1773,14 +1810,25 @@ phases:
                  registry churn, with no code execution and no data theft. REJECT
                  `non-winning-impact`. Persistence, propagation, and stealth do
                  NOT promote a state-mutation finding into an entry.
-            6. **Apply the sandbox test.** If the brief says the network-facing
-               component is sandboxed or containerized, the rules require "a full
-               sandbox escape". A claim reaching code execution *inside* the
-               sandbox PASSES this gate but is an incomplete entry — record in
-               `follow_up_action` that the chain needs the escape link, and name
-               the candidate escape paths from the brief. Only reject here if the
-               claim asserts a complete entry while ignoring a sandbox the brief
-               says is present; in that case use `incomplete-chain-overclaimed`.
+            6. **Apply the sandbox test.** The registered attack vector is
+               Remote Code Execution on the device, so arbitrary code execution
+               in the device's own network-facing process is a **complete
+               winning impact by default**. Do not downgrade it to "incomplete"
+               because the process runs in a container, a namespace, or a
+               service account — containerized is not sandboxed, and treating it
+               as such invents a fourth mandatory link the rules did not ask
+               for. That error is expensive: it redirects the run away from the
+               vector that actually wins.
+
+               An escape link is required only where the rules text or a Sponsor
+               ruling recorded in `output/run-profile.md` designates the
+               compromised component a contest sandbox. If the brief or recap
+               leaves that question open, it stays open — PASS the claim on
+               impact, and note in `follow_up_action` that an escape would
+               harden the entry and that the Sponsor ruling is worth obtaining.
+               Reject here only when the claim asserts a complete entry while
+               ignoring a sandbox the rules or a Sponsor ruling say is present;
+               in that case use `incomplete-chain-overclaimed`.
                The mirror case is the one this gate has let through before: a
                claim supplying ONLY the escape, starting from code execution
                inside the sandbox that no verified claim provides. A sandbox
@@ -2172,7 +2220,9 @@ phases:
             justification grounded in the impact.
           - **Chain role** — which link this finding fills: Link A
             (unauthenticated reach), Link B (primitive), Link C (winning impact),
-            or Link D (sandbox escape). State explicitly which links of a
+            or Link D (escape, only where a Sponsor ruling requires one — a
+            chain that reaches Link C is complete without it). State explicitly
+            which links of a
             complete entry this finding does NOT supply, and what would be needed
             to close them. Pull this from the claim's reasoning and the verifier
             notes.
@@ -2546,7 +2596,9 @@ phases:
       - Link A (unauthenticated reach) — claim ID and title, or MISSING
       - Link B (primitive) — claim ID and title, or MISSING
       - Link C (winning impact) - claim ID and title, or MISSING
-      - Link D (sandbox escape) — claim ID and title, MISSING, or n/a
+      - Link D (escape) — claim ID and title, or `n/a` when no Sponsor ruling
+        requires one. Do not mark a chain incomplete for a missing Link D unless
+        the run profile records that ruling; a chain reaching Link C is complete.
       - The specific work that would close the gap
 
       Order chains by how close they are to complete.
