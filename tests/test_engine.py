@@ -3190,6 +3190,7 @@ class TestAnalysisEngineIntegration:
             "priority": 90,
             "scope_paths": ["src/app.py"],
             "scope_symbols": ["app"],
+            "goal": "Settle the question this target names, with a file:line anchor either way.",
             "instructions": f"Analyze {target_id}.",
             "depends_on_claim_ids": [],
             "spawn_reason": f"Captain queued {target_id}.",

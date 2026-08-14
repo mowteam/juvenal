@@ -105,6 +105,7 @@ Required JSON shape:
       "priority": 90,
       "scope_paths": ["string"],
       "scope_symbols": ["string"],
+      "goal": "string",
       "instructions": "string",
       "depends_on_claim_ids": ["string"],
       "spawn_reason": "string"
@@ -130,6 +131,32 @@ Target requirements:
 - `target_id` must be stable and unique within this turn.
 - `priority` must be an integer.
 - `scope_paths` and `scope_symbols` must be repo-relative and bounded.
+- `goal` is **the single outcome that would end this target**, and it is the field the
+  worker optimises against. Three rules, all enforced:
+
+  1. **Define the outcome, not the method.** Spend your words on what success looks like
+     and almost none on how to get there. The worker is better than you at choosing an
+     approach and worse than you at knowing what counts as done. Every sentence you spend
+     prescribing method is a constraint on an answer you have not seen yet.
+  2. **State a success criterion precise enough to exclude near-misses.** "Audit the
+     parser" is not a goal. "Establish whether unauthenticated input reaches an
+     attacker-controlled length in `parse_frame()`, with a `file:line` anchor either way"
+     is. A negative that meets the criterion is a result, not a failure.
+  3. **Exactly one objective per target.** A worker given several competing outcomes
+     optimises them unevenly and reports the easiest. If you catch yourself enumerating
+     sub-questions, either split into separate targets or move them into `instructions`
+     as supporting detail beneath the one outcome they serve.
+
+  A goal over 1000 characters, or one enumerating more than one objective, is rejected
+  and comes back to you as a repair.
+
+- `instructions` carries everything the goal deliberately leaves out: established facts
+  and their `file:line` anchors, scope boundaries, what has already been ruled out and by
+  which target, artifacts to reuse, and any hard constraint the worker cannot discover for
+  itself. Put method here only where it is a genuine constraint rather than your guess at
+  the best route. When you name the sinks a primitive must satisfy, you are choosing the
+  answer — enumerate consumers by what the primitive naturally produces, not by what you
+  hope it produces.
 - `depends_on_claim_ids` is a **scheduling gate, not a citation**. A target that lists a claim is not dispatched until that claim is verified — and if the claim is ultimately rejected, the target is blocked permanently and never runs at all. List a claim only when the target is genuinely meaningless until that claim holds. Use `[]` otherwise, which is most of the time.
 
   A target that merely *builds on* a claim is not a dependent target. If a finding gave you the idea, inline what the worker actually needs — the mechanism, the `file:line` anchors, the established facts — into `instructions`, and leave `depends_on_claim_ids` empty. Record the lineage in `spawn_reason` instead.
@@ -157,7 +184,8 @@ CAPTAIN_JSON_BEGIN
       "priority": 92,
       "scope_paths": ["src/net/server.c", "src/net/parser.c"],
       "scope_symbols": ["handle_client", "parse_frame"],
-      "instructions": "Trace callers of parse_frame() and determine whether a trusted bounds check dominates the length arithmetic and allocation sites.",
+      "goal": "Settle whether any caller of parse_frame() clamps the attacker-influenced length before it reaches the allocation site. Success is a definitive answer either way, anchored at file:line — a named caller whose clamp dominates every path, or a demonstrated path on which no clamp exists.",
+      "instructions": "Established by claim-12: untrusted header bytes reach parse_frame(). The unchecked arithmetic is at src/net/parser.c:133-138, where payload_len is added to header_len before the sum sizes a malloc(). Callers reachable from the network path start at handle_client(). A caller-side clamp only counts if it dominates every path to the allocation, not just the common one.",
       "depends_on_claim_ids": ["claim-12"],
       "spawn_reason": "Verified claim claim-12 established that untrusted header bytes reach parse_frame(), so the next question is whether any caller provides a trusted clamp."
     },
@@ -168,7 +196,8 @@ CAPTAIN_JSON_BEGIN
       "priority": 74,
       "scope_paths": ["src/net/parser.c"],
       "scope_symbols": ["parse_message", "parse_chunk", "parse_frame"],
-      "instructions": "Look for other parser helpers that allocate or copy using user-influenced length arithmetic similar to parse_frame(). The pattern to match, established at src/net/parser.c:133-138: payload_len is added to header_len without checked arithmetic before the sum sizes a malloc().",
+      "goal": "Produce the complete set of parser helpers that size an allocation or copy from unchecked user-influenced length arithmetic, each with a file:line anchor. An empty set is a valid outcome if the sweep is exhaustive and says so.",
+      "instructions": "The pattern to match, established at src/net/parser.c:133-138: payload_len is added to header_len without checked arithmetic before the sum sizes a malloc(). parse_frame() is the known instance and is out of scope here. Do not gate on claim-12 — the pattern is inlined above precisely so this runs whether or not that claim survives verification.",
       "depends_on_claim_ids": [],
       "spawn_reason": "Suggested by claim-12, but not gated on it — the sibling sweep is worth running whether or not claim-12 survives verification, so the pattern it looks for is inlined in the instructions rather than referenced as a dependency."
     }

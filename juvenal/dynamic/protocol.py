@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -123,6 +124,33 @@ def _parse_code_location_list(value: Any, field_name: str) -> list[CodeLocation]
     return [_parse_code_location(item, f"{field_name}[{index}]") for index, item in enumerate(value)]
 
 
+_GOAL_MAX_CHARS = 1000
+_ENUMERATED_OBJECTIVE_RE = re.compile(r"(?:^|\s)(?:\(\d\)|\d[.)])\s")
+
+
+def _require_goal(value: Any, field_name: str) -> str:
+    """Validate a target goal: one outcome, stated once.
+
+    Shape checks are deterministic and deliberately few. They exist to stop a
+    whole method-brief being pasted into the field, which is the failure mode
+    that makes a worker optimise several objectives unevenly.
+    """
+    goal = _require_non_empty_string(value, field_name).strip()
+    if len(goal) > _GOAL_MAX_CHARS:
+        raise ValueError(
+            f"{field_name} is {len(goal)} characters (limit {_GOAL_MAX_CHARS}). A goal states the "
+            f"outcome that would end this target, not how to reach it. Move method, setup, scope "
+            f"notes and background into `instructions`."
+        )
+    if len(_ENUMERATED_OBJECTIVE_RE.findall(goal)) > 1:
+        raise ValueError(
+            f"{field_name} enumerates more than one objective. One target carries exactly one "
+            f"outcome — split it into separate targets, or move the sub-questions into "
+            f"`instructions` and state the single outcome they serve."
+        )
+    return goal
+
+
 def _parse_target_proposal(value: Any, field_name: str) -> TargetProposal:
     payload = _require_mapping(value, field_name)
     depends_on_claim_ids = _require_string_list(
@@ -137,6 +165,7 @@ def _parse_target_proposal(value: Any, field_name: str) -> TargetProposal:
         priority=_require_int(payload.get("priority"), f"{field_name}.priority"),
         scope_paths=_require_string_list(payload.get("scope_paths"), f"{field_name}.scope_paths"),
         scope_symbols=_require_string_list(payload.get("scope_symbols"), f"{field_name}.scope_symbols"),
+        goal=_require_goal(payload.get("goal"), f"{field_name}.goal"),
         instructions=_require_non_empty_string(payload.get("instructions"), f"{field_name}.instructions"),
         depends_on_claim_ids=depends_on_claim_ids,
         spawn_reason=_require_non_empty_string(payload.get("spawn_reason"), f"{field_name}.spawn_reason"),

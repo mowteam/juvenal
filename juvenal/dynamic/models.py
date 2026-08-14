@@ -22,6 +22,7 @@ class TargetProposal:
     priority: int
     scope_paths: list[str]
     scope_symbols: list[str]
+    goal: str
     instructions: str
     depends_on_claim_ids: list[str]
     spawn_reason: str
@@ -90,6 +91,7 @@ class TargetRecord:
     created_at: float
     updated_at: float
     error_retry_count: int = 0
+    goal: str = ""
 
 
 @dataclass

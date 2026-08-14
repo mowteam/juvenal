@@ -2498,6 +2498,7 @@ class DynamicAnalysisRunner:
             "priority": target.priority,
             "scope_paths": target.scope_paths,
             "scope_symbols": target.scope_symbols,
+            "goal": target.goal or target.instructions,
             "instructions": target.instructions,
             "spawn_reason": target.spawn_reason,
             "allow_repo_tools": self.config.allow_repo_tools,
@@ -4140,6 +4141,7 @@ class DynamicAnalysisRunner:
                     source="captain",
                     scope_paths=list(proposal.scope_paths),
                     scope_symbols=list(proposal.scope_symbols),
+                    goal=proposal.goal,
                     instructions=proposal.instructions,
                     depends_on_claim_ids=list(proposal.depends_on_claim_ids),
                     spawn_reason=proposal.spawn_reason,
@@ -4251,6 +4253,7 @@ class DynamicAnalysisRunner:
             "generation": target.active_generation,
             "scope_paths": target.scope_paths,
             "scope_symbols": target.scope_symbols,
+            "goal": target.goal,
             "instructions": target.instructions,
         }
 

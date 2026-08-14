@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 
 import pytest
@@ -68,6 +69,7 @@ CAPTAIN_JSON_BEGIN
       "priority": 90,
       "scope_paths": ["src/net/parser.c"],
       "scope_symbols": ["parse_frame"],
+      "goal": "Settle the question this target names, with a file:line anchor either way.",
       "instructions": "Trace untrusted lengths into allocation sites.",
       "depends_on_claim_ids": ["claim-0"],
       "spawn_reason": "Header decoding already looks suspicious."
@@ -368,3 +370,56 @@ def test_parse_show_directive_rejects_empty_topic():
 def test_parse_chat_directive_rejects_arguments():
     with pytest.raises(ValueError, match="/chat does not accept arguments"):
         parse_user_directive("/chat with the captain", directive_id="dir-chat")
+
+
+def _captain_output_with_goal(goal: str) -> str:
+    return f"""
+CAPTAIN_JSON_BEGIN
+{{
+  "message_to_user": "",
+  "acknowledged_directive_ids": [],
+  "mental_model": "m",
+  "open_questions": [],
+  "enqueue_targets": [
+    {{
+      "target_id": "target-1",
+      "title": "t",
+      "kind": "k",
+      "priority": 90,
+      "scope_paths": ["src/net/parser.c"],
+      "scope_symbols": ["parse_frame"],
+      "goal": {json.dumps(goal)},
+      "instructions": "i",
+      "depends_on_claim_ids": [],
+      "spawn_reason": "s"
+    }}
+  ],
+  "defer_target_ids": [],
+  "termination_state": "continue",
+  "termination_reason": "r"
+}}
+CAPTAIN_JSON_END
+"""
+
+
+def test_target_goal_is_required():
+    output = _captain_output_with_goal("x").replace('"goal": "x",', "")
+    with pytest.raises(ValueError, match="goal"):
+        parse_captain_output(output)
+
+
+def test_target_goal_rejects_a_pasted_brief():
+    with pytest.raises(ValueError, match="limit 1000"):
+        parse_captain_output(_captain_output_with_goal("word " * 300))
+
+
+def test_target_goal_rejects_multiple_enumerated_objectives():
+    goal = "Answer: (1) does the clamp dominate, and (2) is the sum checked?"
+    with pytest.raises(ValueError, match="more than one objective"):
+        parse_captain_output(_captain_output_with_goal(goal))
+
+
+def test_target_goal_allows_a_single_enumerated_reference():
+    goal = "Settle whether the clamp at (1) dominates every path to the allocation site."
+    turn = parse_captain_output(_captain_output_with_goal(goal))
+    assert turn.enqueue_targets[0].goal == goal
