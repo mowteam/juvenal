@@ -235,7 +235,7 @@ class VerificationRecord:
 @dataclass
 class UserDirective:
     directive_id: str
-    kind: Literal["focus", "ignore", "target", "ask", "summary", "stop", "wrap", "note", "now", "show", "chat"]
+    kind: Literal["focus", "ignore", "target", "ask", "summary", "stop", "wrap", "note", "now", "show", "chat", "goal"]
     text: str
     status: Literal["pending", "acknowledged", "applied"]
     created_at: float

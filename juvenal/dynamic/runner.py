@@ -106,6 +106,15 @@ def _flush_stdin_buffer() -> None:
         pass
 
 
+# Used when a workflow configures no `analysis.goal`. Broad by construction: it
+# names the outcome and leaves the route entirely open, and it tells the captain to
+# sharpen it from the mission rather than leaving the run without one.
+_DEFAULT_RUN_GOAL = (
+    "Reach the outcome this run's mission describes, and establish it with evidence a "
+    "skeptical reviewer would accept. Restate this as a sharper, run-specific outcome in "
+    "your first `mental_model_summary` and pursue that."
+)
+
 _DEFAULT_CONTINUE_NUDGE = (
     "## Continue nudge — engine override\n\n"
     "The engine has REJECTED your `complete` declaration (override #{consecutive} of "
@@ -879,6 +888,12 @@ class DynamicAnalysisRunner:
             self.state.normalize_for_resume(verifier_chain_length=len(self._verifier_chain))
         else:
             self.state = DynamicSessionState(self.state_file)
+            self.state.save()
+
+        # Seed the run goal before the captain's first turn so it is persisted,
+        # visible in state, and survives resume. A run always has a goal.
+        if not self.state.run_goal:
+            self.state.run_goal = (self.config.goal or "").strip() or _DEFAULT_RUN_GOAL
             self.state.save()
 
         self._rebuild_pending_claim_retries()
@@ -1954,7 +1969,17 @@ class DynamicAnalysisRunner:
             return self._apply_show_directive(directive)
         if directive.kind == "chat":
             return self._apply_chat_directive(directive)
+        if directive.kind == "goal":
+            return self._apply_goal_directive(directive)
         return self._queue_captain_directive(directive)
+
+    def _apply_goal_directive(self, directive: UserDirective) -> bool:
+        """Replace the run goal. Re-injected into every captain turn from here on."""
+        directive.status = "applied"
+        self.state.directives[directive.directive_id] = directive
+        self.state.run_goal = directive.text.strip()
+        self.state.save()
+        return True
 
     def _apply_chat_directive(self, directive: UserDirective) -> bool:
         directive.status = "applied"
@@ -2407,12 +2432,14 @@ class DynamicAnalysisRunner:
             "specific items when you need them — do not assume the prompt contains complete state.\n"
         )
 
+        goal_block = self._run_goal_block()
         brief_block = self._project_brief_block(self.config.captain_backend)
         if is_first_turn:
             system_prompt = f"{self._captain_role_prompt}\n\nMission:\n{mission}"
             if brief_block:
                 system_prompt = f"{system_prompt}\n\n{brief_block}"
             user_prompt = (
+                f"{goal_block}"
                 f"Repository root: {self.working_dir}\n"
                 f"Captain turn: 1\n"
                 f"Mode: {mode_note}\n\n"
@@ -2429,6 +2456,7 @@ class DynamicAnalysisRunner:
             if brief_block:
                 user_prompt_prefix = f"{brief_block}\n\n"
             user_prompt = (
+                f"{goal_block}"
                 f"{user_prompt_prefix}"
                 f"Captain turn: {self.state.captain.turn_index + 1}\n"
                 f"Mode: {mode_note}\n\n"
@@ -5380,6 +5408,28 @@ class DynamicAnalysisRunner:
             "subagent.\n"
         )
         return header + mechanism + guardrail
+
+    def _run_goal_block(self) -> str:
+        """The run's outcome, re-stated at the top of every captain turn.
+
+        This is the standing driver of the run. It is deliberately broad: it says what
+        would count as success, never how to get there, because the route is exactly what
+        the captain is being paid to discover. It leads the prompt so that a long run
+        cannot drift into optimising the frontier's shape instead of the outcome.
+        """
+        goal = (self.state.run_goal or self.config.goal or "").strip()
+        if not goal:
+            return ""
+        return (
+            "## RUN GOAL — this is what the run is for\n\n"
+            f"**{goal}**\n\n"
+            "Everything below is context for pursuing that outcome. Judge every target you "
+            "enqueue, defer or retire by whether it moves this goal, not by whether it is "
+            "tidy, adjacent, or cheap. The goal states the outcome only — no route is "
+            "prescribed and none is implied, so if the evidence points somewhere the goal "
+            "does not mention, follow it. A result that settles whether the goal is "
+            "achievable is progress; restating what is already known is not.\n\n"
+        )
 
     @staticmethod
     def _current_project_brief(state: AttackSurfaceState) -> str:

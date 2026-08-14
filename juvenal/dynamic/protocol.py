@@ -331,6 +331,10 @@ def parse_user_directive(raw_text: str, *, directive_id: str) -> UserDirective:
             if not payload:
                 raise ValueError("/target requires text")
             kind = "target"
+        elif normalized == "/goal":
+            if not payload:
+                raise ValueError("/goal requires text")
+            kind = "goal"
         elif normalized == "/ask":
             if not payload:
                 raise ValueError("/ask requires text")

@@ -423,3 +423,14 @@ def test_target_goal_allows_a_single_enumerated_reference():
     goal = "Settle whether the clamp at (1) dominates every path to the allocation site."
     turn = parse_captain_output(_captain_output_with_goal(goal))
     assert turn.enqueue_targets[0].goal == goal
+
+
+def test_goal_directive_parses():
+    directive = parse_user_directive("/goal Find an unauthenticated RCE.", directive_id="dir-1")
+    assert directive.kind == "goal"
+    assert directive.text == "Find an unauthenticated RCE."
+
+
+def test_goal_directive_requires_text():
+    with pytest.raises(ValueError, match="/goal requires text"):
+        parse_user_directive("/goal", directive_id="dir-1")

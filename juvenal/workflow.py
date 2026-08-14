@@ -462,6 +462,7 @@ class AnalysisConfig:
     # nominal 5h Anthropic rate-limit window without trapping a stuck run.
     max_single_backoff_seconds: int = 3600
     max_total_backoff_seconds: int = 24 * 3600
+    goal: str = ""
     min_captain_turns: int = 0
     min_terminal_targets_before_complete: int = 0
     continue_nudge: str | None = None
@@ -493,6 +494,7 @@ _ANALYSIS_CONFIG_KEYS = {
     "max_consecutive_errors",
     "max_single_backoff_seconds",
     "max_total_backoff_seconds",
+    "goal",
     "min_captain_turns",
     "min_terminal_targets_before_complete",
     "continue_nudge",
@@ -1026,6 +1028,7 @@ def _parse_analysis_config(
         max_consecutive_errors=max_consecutive_errors,
         max_single_backoff_seconds=max_single_backoff_seconds,
         max_total_backoff_seconds=max_total_backoff_seconds,
+        goal=str(raw.get("goal", defaults.goal) or "").strip(),
         min_captain_turns=min_captain_turns,
         min_terminal_targets_before_complete=min_terminal_targets_before_complete,
         continue_nudge=continue_nudge,

@@ -10,6 +10,7 @@ import pytest
 from juvenal.display import Display
 from juvenal.dynamic.models import (
     AttackSurfaceState,
+    UserDirective,
     VerificationRecord,
     WorkerAttempt,
 )
@@ -967,3 +968,31 @@ def test_record_infrastructure_error_triggers_backoff_for_actual_rate_limit(tmp_
         runner._record_infrastructure_error("worker exited with code 1: You've hit your limit · resets 1am")
 
     assert len(backoff_calls) >= 1, "rate-limit-like errors should trigger backoff after threshold"
+
+
+def test_run_goal_block_uses_config_goal_and_leads_every_turn(tmp_path, patched_backend):
+    runner = _make_runner(tmp_path, patched_backend, analyst_spec=None)
+    runner.config.goal = "Find an unauthenticated remote code execution path."
+    block = runner._run_goal_block()
+    assert "RUN GOAL" in block
+    assert "Find an unauthenticated remote code execution path." in block
+
+    system_prompt, user_prompt = runner._build_captain_prompt()
+    assert user_prompt.startswith("## RUN GOAL")
+
+
+def test_run_goal_directive_overrides_config_goal(tmp_path, patched_backend):
+    runner = _make_runner(tmp_path, patched_backend, analyst_spec=None)
+    runner.config.goal = "Original outcome."
+    directive = UserDirective(
+        directive_id="dir-1",
+        kind="goal",
+        text="  Find an unauthenticated RCE.  ",
+        status="pending",
+        created_at=1.0,
+        acknowledged_at=None,
+    )
+    assert runner._persist_directive(directive) is True
+    assert runner.state.run_goal == "Find an unauthenticated RCE."
+    assert "Find an unauthenticated RCE." in runner._run_goal_block()
+    assert "Original outcome." not in runner._run_goal_block()

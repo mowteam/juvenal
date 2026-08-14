@@ -168,6 +168,7 @@ class DynamicSessionState:
     events: list[DynamicEvent] = field(default_factory=list)
     attack_surface: AttackSurfaceState = field(default_factory=AttackSurfaceState)
     simulation_env: SimulationEnvState = field(default_factory=SimulationEnvState)
+    run_goal: str = ""
     _lock: RLock = field(init=False, repr=False, default_factory=RLock)
 
     @classmethod

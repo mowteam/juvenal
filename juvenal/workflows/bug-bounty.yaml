@@ -165,6 +165,16 @@ phases:
       scratch artifacts in, and writes `report.md`. There is no per-bug dir
       under `output/` until that has happened.
     analysis:
+      # The run's standing outcome, restated at the top of every captain turn.
+      # Deliberately broad: it names what would count as success and prescribes
+      # no route, because the route is what the run exists to discover. Override
+      # per run in your own workflow, or mid-run with the `/goal` directive.
+      goal: >-
+        Find a concrete, exploitable vulnerability in this codebase that an
+        attacker could actually reach, and establish it with evidence strong
+        enough that a skeptical reviewer would accept it. A rigorous negative
+        that closes a plausible attack surface is a real result; a restatement
+        of known-safe code is not.
       # Models default per role: claude → captain opus 4.7 1M, worker opus 4.7
       # (200K), verifier opus 4.6 (200K), reporter sonnet 4.6; codex → CLI
       # default. Override with `captain_model`, `worker_model`,
