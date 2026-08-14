@@ -5358,6 +5358,23 @@ class DynamicAnalysisRunner:
         )
         return header + mechanism + guardrail
 
+    @staticmethod
+    def _current_project_brief(state: AttackSurfaceState) -> str:
+        """Return the brief as it stands on disk, falling back to the state snapshot.
+
+        Operators amend the brief file in place to correct scope that has moved since
+        the analyst ran. Serving the snapshot instead makes those edits silently inert
+        and keeps injecting superseded scope into every role for the life of the run.
+        """
+        if state.brief_path:
+            try:
+                on_disk = Path(state.brief_path).read_text(encoding="utf-8")
+            except OSError:
+                return state.brief or ""
+            if on_disk.strip():
+                return on_disk
+        return state.brief or ""
+
     def _project_brief_block(self, backend: str | None = None) -> str:
         """Cacheable prefix injected into every captain/worker/verifier/reporter system prompt.
 
@@ -5382,7 +5399,7 @@ class DynamicAnalysisRunner:
                 "## Project brief (attack-surface analyst output)\n\n"
                 "The attack-surface analyst has produced the brief below. Treat it as the source "
                 "of truth for the project's trust model and attack surface.\n\n"
-                f"{state.brief}\n\n"
+                f"{self._current_project_brief(state)}\n\n"
                 f"{guidance}"
             )
         if state.status == "running" or state.status == "pending":

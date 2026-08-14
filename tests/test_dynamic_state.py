@@ -475,6 +475,24 @@ def test_deferred_target_persists_and_requeues_on_next_turn(tmp_path):
     assert reloaded.targets["target-1"].deferred_until_turn is None
 
 
+def test_stop_parked_target_requeues_instead_of_stranding(tmp_path):
+    state_file = tmp_path / "dynamic-state.json"
+    state = DynamicSessionState(state_file=state_file)
+    state.targets["target-1"] = make_target(status="queued")
+    state.control.stop_requested = True
+    state.save()
+
+    loaded = DynamicSessionState.load(state_file)
+    loaded.normalize_for_resume()
+    assert loaded.targets["target-1"].status == "deferred"
+    assert loaded.targets["target-1"].deferred_until_turn is None
+
+    loaded.record_captain_turn(make_turn(), delivered_event_seq=0)
+    reloaded = DynamicSessionState.load(state_file)
+    assert reloaded.targets["target-1"].status == "queued"
+    assert reloaded.targets["target-1"].deferred_until_turn is None
+
+
 def test_exhausted_target_persists_and_redelivers_to_captain(tmp_path):
     state_file = tmp_path / "dynamic-state.json"
     state = DynamicSessionState(state_file=state_file)

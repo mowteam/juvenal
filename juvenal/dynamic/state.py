@@ -607,12 +607,15 @@ class DynamicSessionState:
         for target in self.targets.values():
             if target.status != "deferred":
                 continue
-            if target.deferred_until_turn is None:
+            # A null deadline means parked by a stop/wrap resume rewrite, not
+            # deferred to a turn. Nothing else can un-park it — CAPTAIN_JSON has
+            # no requeue field and re-enqueuing collides with the existing id —
+            # so treat it as due now or it stays non-terminal forever.
+            if target.deferred_until_turn is not None and target.deferred_until_turn > self.captain.turn_index:
                 continue
-            if target.deferred_until_turn <= self.captain.turn_index:
-                target.status = "queued"
-                target.deferred_until_turn = None
-                target.updated_at = now
+            target.status = "queued"
+            target.deferred_until_turn = None
+            target.updated_at = now
 
     def _to_dict(self) -> dict[str, Any]:
         return {

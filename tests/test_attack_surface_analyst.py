@@ -326,6 +326,36 @@ def test_brief_block_ready_inserts_brief_text(tmp_path, patched_backend):
     assert "attack-surface" in block.lower()
 
 
+def test_brief_block_reflects_on_disk_amendments(tmp_path, patched_backend):
+    spec = AnalystSpec(prompt="x")
+    runner = _make_runner(tmp_path, patched_backend, analyst_spec=spec)
+    brief_file = tmp_path / "output" / ".attack-surface-brief.md"
+    brief_file.parent.mkdir(parents=True, exist_ok=True)
+    brief_file.write_text("# Brief\nTreat Link D as mandatory.", encoding="utf-8")
+    runner.state.attack_surface = AttackSurfaceState(
+        status="ready",
+        brief="# Brief\nTreat Link D as mandatory.",
+        brief_path=str(brief_file),
+    )
+    assert "Treat Link D as mandatory." in runner._project_brief_block()
+
+    brief_file.write_text("# Brief\nThere is no Link D.", encoding="utf-8")
+    block = runner._project_brief_block()
+    assert "There is no Link D." in block
+    assert "Treat Link D as mandatory." not in block
+
+
+def test_brief_block_falls_back_to_snapshot_when_file_unreadable(tmp_path, patched_backend):
+    spec = AnalystSpec(prompt="x")
+    runner = _make_runner(tmp_path, patched_backend, analyst_spec=spec)
+    runner.state.attack_surface = AttackSurfaceState(
+        status="ready",
+        brief="# Brief\nsnapshot body",
+        brief_path=str(tmp_path / "output" / "missing.md"),
+    )
+    assert "snapshot body" in runner._project_brief_block()
+
+
 def test_brief_block_empty_when_analyst_not_configured(tmp_path, patched_backend):
     runner = _make_runner(tmp_path, patched_backend, analyst_spec=None)
     assert runner._project_brief_block() == ""
