@@ -4784,19 +4784,39 @@ class DynamicAnalysisRunner:
         self._backoff_count = 0
         self._total_backoff_seconds = 0.0
 
+    def _claim_mechanism_established(self, claim_id: str) -> bool:
+        """True if a claim is verified, or was rejected only after a verifier passed it.
+
+        A dependent target declared a dependency on a finding, not on a verdict. When a
+        later verifier rejects on impact or scope, the mechanism an earlier verifier
+        confirmed still exists and is still something to build on — so the dependent
+        stays schedulable. A claim rejected by the first verifier established nothing.
+        """
+        claim = self.state.claims.get(claim_id)
+        if claim is None:
+            return False
+        if claim.status == "verified":
+            return True
+        if claim.status != "rejected":
+            return False
+        return any(
+            verification.claim_id == claim_id and verification.status == "passed"
+            for verification in self.state.verifications.values()
+        )
+
     def _dependencies_satisfied(self, target: TargetRecord) -> bool:
-        def verified_via_retries(claim_id: str, seen: set[str]) -> bool:
+        def established_via_retries(claim_id: str, seen: set[str]) -> bool:
             if claim_id in seen:
                 return False
             seen.add(claim_id)
             claim = self.state.claims.get(claim_id)
             if claim is None:
                 return False
-            if claim.status == "verified":
+            if self._claim_mechanism_established(claim_id):
                 return True
-            return any(verified_via_retries(rid, seen) for rid in claim.retry_claim_ids)
+            return any(established_via_retries(rid, seen) for rid in claim.retry_claim_ids)
 
-        return all(verified_via_retries(dep_id, set()) for dep_id in target.depends_on_claim_ids)
+        return all(established_via_retries(dep_id, set()) for dep_id in target.depends_on_claim_ids)
 
     def _dep_claim_unverifiable(self, claim_id: str) -> bool:
         """Walk a dep claim's retry chain. Return True iff no claim in the
@@ -4821,7 +4841,7 @@ class DynamicAnalysisRunner:
                 # Defensive: a missing dep is not a known dead-end. Don't
                 # block targets on what might be a future claim.
                 return False
-            if claim.status == "verified":
+            if self._claim_mechanism_established(cid):
                 return False
             if claim.status in ("proposed", "verifying"):
                 return False

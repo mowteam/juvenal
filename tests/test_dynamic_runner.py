@@ -1025,6 +1025,39 @@ def test_dependencies_satisfied_walks_retry_chain(tmp_path):
     dep_target.depends_on_claim_ids = []
     assert runner._dependencies_satisfied(dep_target) is True
 
+    # A dep rejected only AFTER a verifier passed it established a mechanism the
+    # dependent can still build on — satisfied, and not swept to blocked.
+    from juvenal.dynamic.models import VerificationRecord
+
+    runner.state.claims["target-1-g1-retry-c2"].status = "rejected"
+    runner.state.claims["target-1-g1-retry-c2"].verified_at = None
+    for claim in runner.state.claims.values():
+        claim.retry_count = runner.config.max_worker_retries
+    dep_target.depends_on_claim_ids = ["target-1-g1-claim-c1"]
+    assert runner._dependencies_satisfied(dep_target) is False
+    assert runner._dep_claim_unverifiable("target-1-g1-claim-c1") is True
+
+    runner.state.verifications["v-mech"] = VerificationRecord(
+        verification_id="v-mech",
+        claim_id="target-1-g1-claim-c1",
+        target_id="target-1",
+        generation=1,
+        backend="mock",
+        verifier_role="analysis-verifier",
+        session_id=None,
+        status="passed",
+        disposition="verified",
+        reason="mechanism confirmed",
+        rejection_class=None,
+        raw_output="",
+        started_at=now,
+        completed_at=now,
+        verifier_name="bug-class",
+        verifier_index=1,
+    )
+    assert runner._dependencies_satisfied(dep_target) is True
+    assert runner._dep_claim_unverifiable("target-1-g1-claim-c1") is False
+
 
 def test_consecutive_errors_backoff_and_retry(tmp_path):
     """Consecutive infrastructure errors trigger backoff sleep, then retry (not fatal exit)."""
