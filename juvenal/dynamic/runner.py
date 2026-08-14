@@ -5425,10 +5425,8 @@ class DynamicAnalysisRunner:
             f"**{goal}**\n\n"
             "Everything below is context for pursuing that outcome. Judge every target you "
             "enqueue, defer or retire by whether it moves this goal, not by whether it is "
-            "tidy, adjacent, or cheap. The goal states the outcome only — no route is "
-            "prescribed and none is implied, so if the evidence points somewhere the goal "
-            "does not mention, follow it. A result that settles whether the goal is "
-            "achievable is progress; restating what is already known is not.\n\n"
+            "tidy, adjacent, or cheap. A result that settles whether the goal is achievable "
+            "is progress; restating what is already known is not.\n\n"
         )
 
     @staticmethod

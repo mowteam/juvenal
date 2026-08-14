@@ -34,11 +34,8 @@ Task packet:
 ```
 
 **`goal` is the one outcome you are working toward — read it first and treat it as the
-definition of done.** It states what would settle this target, not how to get there;
-choosing the approach is your job, and you are better placed to choose it than the captain
-was when the target was written. `instructions` carries established facts, `file:line`
-anchors, scope boundaries and hard constraints — use them, but do not mistake them for a
-prescribed route.
+definition of done.** `instructions` carries established facts, `file:line` anchors, scope
+boundaries and hard constraints — use them, but do not mistake them for a prescribed route.
 
 A negative that meets the goal's success criterion is a real result. Report it as
 `no_findings` with the evidence that settles it, and say which part of the goal you
